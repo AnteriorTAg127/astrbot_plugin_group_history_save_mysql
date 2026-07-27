@@ -3,6 +3,10 @@
 负责注册和处理所有 Web 管理后台的 API 请求。
 """
 
+import random
+import time
+import uuid
+
 from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.api.web import error_response, json_response, request
@@ -12,6 +16,29 @@ from .db_config import ConfigManager
 from .db_mysql import MySQLManager
 
 PLUGIN_NAME = "astrbot_plugin_group_history_save_mysql"
+
+CHALLENGE_TTL = 300  # 清空验证题目有效期（秒）
+
+
+def make_challenge() -> tuple[str, str, int]:
+    """生成一道随机加减法验证题。
+
+    Returns:
+        tuple: (challenge_id, question, answer)，如 ("ab12...", "12 + 34 = ?", 46)
+    """
+    a = random.randint(1, 99)
+    b = random.randint(1, 99)
+    if random.random() < 0.5:
+        question = f"{a} + {b} = ?"
+        answer = a + b
+    else:
+        # 减法保证结果非负
+        if a < b:
+            a, b = b, a
+        question = f"{a} - {b} = ?"
+        answer = a - b
+    challenge_id = uuid.uuid4().hex
+    return challenge_id, question, answer
 
 
 class WebAPI:
@@ -28,6 +55,7 @@ class WebAPI:
         self.mysql_mgr = mysql_mgr
         self.config_mgr = config_mgr
         self.cleaner = cleaner
+        self._purge_challenges: dict[str, tuple[int, float]] = {}
         self._register_routes()
 
     def _register_routes(self):
@@ -58,6 +86,13 @@ class WebAPI:
             (f"/{PLUGIN_NAME}/stats/daily", self.api_daily_stats, ["GET"], "每日统计"),
             (f"/{PLUGIN_NAME}/clean", self.api_clean, ["POST"], "手动清理"),
             (f"/{PLUGIN_NAME}/query", self.api_query, ["GET"], "查询聊天记录"),
+            (
+                f"/{PLUGIN_NAME}/purge/challenge",
+                self.api_purge_challenge,
+                ["GET"],
+                "获取清空验证题目",
+            ),
+            (f"/{PLUGIN_NAME}/purge", self.api_purge, ["POST"], "清空所有数据"),
         ]
         for route, handler, methods, desc in routes:
             self.context.register_web_api(route, handler, methods, desc)
@@ -200,8 +235,8 @@ class WebAPI:
 
     async def api_query(self):
         """查询聊天记录（支持多条件过滤和分页）。"""
-        group_id = request.query.get("group_id", type=int)
-        sender_id = request.query.get("sender_id", type=int)
+        group_id = request.query.get("group_id")
+        sender_id = request.query.get("sender_id")
         time_start = request.query.get("time_start")
         time_end = request.query.get("time_end")
         page = request.query.get("page", 1, type=int)
@@ -215,6 +250,10 @@ class WebAPI:
         if page_size > 200:
             page_size = 200
 
+        # 群号/QQ 号为文本字段，空字符串视同未提供
+        group_id = group_id or None
+        sender_id = sender_id or None
+
         result = await self.mysql_mgr.query_messages(
             group_id=group_id,
             sender_id=sender_id,
@@ -222,5 +261,46 @@ class WebAPI:
             time_end=time_end,
             page=page,
             page_size=page_size,
+        )
+        return json_response(result)
+
+    async def api_purge_challenge(self):
+        """生成随机加减法验证题，用于清空所有数据前的二次确认。"""
+        now = time.monotonic()
+        # 清理过期项，防止内存泄漏
+        self._purge_challenges = {
+            k: v for k, v in self._purge_challenges.items() if v[1] > now
+        }
+        challenge_id, question, answer = make_challenge()
+        self._purge_challenges[challenge_id] = (answer, now + CHALLENGE_TTL)
+        return json_response({"challenge_id": challenge_id, "question": question})
+
+    async def api_purge(self):
+        """校验加减法答案后清空 chat_history 与 image_records 两张表的全部数据。"""
+        payload = await request.json(default={})
+        challenge_id = payload.get("challenge_id") or ""
+        # 一次性消费：无论对错都弹出，防止对两位数答案暴力穷举
+        entry = self._purge_challenges.pop(challenge_id, None)
+        if entry is None:
+            return error_response("验证已失效，请重新打开弹窗再试", status_code=400)
+
+        expected, expire_at = entry
+        if time.monotonic() > expire_at:
+            return error_response("验证已过期，请重新打开弹窗再试", status_code=400)
+
+        try:
+            answer = int(str(payload.get("answer", "")).strip())
+        except (ValueError, TypeError):
+            return error_response("答案不正确，已取消清空", status_code=400)
+        if answer != expected:
+            return error_response("答案不正确，已取消清空", status_code=400)
+
+        result = await self.mysql_mgr.purge_all()
+        if not result.get("success"):
+            return error_response("清空数据失败，请检查数据库连接", status_code=500)
+
+        logger.warning(
+            f"[HistorySave] Web 后台执行清空所有数据：删除 {result['deleted_messages']} 条消息、"
+            f"{result['deleted_images']} 条图片"
         )
         return json_response(result)

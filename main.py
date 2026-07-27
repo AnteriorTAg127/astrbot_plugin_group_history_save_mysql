@@ -14,11 +14,67 @@ from .db_mysql import MySQLManager
 from .web_api import WebAPI
 
 
+def extract_image_urls(message_obj, message_chain) -> list[str]:
+    """提取图片的原始 http(s) 链接。
+
+    优先从 OneBot 原始事件(message_obj.raw_message)的图片消息段提取 QQ 下发的
+    原始链接;raw_message 不可用或提取不到时,回退到遍历消息链中的 Image 组件。
+    本地文件路径一律不返回(新版 AstrBot 预处理会把组件 url 改写为本地临时路径)。
+
+    Args:
+        message_obj: event.message_obj(AstrBotMessage,其 raw_message 为 OneBot 原始事件)
+        message_chain: event.get_messages() 返回的消息组件列表
+
+    Returns:
+        list[str]: 以 http 开头的图片链接列表
+    """
+    urls: list[str] = []
+
+    # 优先从 OneBot 原始事件的消息段数组提取(QQ 下发的原始链接)
+    raw = getattr(message_obj, "raw_message", None)
+    segments = raw.get("message") if isinstance(raw, dict) else None
+    if isinstance(segments, list):
+        for seg in segments:
+            try:
+                if not isinstance(seg, dict) or seg.get("type") != "image":
+                    continue
+                data = seg.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                # 优先取 data.url;部分实现(如 Lagrange)把链接放在 data.file
+                url = data.get("url")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    urls.append(url)
+                    continue
+                file = data.get("file")
+                if isinstance(file, str) and file.startswith(("http://", "https://")):
+                    urls.append(file)
+            except Exception as e:
+                logger.debug(f"[HistorySave] 解析图片消息段失败: {e}")
+                continue
+
+    if urls:
+        return urls
+
+    # 回退:遍历消息链中的 Image 组件(本地临时路径一律不收集)
+    try:
+        for component in message_chain or []:
+            if not isinstance(component, Comp.Image):
+                continue
+            value = component.url or component.file
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                urls.append(value)
+    except Exception as e:
+        logger.debug(f"[HistorySave] 遍历消息链提取图片链接失败: {e}")
+
+    return urls
+
+
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台",
-    "0.1.0",
+    "0.2.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -76,19 +132,23 @@ class GroupHistoryPlugin(Star):
             return
 
         try:
-            group_id = int(event.get_group_id())
-            sender_id = int(event.get_sender_id())
+            group_id = str(event.get_group_id())
+            sender_id = str(event.get_sender_id())
             sender_name = event.get_sender_name()
             message_id = event.message_obj.message_id or ""
 
-            # 检查群是否在白名单中
-            if not await self.config_mgr.is_group_enabled(group_id):
+            # 检查群是否在白名单中（本地白名单以整数群号匹配）
+            try:
+                group_id_int = int(group_id)
+            except (ValueError, TypeError):
+                return
+            if not await self.config_mgr.is_group_enabled(group_id_int):
                 return
 
             # 解析消息链
             message_chain = event.get_messages()
             text_parts = []
-            image_urls = []
+            image_count = 0
 
             for component in message_chain:
                 if isinstance(component, Comp.Plain):
@@ -96,9 +156,12 @@ class GroupHistoryPlugin(Star):
                     if text:
                         text_parts.append(text)
                 elif isinstance(component, Comp.Image):
-                    url = component.url or component.file or ""
-                    if url:
-                        image_urls.append(url)
+                    image_count += 1
+
+            # 提取图片原始链接（优先 OneBot 原始事件中的图片消息段）
+            image_urls = extract_image_urls(event.message_obj, message_chain)
+            if image_count > 0 and not image_urls:
+                logger.warning("[HistorySave] 图片消息未能提取到原始链接,已跳过入库")
 
             # 保存文本消息
             if text_parts:
@@ -119,6 +182,7 @@ class GroupHistoryPlugin(Star):
                     group_id=group_id,
                     sender_id=sender_id,
                     image_url=url,
+                    sender_name=sender_name,
                 )
 
         except Exception as e:

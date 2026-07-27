@@ -237,6 +237,65 @@ function escapeAttr(text) {
     return text.replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
+// ========== 清空所有数据（加减法验证） ==========
+const purgeMask = document.getElementById("purgeModal");
+let purgeChallengeId = null;
+
+// 拉取新题目并更新弹窗题干（打开弹窗与验证失败后均复用），返回是否成功
+async function refreshChallenge() {
+    const questionEl = document.getElementById("purgeQuestion");
+    questionEl.textContent = "加载中...";
+    try {
+        const data = await bridge.apiGet("purge/challenge");
+        purgeChallengeId = data.challenge_id;
+        questionEl.textContent = data.question;
+        return true;
+    } catch (e) {
+        purgeChallengeId = null;
+        questionEl.textContent = "题目加载失败";
+        showToast("获取验证题目失败: " + e.message, "error");
+        return false;
+    }
+}
+
+async function openPurgeModal() {
+    purgeMask.style.display = "flex";
+    document.getElementById("purgeAnswer").value = "";
+    document.getElementById("purgeConfirmBtn").disabled = false;
+    if (await refreshChallenge()) {
+        document.getElementById("purgeAnswer").focus();
+    } else {
+        closePurgeModal();
+    }
+}
+
+function closePurgeModal() {
+    purgeMask.style.display = "none";
+    purgeChallengeId = null;
+}
+
+async function confirmPurge() {
+    const answer = document.getElementById("purgeAnswer").value.trim();
+    if (!answer) { showToast("请先输入答案", "error"); return; }
+    const btn = document.getElementById("purgeConfirmBtn");
+    btn.disabled = true;
+    try {
+        const data = await bridge.apiPost("purge", { challenge_id: purgeChallengeId, answer: Number(answer) });
+        showToast(`已清空：${data.deleted_messages} 条消息、${data.deleted_images} 条图片`, "success");
+        closePurgeModal();
+        await loadStatus();
+    } catch (e) {
+        showToast(e.message || "清空失败", "error");
+        // challenge 已被后端一次性消费（答错同样删除），需换新题重试
+        await refreshChallenge();
+        const input = document.getElementById("purgeAnswer");
+        input.value = "";
+        input.focus();
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // ========== 事件绑定 ==========
 function bindEvents() {
     document.getElementById("addGroupBtn").addEventListener("click", async () => {
@@ -281,6 +340,17 @@ function bindEvents() {
             showToast(`已清理 ${data.deleted} 条图片记录`, "success");
             await loadStatus();
         } catch (e) { showToast("清理失败: " + e.message, "error"); }
+    });
+
+    // 清空所有数据（加减法验证弹窗）
+    document.getElementById("purgeBtn").addEventListener("click", () => openPurgeModal());
+    document.getElementById("purgeCancelBtn").addEventListener("click", closePurgeModal);
+    purgeMask.addEventListener("click", (e) => {
+        if (e.target === purgeMask) closePurgeModal();
+    });
+    document.getElementById("purgeConfirmBtn").addEventListener("click", () => confirmPurge());
+    document.getElementById("purgeAnswer").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") confirmPurge();
     });
 
     document.getElementById("queryBtn").addEventListener("click", () => doQuery(1));

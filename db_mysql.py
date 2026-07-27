@@ -118,7 +118,9 @@ class DynamicPool:
         except Exception:
             return False
 
-    async def _ensure_connection(self, conn: aiomysql.Connection) -> aiomysql.Connection:
+    async def _ensure_connection(
+        self, conn: aiomysql.Connection
+    ) -> aiomysql.Connection:
         """确保连接可用，失效则重建。"""
         if conn.closed:
             return await self._create_connection()
@@ -176,9 +178,7 @@ class DynamicPool:
                         f"当前连接数: {self.size}/{self._max_size}"
                     )
                 try:
-                    await asyncio.wait_for(
-                        self._not_empty.wait(), timeout=remaining
-                    )
+                    await asyncio.wait_for(self._not_empty.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
                     raise TimeoutError(
                         f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
@@ -349,7 +349,7 @@ class MySQLManager:
         )
 
     async def initialize(self) -> bool:
-        """初始化连接池并创建表结构。
+        """初始化连接池、创建表结构并迁移旧表结构。
 
         Returns:
             bool: 初始化是否成功
@@ -357,6 +357,7 @@ class MySQLManager:
         try:
             await self.pool.initialize()
             await self._create_tables()
+            await self._migrate_schema()
             logger.info("[HistorySave] MySQL 动态连接池初始化成功")
             return True
         except Exception as e:
@@ -372,8 +373,8 @@ class MySQLManager:
                     CREATE TABLE IF NOT EXISTS chat_history (
                         id BIGINT AUTO_INCREMENT PRIMARY KEY,
                         timestamp DATETIME NOT NULL,
-                        group_id BIGINT NOT NULL,
-                        sender_id BIGINT NOT NULL,
+                        group_id VARCHAR(32) NOT NULL,
+                        sender_id VARCHAR(32) NOT NULL,
                         sender_name VARCHAR(128) DEFAULT '',
                         message_type VARCHAR(16) DEFAULT 'text',
                         content TEXT,
@@ -388,18 +389,87 @@ class MySQLManager:
                     CREATE TABLE IF NOT EXISTS image_records (
                         id BIGINT AUTO_INCREMENT PRIMARY KEY,
                         timestamp DATETIME NOT NULL,
-                        group_id BIGINT NOT NULL,
-                        sender_id BIGINT NOT NULL,
+                        group_id VARCHAR(32) NOT NULL,
+                        sender_id VARCHAR(32) NOT NULL,
+                        sender_name VARCHAR(128) NOT NULL DEFAULT '',
                         image_url VARCHAR(1024) NOT NULL,
                         INDEX idx_img_time (timestamp),
                         INDEX idx_img_group (group_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
 
+    async def _migrate_schema(self):
+        """将 v0.1 旧表结构迁移到 v0.2 新结构。
+
+        检测并迁移内容：
+        - chat_history / image_records 的 group_id、sender_id 列若不是字符串类型
+          （varchar/char/text），MODIFY 为 VARCHAR(32) NOT NULL
+          （MySQL 会自动把已有数字值转为字符串，不丢数据，列上索引自动重建）
+        - image_records 缺少 sender_name 列时自动 ADD COLUMN
+
+        每一步独立 try/except 包裹，失败仅记录 error 日志，
+        绝不向上抛异常、不阻断插件启动。
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    # 需要检测为字符串类型的列: (表名, 列名)
+                    varchar_columns = [
+                        ("chat_history", "group_id"),
+                        ("chat_history", "sender_id"),
+                        ("image_records", "group_id"),
+                        ("image_records", "sender_id"),
+                    ]
+                    for table, column in varchar_columns:
+                        try:
+                            await cur.execute(
+                                "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS"
+                                " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                                (table, column),
+                            )
+                            row = await cur.fetchone()
+                            if row and str(row[0]).lower() not in (
+                                "varchar",
+                                "char",
+                                "text",
+                            ):
+                                await cur.execute(
+                                    f"ALTER TABLE {table} MODIFY COLUMN {column} VARCHAR(32) NOT NULL"
+                                )
+                                logger.info(
+                                    f"[HistorySave] 表结构迁移: {table}.{column} 已改为 VARCHAR(32)"
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"[HistorySave] 表结构迁移 {table}.{column} 失败: {e}"
+                            )
+
+                    # 检测 image_records 是否缺少 sender_name 列
+                    try:
+                        await cur.execute(
+                            "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS"
+                            " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                            ("image_records", "sender_name"),
+                        )
+                        row = await cur.fetchone()
+                        if not row:
+                            await cur.execute(
+                                "ALTER TABLE image_records ADD COLUMN sender_name VARCHAR(128) NOT NULL DEFAULT ''"
+                            )
+                            logger.info(
+                                "[HistorySave] 表结构迁移: image_records 已新增 sender_name 列"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"[HistorySave] 表结构迁移 image_records.sender_name 失败: {e}"
+                        )
+        except Exception as e:
+            logger.error(f"[HistorySave] 表结构迁移失败（无法获取连接）: {e}")
+
     async def insert_chat_message(
         self,
-        group_id: int,
-        sender_id: int,
+        group_id: str,
+        sender_id: str,
         sender_name: str,
         message_type: str,
         content: str,
@@ -408,8 +478,8 @@ class MySQLManager:
         """插入一条聊天记录。
 
         Args:
-            group_id: 群号
-            sender_id: 发送者 QQ 号
+            group_id: 群号（字符串形式）
+            sender_id: 发送者 QQ 号（字符串形式）
             sender_name: 发送者昵称
             message_type: 消息类型（text/image/mixed）
             content: 文本内容
@@ -441,14 +511,15 @@ class MySQLManager:
             return False
 
     async def insert_image_record(
-        self, group_id: int, sender_id: int, image_url: str
+        self, group_id: str, sender_id: str, image_url: str, sender_name: str = ""
     ) -> bool:
         """插入一条图片记录。
 
         Args:
-            group_id: 群号
-            sender_id: 发送者 QQ 号
+            group_id: 群号（字符串形式）
+            sender_id: 发送者 QQ 号（字符串形式）
             image_url: 图片 URL
+            sender_name: 发送者昵称（可选，默认空字符串）
 
         Returns:
             bool: 是否插入成功
@@ -458,9 +529,9 @@ class MySQLManager:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """INSERT INTO image_records
-                           (timestamp, group_id, sender_id, image_url)
-                           VALUES (%s, %s, %s, %s)""",
-                        (datetime.now(), group_id, sender_id, image_url),
+                           (timestamp, group_id, sender_id, sender_name, image_url)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (datetime.now(), group_id, sender_id, sender_name, image_url),
                     )
             return True
         except Exception as e:
@@ -488,6 +559,29 @@ class MySQLManager:
         except Exception as e:
             logger.error(f"[HistorySave] 清理图片记录失败: {e}")
             return -1
+
+    async def purge_all(self) -> dict:
+        """清空所有聊天记录和图片记录（不可恢复）。
+
+        Returns:
+            dict: {"success": bool, "deleted_messages": int, "deleted_images": int}
+        """
+        result = {"success": False, "deleted_messages": 0, "deleted_images": 0}
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("DELETE FROM chat_history")
+                    result["deleted_messages"] = cur.rowcount
+                    await cur.execute("DELETE FROM image_records")
+                    result["deleted_images"] = cur.rowcount
+            result["success"] = True
+            logger.warning(
+                f"[HistorySave] 已清空所有数据: 聊天记录 {result['deleted_messages']} 条, "
+                f"图片记录 {result['deleted_images']} 条"
+            )
+        except Exception as e:
+            logger.error(f"[HistorySave] 清空所有数据失败: {e}")
+        return result
 
     async def get_stats(self) -> dict:
         """获取统计信息（今日消息数、今日图片数、总消息数、总图片数）。
@@ -578,8 +672,8 @@ class MySQLManager:
 
     async def query_messages(
         self,
-        group_id: int | None = None,
-        sender_id: int | None = None,
+        group_id: str | None = None,
+        sender_id: str | None = None,
         time_start: str | None = None,
         time_end: str | None = None,
         page: int = 1,
@@ -588,8 +682,8 @@ class MySQLManager:
         """查询聊天记录（支持多条件过滤和分页）。
 
         Args:
-            group_id: 群号过滤（可选）
-            sender_id: QQ 号过滤（可选）
+            group_id: 群号过滤（可选，字符串形式）
+            sender_id: QQ 号过滤（可选，字符串形式）
             time_start: 开始时间（格式 YYYY-MM-DD HH:MM:SS）
             time_end: 结束时间
             page: 页码（从 1 开始）
