@@ -1,24 +1,261 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+"""群聊记录存储插件主入口。
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+监听 QQ 群消息，将文本和图片分别存入 MySQL，提供管理指令和 Web 管理后台。
+"""
+
+import astrbot.api.message_components as Comp
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+
+from .cleaner import ImageCleaner
+from .db_config import ConfigManager
+from .db_mysql import MySQLManager
+from .web_api import WebAPI
+
+
+@register(
+    "astrbot_plugin_group_history_save_mysql",
+    "AnteriorTAg127",
+    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台",
+    "0.1.0",
+)
+class GroupHistoryPlugin(Star):
+    """群聊记录存储插件。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+        # 初始化 MySQL 管理器（动态连接池）
+        self.mysql_mgr = MySQLManager(
+            host=config.get("mysql_host", "127.0.0.1"),
+            port=config.get("mysql_port", 3306),
+            user=config.get("mysql_user", "root"),
+            password=config.get("mysql_password", ""),
+            database=config.get("mysql_database", "astrbot_history"),
+            pool_min_size=config.get("pool_min_size", 1),
+            pool_max_size=config.get("pool_max_size", 10),
+            pool_idle_timeout=config.get("pool_idle_timeout", 120),
+            pool_timeout=config.get("pool_timeout", 30),
+        )
+
+        # 初始化本地配置管理器
+        self.config_mgr = ConfigManager()
+
+        # 初始化图片清理器
+        self.cleaner = ImageCleaner(self.mysql_mgr, self.config_mgr)
+
+        # 初始化 Web API
+        self.web_api = WebAPI(context, self.mysql_mgr, self.config_mgr, self.cleaner)
+
+        self._initialized = False
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """异步初始化：连接数据库、启动定时任务。"""
+        # 初始化本地配置
+        config_ok = await self.config_mgr.initialize()
+        if not config_ok:
+            logger.error("[HistorySave] 本地配置初始化失败，插件功能受限")
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        # 初始化 MySQL
+        mysql_ok = await self.mysql_mgr.initialize()
+        if mysql_ok:
+            self._initialized = True
+            # 启动图片清理任务
+            await self.cleaner.start()
+            logger.info("[HistorySave] 插件初始化完成，开始监听群消息")
+        else:
+            logger.error("[HistorySave] MySQL 连接失败，聊天记录将不会被保存")
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def on_group_message(self, event: AstrMessageEvent):
+        """监听群消息并保存到 MySQL。"""
+        if not self._initialized:
+            return
+
+        try:
+            group_id = int(event.get_group_id())
+            sender_id = int(event.get_sender_id())
+            sender_name = event.get_sender_name()
+            message_id = event.message_obj.message_id or ""
+
+            # 检查群是否在白名单中
+            if not await self.config_mgr.is_group_enabled(group_id):
+                return
+
+            # 解析消息链
+            message_chain = event.get_messages()
+            text_parts = []
+            image_urls = []
+
+            for component in message_chain:
+                if isinstance(component, Comp.Plain):
+                    text = component.text.strip()
+                    if text:
+                        text_parts.append(text)
+                elif isinstance(component, Comp.Image):
+                    url = component.url or component.file or ""
+                    if url:
+                        image_urls.append(url)
+
+            # 保存文本消息
+            if text_parts:
+                content = "\n".join(text_parts)
+                msg_type = "mixed" if image_urls else "text"
+                await self.mysql_mgr.insert_chat_message(
+                    group_id=group_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    message_type=msg_type,
+                    content=content,
+                    message_id=message_id,
+                )
+
+            # 保存图片记录
+            for url in image_urls:
+                await self.mysql_mgr.insert_image_record(
+                    group_id=group_id,
+                    sender_id=sender_id,
+                    image_url=url,
+                )
+
+        except Exception as e:
+            logger.error(f"[HistorySave] 处理群消息时出错: {e}")
+
+    @filter.command("history_start")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def history_start(self, event: AstrMessageEvent, group_id: str = ""):
+        """开启指定群的聊天记录保存。
+
+        用法: /history_start [群号]
+        不填群号则默认为当前群。
+        """
+        target_group = await self._resolve_group_id(event, group_id)
+        if target_group is None:
+            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
+            return
+
+        success = await self.config_mgr.add_group(target_group)
+        if success:
+            yield event.plain_result(f"已开启群 {target_group} 的聊天记录保存。")
+        else:
+            yield event.plain_result(f"开启群 {target_group} 记录失败，请检查日志。")
+
+    @filter.command("history_stop")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def history_stop(self, event: AstrMessageEvent, group_id: str = ""):
+        """关闭指定群的聊天记录保存。
+
+        用法: /history_stop [群号]
+        不填群号则默认为当前群。
+        """
+        target_group = await self._resolve_group_id(event, group_id)
+        if target_group is None:
+            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
+            return
+
+        success = await self.config_mgr.remove_group(target_group)
+        if success:
+            yield event.plain_result(f"已关闭群 {target_group} 的聊天记录保存。")
+        else:
+            yield event.plain_result(f"关闭群 {target_group} 记录失败，请检查日志。")
+
+    @filter.command("history_status")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def history_status(self, event: AstrMessageEvent):
+        """查询聊天记录保存的状态。"""
+        # 数据库连接状态
+        ping = await self.mysql_mgr.ping()
+        db_status = "✅ 已连接" if ping["connected"] else "❌ 未连接"
+        latency = f"{ping['latency_ms']}ms" if ping["connected"] else "-"
+        pool_info = ping.get("pool", {})
+        pool_str = (
+            f"{pool_info.get('used', 0)}活跃/"
+            f"{pool_info.get('current_size', 0)}总计 "
+            f"(范围 {pool_info.get('min_size', 1)}~{pool_info.get('max_size', 10)})"
+        )
+
+        # 统计信息
+        stats = await self.mysql_mgr.get_stats()
+
+        # 群列表
+        groups = await self.config_mgr.get_groups()
+        settings = await self.config_mgr.get_all_settings()
+        all_mode = settings.get("all_mode", "false") == "true"
+
+        enabled_groups = [g for g in groups if g["enabled"]]
+        group_list = ", ".join(str(g["group_id"]) for g in enabled_groups) or "无"
+
+        text = (
+            f"📊 群聊记录存储状态\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"数据库: {db_status} ({latency})\n"
+            f"连接池: {pool_str}\n"
+            f"ALL 模式: {'开启' if all_mode else '关闭'}\n"
+            f"记录中的群: {group_list}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"今日消息: {stats.get('today_messages', 0)} 条\n"
+            f"今日图片: {stats.get('today_images', 0)} 条\n"
+            f"总消息: {stats.get('total_messages', 0)} 条\n"
+            f"总图片: {stats.get('total_images', 0)} 条\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"图片保留: {settings.get('image_retention_days', '3')} 天"
+        )
+        yield event.plain_result(text)
+
+    @filter.command("history_clean")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def history_clean(self, event: AstrMessageEvent, days: str = ""):
+        """手动清理过期的图片记录。
+
+        用法: /history_clean [天数]
+        不填天数则使用配置的默认值。
+        """
+        clean_days = None
+        if days:
+            try:
+                clean_days = int(days)
+                if clean_days < 1:
+                    yield event.plain_result("天数不能小于 1。")
+                    return
+            except ValueError:
+                yield event.plain_result("请提供有效的天数（正整数）。")
+                return
+
+        deleted = await self.cleaner.manual_clean(clean_days)
+        if deleted >= 0:
+            actual_days = clean_days or int(
+                await self.config_mgr.get_setting("image_retention_days", "3")
+            )
+            yield event.plain_result(
+                f"清理完成：删除了 {deleted} 条 {actual_days} 天前的图片记录。"
+            )
+        else:
+            yield event.plain_result("清理失败，请检查数据库连接。")
+
+    async def _resolve_group_id(
+        self, event: AstrMessageEvent, group_id_str: str
+    ) -> int | None:
+        """解析目标群号：优先使用参数，否则使用当前群。"""
+        if group_id_str:
+            try:
+                return int(group_id_str)
+            except ValueError:
+                return None
+        # 尝试获取当前群号
+        try:
+            gid = event.get_group_id()
+            if gid:
+                return int(gid)
+        except (ValueError, TypeError):
+            pass
+        return None
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件卸载/停用时清理资源。"""
+        await self.cleaner.stop()
+        await self.mysql_mgr.close()
+        await self.config_mgr.close()
+        logger.info("[HistorySave] 插件已安全停止")

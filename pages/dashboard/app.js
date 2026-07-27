@@ -1,0 +1,293 @@
+const bridge = window.AstrBotPluginPage;
+await bridge.ready();
+
+let currentPage = 1;
+const pageSize = 50;
+
+// ========== Toast ==========
+function showToast(msg, type = "") {
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.className = "toast show" + (type ? ` ${type}` : "");
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+// ========== Tab 切换 ==========
+document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+        document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+        tab.classList.add("active");
+        document.getElementById(`page-${tab.dataset.tab}`).classList.add("active");
+    });
+});
+
+// ========== 初始化 ==========
+async function init() {
+    bindEvents();
+    await Promise.all([loadStatus(), loadGroups(), loadSettings(), loadDailyStats()]);
+}
+
+// ========== 状态 ==========
+async function loadStatus() {
+    const badge = document.getElementById("dbBadge");
+    try {
+        const data = await bridge.apiGet("status");
+        const db = data.database || {};
+        if (db.connected) {
+            badge.textContent = `已连接 · ${db.latency_ms}ms`;
+            badge.className = "db-badge online";
+        } else {
+            badge.textContent = "未连接";
+            badge.className = "db-badge offline";
+        }
+        // 连接池信息
+        const pool = db.pool || {};
+        document.getElementById("poolUsed").textContent = pool.used ?? 0;
+        document.getElementById("poolFree").textContent = pool.free ?? 0;
+        document.getElementById("poolRange").textContent = `${pool.min_size ?? 1} ~ ${pool.max_size ?? 10}`;
+        document.getElementById("poolCreated").textContent = pool.total_created ?? 0;
+        document.getElementById("poolRecycled").textContent = pool.total_recycled ?? 0;
+
+        const stats = data.stats || {};
+        document.getElementById("todayMessages").textContent = stats.today_messages ?? 0;
+        document.getElementById("todayImages").textContent = stats.today_images ?? 0;
+        document.getElementById("totalMessages").textContent = formatNum(stats.total_messages ?? 0);
+        document.getElementById("enabledGroups").textContent = data.enabled_groups ?? 0;
+        document.getElementById("allModeToggle").checked = data.all_mode || false;
+    } catch {
+        badge.textContent = "请求失败";
+        badge.className = "db-badge offline";
+    }
+}
+
+function formatNum(n) {
+    if (n >= 10000) return (n / 10000).toFixed(1) + "w";
+    return String(n);
+}
+
+// ========== 群管理 ==========
+async function loadGroups() {
+    const container = document.getElementById("groupList");
+    try {
+        const data = await bridge.apiGet("groups");
+        const groups = data.groups || [];
+        document.getElementById("allModeToggle").checked = data.all_mode || false;
+
+        if (groups.length === 0) {
+            container.innerHTML = '<div class="loading">暂无配置的群，请添加</div>';
+            return;
+        }
+
+        container.innerHTML = groups
+            .map(
+                (g) => `
+            <div class="group-item">
+                <div class="group-avatar">${String(g.group_id).slice(-4)}</div>
+                <div class="group-info">
+                    <div class="group-name">${g.group_id}</div>
+                    <div class="group-time">添加于 ${g.created_at || "未知"}</div>
+                </div>
+                <div class="group-actions">
+                    <label class="mini-toggle">
+                        <input type="checkbox" ${g.enabled ? "checked" : ""}
+                               onchange="toggleGroup(${g.group_id})">
+                        <span class="mini-track"></span>
+                    </label>
+                    <button class="btn btn-ghost btn-sm" onclick="removeGroup(${g.group_id})">移除</button>
+                </div>
+            </div>`
+            )
+            .join("");
+    } catch {
+        container.innerHTML = '<div class="loading">加载失败</div>';
+    }
+}
+
+window.toggleGroup = async function (groupId) {
+    try {
+        await bridge.apiPost("groups/toggle", { group_id: groupId });
+        await loadGroups();
+    } catch (e) {
+        showToast("操作失败: " + e.message, "error");
+    }
+};
+
+window.removeGroup = async function (groupId) {
+    if (!confirm(`确定要移除群 ${groupId} 吗？`)) return;
+    try {
+        await bridge.apiPost("groups/remove", { group_id: groupId });
+        showToast(`已移除群 ${groupId}`, "success");
+        await loadGroups();
+    } catch (e) {
+        showToast("移除失败: " + e.message, "error");
+    }
+};
+
+// ========== 设置 ==========
+async function loadSettings() {
+    try {
+        const settings = await bridge.apiGet("settings");
+        document.getElementById("retentionDays").value = settings.image_retention_days || 3;
+    } catch { /* ignore */ }
+}
+
+// ========== 每日统计 ==========
+async function loadDailyStats() {
+    const container = document.getElementById("dailyStats");
+    try {
+        const data = await bridge.apiGet("stats/daily", { days: 7 });
+        const stats = data.data || [];
+
+        if (stats.length === 0) {
+            container.innerHTML = '<div class="loading">暂无数据</div>';
+            return;
+        }
+
+        const maxVal = Math.max(...stats.map((s) => s.messages + s.images), 1);
+
+        container.innerHTML = stats
+            .map((s) => {
+                const total = s.messages + s.images;
+                const pct = Math.max((total / maxVal) * 100, 1);
+                const dateStr = s.date.slice(5); // MM-DD
+                return `
+                <div class="daily-row">
+                    <span class="daily-date">${dateStr}</span>
+                    <div class="daily-bar-wrap">
+                        <div class="daily-bar" style="width:${pct}%"></div>
+                    </div>
+                    <span class="daily-count">${total}</span>
+                </div>`;
+            })
+            .join("");
+    } catch {
+        container.innerHTML = '<div class="loading">加载失败</div>';
+    }
+}
+
+// ========== 查询 ==========
+async function doQuery(page = 1) {
+    currentPage = page;
+    const params = { page, page_size: pageSize };
+
+    const groupId = document.getElementById("queryGroupId").value.trim();
+    const senderId = document.getElementById("querySenderId").value.trim();
+    const timeStart = document.getElementById("queryTimeStart").value;
+    const timeEnd = document.getElementById("queryTimeEnd").value;
+
+    if (groupId) params.group_id = parseInt(groupId);
+    if (senderId) params.sender_id = parseInt(senderId);
+    if (timeStart) params.time_start = timeStart.replace("T", " ") + ":00";
+    if (timeEnd) params.time_end = timeEnd.replace("T", " ") + ":59";
+
+    try {
+        const data = await bridge.apiGet("query", params);
+        const total = data.total || 0;
+        const rows = data.data || [];
+
+        document.getElementById("queryInfo").textContent = `共 ${total} 条记录`;
+
+        const table = document.getElementById("queryTable");
+        const empty = document.getElementById("queryEmpty");
+        const tbody = document.getElementById("queryTableBody");
+
+        if (rows.length === 0) {
+            table.style.display = "none";
+            empty.style.display = "block";
+            document.getElementById("pagination").style.display = "none";
+            return;
+        }
+
+        empty.style.display = "none";
+        table.style.display = "table";
+        tbody.innerHTML = rows
+            .map(
+                (r) => `
+            <tr>
+                <td>${r.timestamp}</td>
+                <td>${r.group_id}</td>
+                <td>${r.sender_id}</td>
+                <td>${r.sender_name || "-"}</td>
+                <td><span class="type-badge">${r.message_type}</span></td>
+                <td class="content-cell" title="${escapeAttr(r.content || "")}">${escapeHtml(r.content || "")}</td>
+            </tr>`
+            )
+            .join("");
+
+        const totalPages = Math.ceil(total / pageSize);
+        const pagination = document.getElementById("pagination");
+        pagination.style.display = totalPages > 1 ? "flex" : "none";
+        document.getElementById("pageInfo").textContent = `${page} / ${totalPages}`;
+        document.getElementById("prevPage").disabled = page <= 1;
+        document.getElementById("nextPage").disabled = page >= totalPages;
+    } catch (e) {
+        document.getElementById("queryInfo").textContent = "查询失败: " + e.message;
+    }
+}
+
+function escapeHtml(text) {
+    const d = document.createElement("div");
+    d.textContent = text;
+    return d.innerHTML;
+}
+
+function escapeAttr(text) {
+    return text.replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+// ========== 事件绑定 ==========
+function bindEvents() {
+    document.getElementById("addGroupBtn").addEventListener("click", async () => {
+        const input = document.getElementById("newGroupId");
+        const gid = input.value.trim();
+        if (!gid || isNaN(gid)) { showToast("请输入有效的群号", "error"); return; }
+        try {
+            await bridge.apiPost("groups/add", { group_id: parseInt(gid) });
+            input.value = "";
+            showToast(`已添加群 ${gid}`, "success");
+            await loadGroups();
+        } catch (e) { showToast("添加失败: " + e.message, "error"); }
+    });
+
+    document.getElementById("newGroupId").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") document.getElementById("addGroupBtn").click();
+    });
+
+    document.getElementById("allModeToggle").addEventListener("change", async (e) => {
+        try {
+            await bridge.apiPost("settings/save", { all_mode: e.target.checked });
+            showToast(e.target.checked ? "已开启 ALL 模式" : "已关闭 ALL 模式", "success");
+        } catch (err) {
+            showToast("保存失败: " + err.message, "error");
+            e.target.checked = !e.target.checked;
+        }
+    });
+
+    document.getElementById("saveSettingsBtn").addEventListener("click", async () => {
+        const days = parseInt(document.getElementById("retentionDays").value);
+        if (isNaN(days) || days < 1) { showToast("请输入有效天数", "error"); return; }
+        try {
+            await bridge.apiPost("settings/save", { image_retention_days: days });
+            showToast("设置已保存", "success");
+        } catch (e) { showToast("保存失败: " + e.message, "error"); }
+    });
+
+    document.getElementById("cleanBtn").addEventListener("click", async () => {
+        if (!confirm("确定要清理过期图片记录吗？此操作不可撤销。")) return;
+        try {
+            const data = await bridge.apiPost("clean", {});
+            showToast(`已清理 ${data.deleted} 条图片记录`, "success");
+            await loadStatus();
+        } catch (e) { showToast("清理失败: " + e.message, "error"); }
+    });
+
+    document.getElementById("queryBtn").addEventListener("click", () => doQuery(1));
+    document.getElementById("prevPage").addEventListener("click", () => {
+        if (currentPage > 1) doQuery(currentPage - 1);
+    });
+    document.getElementById("nextPage").addEventListener("click", () => doQuery(currentPage + 1));
+}
+
+init();

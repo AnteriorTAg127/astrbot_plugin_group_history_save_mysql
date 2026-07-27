@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>群聊记录管理</title>
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- 顶栏 -->
+        <header class="header">
+            <div class="header-left">
+                <span class="header-icon">💬</span>
+                <h1>群聊记录存储</h1>
+            </div>
+            <div class="header-right">
+                <span class="db-badge" id="dbBadge">检测中</span>
+            </div>
+        </header>
+
+        <!-- Tab 导航 -->
+        <nav class="tabs">
+            <button class="tab active" data-tab="overview">概览</button>
+            <button class="tab" data-tab="groups">群管理</button>
+            <button class="tab" data-tab="query">查询</button>
+            <button class="tab" data-tab="settings">设置</button>
+        </nav>
+
+        <!-- 概览页 -->
+        <section class="page active" id="page-overview">
+            <div class="stats-grid">
+                <div class="stat-card stat-blue">
+                    <div class="stat-icon">📨</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="todayMessages">-</div>
+                        <div class="stat-label">今日消息</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-purple">
+                    <div class="stat-icon">🖼️</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="todayImages">-</div>
+                        <div class="stat-label">今日图片</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-green">
+                    <div class="stat-icon">📚</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="totalMessages">-</div>
+                        <div class="stat-label">总消息数</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-orange">
+                    <div class="stat-icon">👥</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="enabledGroups">-</div>
+                        <div class="stat-label">记录中的群</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 连接池状态 -->
+            <div class="section-card pool-card">
+                <div class="section-title"><span>🔗 连接池</span></div>
+                <div class="pool-info">
+                    <div class="pool-item">
+                        <span class="pool-label">活跃连接</span>
+                        <span class="pool-value" id="poolUsed">-</span>
+                    </div>
+                    <div class="pool-item">
+                        <span class="pool-label">空闲连接</span>
+                        <span class="pool-value" id="poolFree">-</span>
+                    </div>
+                    <div class="pool-item">
+                        <span class="pool-label">连接范围</span>
+                        <span class="pool-value" id="poolRange">-</span>
+                    </div>
+                    <div class="pool-item">
+                        <span class="pool-label">累计创建</span>
+                        <span class="pool-value" id="poolCreated">-</span>
+                    </div>
+                    <div class="pool-item">
+                        <span class="pool-label">累计回收</span>
+                        <span class="pool-value" id="poolRecycled">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 每日统计 -->
+            <div class="section-card">
+                <div class="section-title">
+                    <span>📈 最近 7 天趋势</span>
+                </div>
+                <div id="dailyStats" class="daily-stats">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 群管理页 -->
+        <section class="page" id="page-groups">
+            <div class="section-card">
+                <div class="section-title">
+                    <span>👥 群白名单</span>
+                    <label class="all-mode-switch">
+                        <input type="checkbox" id="allModeToggle">
+                        <span class="switch-track"><span class="switch-thumb"></span></span>
+                        <span class="switch-text">ALL 模式</span>
+                    </label>
+                </div>
+                <div class="add-group-bar">
+                    <input type="text" id="newGroupId" placeholder="输入群号..." class="input">
+                    <button id="addGroupBtn" class="btn btn-primary">
+                        <span>＋</span> 添加
+                    </button>
+                </div>
+                <div id="groupList" class="group-list">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 查询页 -->
+        <section class="page" id="page-query">
+            <div class="section-card">
+                <div class="section-title"><span>🔍 聊天记录查询</span></div>
+                <div class="query-filters">
+                    <div class="filter-group">
+                        <label>群号</label>
+                        <input type="text" id="queryGroupId" placeholder="全部" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>QQ 号</label>
+                        <input type="text" id="querySenderId" placeholder="全部" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>开始时间</label>
+                        <input type="datetime-local" id="queryTimeStart" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>结束时间</label>
+                        <input type="datetime-local" id="queryTimeEnd" class="input">
+                    </div>
+                    <div class="filter-group filter-action">
+                        <button id="queryBtn" class="btn btn-primary">查询</button>
+                    </div>
+                </div>
+                <div class="query-meta">
+                    <span id="queryInfo"></span>
+                </div>
+                <div class="table-wrap">
+                    <table id="queryTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>群号</th>
+                                <th>QQ号</th>
+                                <th>昵称</th>
+                                <th>类型</th>
+                                <th>内容</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queryTableBody"></tbody>
+                    </table>
+                    <div id="queryEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>暂无匹配的聊天记录</p>
+                    </div>
+                </div>
+                <div class="pagination" id="pagination" style="display:none;">
+                    <button id="prevPage" class="btn btn-ghost">← 上一页</button>
+                    <span id="pageInfo" class="page-info">1 / 1</span>
+                    <button id="nextPage" class="btn btn-ghost">下一页 →</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 设置页 -->
+        <section class="page" id="page-settings">
+            <div class="section-card">
+                <div class="section-title"><span>⚙️ 插件设置</span></div>
+                <div class="settings-form">
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <div class="setting-name">图片保留天数</div>
+                            <div class="setting-desc">超过此天数的图片 URL 记录将被自动清理</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="retentionDays" min="1" max="365" value="3" class="input input-sm">
+                            <span class="unit">天</span>
+                        </div>
+                    </div>
+                    <div class="setting-actions">
+                        <button id="saveSettingsBtn" class="btn btn-primary">保存设置</button>
+                    </div>
+                </div>
+            </div>
+            <div class="section-card">
+                <div class="section-title"><span>🧹 数据维护</span></div>
+                <div class="danger-zone">
+                    <div class="setting-info">
+                        <div class="setting-name">手动清理过期图片</div>
+                        <div class="setting-desc">立即删除超过保留天数的图片 URL 记录，此操作不可撤销</div>
+                    </div>
+                    <button id="cleanBtn" class="btn btn-danger">执行清理</button>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast"></div>
+
+    <script type="module" src="./app.js"></script>
+</body>
+</html>
