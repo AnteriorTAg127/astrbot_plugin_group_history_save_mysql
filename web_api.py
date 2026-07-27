@@ -214,7 +214,7 @@ class WebAPI:
         if days > 90:
             days = 90
         stats = await self.mysql_mgr.get_daily_stats(days)
-        return json_response({"days": days, "data": stats})
+        return json_response({"days": days, "items": stats})
 
     async def api_clean(self):
         """手动触发图片清理。"""

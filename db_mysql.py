@@ -712,9 +712,9 @@ class MySQLManager:
             page_size: 每页条数
 
         Returns:
-            dict: {"total": int, "data": list[dict]}
+            dict: {"total": int, "records": list[dict]}
         """
-        result = {"total": 0, "data": []}
+        result = {"total": 0, "records": []}
         try:
             conditions = []
             params = []
@@ -767,7 +767,7 @@ class MySQLManager:
                     rows = await cur.fetchall()
                     for row in rows:
                         row["timestamp"] = str(row["timestamp"])
-                    result["data"] = rows
+                    result["records"] = rows
         except Exception as e:
             logger.error(f"[HistorySave] 查询聊天记录失败: {e}")
         return result

@@ -138,7 +138,7 @@ async function loadDailyStats() {
     const container = document.getElementById("dailyStats");
     try {
         const data = await bridge.apiGet("stats/daily", { days: 7 });
-        const stats = data.data || [];
+        const stats = data.items || [];
 
         if (stats.length === 0) {
             container.innerHTML = '<div class="loading">暂无数据</div>';
@@ -170,7 +170,8 @@ async function loadDailyStats() {
 // ========== 查询 ==========
 async function doQuery(page = 1) {
     currentPage = page;
-    const params = { page, page_size: pageSize };
+    // _t 时间戳：破除浏览器对 GET 查询响应的缓存，否则相同 URL 的 ajax 会返回旧的 total:0
+    const params = { page, page_size: pageSize, _t: Date.now() };
 
     const groupId = document.getElementById("queryGroupId").value.trim();
     const senderId = document.getElementById("querySenderId").value.trim();
@@ -188,7 +189,7 @@ async function doQuery(page = 1) {
     try {
         const data = await bridge.apiGet("query", params);
         const total = data.total || 0;
-        const rows = data.data || [];
+        const rows = data.records || [];
 
         document.getElementById("queryInfo").textContent = `共 ${total} 条记录`;
 
