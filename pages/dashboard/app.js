@@ -174,11 +174,14 @@ async function doQuery(page = 1) {
 
     const groupId = document.getElementById("queryGroupId").value.trim();
     const senderId = document.getElementById("querySenderId").value.trim();
+    const keyword = document.getElementById("queryKeyword").value.trim();
     const timeStart = document.getElementById("queryTimeStart").value;
     const timeEnd = document.getElementById("queryTimeEnd").value;
 
-    if (groupId) params.group_id = parseInt(groupId);
-    if (senderId) params.sender_id = parseInt(senderId);
+    // v0.2 起群号/QQ 号为文本字段，原样透传（不再 parseInt，避免大数精度损失与 NaN 匹配不到）
+    if (groupId) params.group_id = groupId;
+    if (senderId) params.sender_id = senderId;
+    if (keyword) params.keyword = keyword;
     if (timeStart) params.time_start = timeStart.replace("T", " ") + ":00";
     if (timeEnd) params.time_end = timeEnd.replace("T", " ") + ":59";
 

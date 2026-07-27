@@ -561,7 +561,12 @@ class MySQLManager:
             return -1
 
     async def purge_all(self) -> dict:
-        """清空所有聊天记录和图片记录（不可恢复）。
+        """清空所有聊天记录和图片记录（不可恢复），并复位自增 ID。
+
+        用 DELETE 清空（保留删除条数供前端提示），随后对每张表执行
+        ``ALTER TABLE ... AUTO_INCREMENT = 1`` 复位自增主键——因为 InnoDB 的
+        DELETE 不会自动复位自增计数，不复位会导致清空后新数据 ID 从旧最大值继续。
+        复位语句各自独立 try/except，失败仅记 warning，不影响清空本身。
 
         Returns:
             dict: {"success": bool, "deleted_messages": int, "deleted_images": int}
@@ -572,8 +577,10 @@ class MySQLManager:
                 async with conn.cursor() as cur:
                     await cur.execute("DELETE FROM chat_history")
                     result["deleted_messages"] = cur.rowcount
+                    await self._reset_auto_increment(cur, "chat_history")
                     await cur.execute("DELETE FROM image_records")
                     result["deleted_images"] = cur.rowcount
+                    await self._reset_auto_increment(cur, "image_records")
             result["success"] = True
             logger.warning(
                 f"[HistorySave] 已清空所有数据: 聊天记录 {result['deleted_messages']} 条, "
@@ -582,6 +589,19 @@ class MySQLManager:
         except Exception as e:
             logger.error(f"[HistorySave] 清空所有数据失败: {e}")
         return result
+
+    async def _reset_auto_increment(self, cur, table: str) -> None:
+        """表清空后将自增 ID 复位到 1。
+
+        DELETE 不会复位 InnoDB 自增计数，需显式 ALTER。表名来自本类硬编码，无注入风险。
+        权限不足等异常仅记 warning，不向上抛（清空已成功，只是 ID 未复位）。
+        """
+        try:
+            await cur.execute(f"ALTER TABLE {table} AUTO_INCREMENT = 1")
+        except Exception as e:
+            logger.warning(
+                f"[HistorySave] 复位 {table} 自增 ID 失败（不影响清空）: {e}"
+            )
 
     async def get_stats(self) -> dict:
         """获取统计信息（今日消息数、今日图片数、总消息数、总图片数）。
@@ -676,6 +696,7 @@ class MySQLManager:
         sender_id: str | None = None,
         time_start: str | None = None,
         time_end: str | None = None,
+        keyword: str | None = None,
         page: int = 1,
         page_size: int = 50,
     ) -> dict:
@@ -686,6 +707,7 @@ class MySQLManager:
             sender_id: QQ 号过滤（可选，字符串形式）
             time_start: 开始时间（格式 YYYY-MM-DD HH:MM:SS）
             time_end: 结束时间
+            keyword: 关键词，模糊匹配 content 与 sender_name（可选）
             page: 页码（从 1 开始）
             page_size: 每页条数
 
@@ -709,6 +731,16 @@ class MySQLManager:
             if time_end:
                 conditions.append("timestamp <= %s")
                 params.append(time_end)
+            if keyword:
+                # 转义 LIKE 通配符，避免用户输入的 % _ 干扰匹配
+                kw = (
+                    keyword.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                like = f"%{kw}%"
+                conditions.append("(content LIKE %s OR sender_name LIKE %s)")
+                params.extend([like, like])
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
             offset = (page - 1) * page_size

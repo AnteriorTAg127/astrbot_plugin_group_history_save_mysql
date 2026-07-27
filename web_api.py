@@ -239,6 +239,7 @@ class WebAPI:
         sender_id = request.query.get("sender_id")
         time_start = request.query.get("time_start")
         time_end = request.query.get("time_end")
+        keyword = (request.query.get("keyword") or "").strip() or None
         page = request.query.get("page", 1, type=int)
         page_size = request.query.get("page_size", 50, type=int)
 
@@ -259,6 +260,7 @@ class WebAPI:
             sender_id=sender_id,
             time_start=time_start,
             time_end=time_end,
+            keyword=keyword,
             page=page,
             page_size=page_size,
         )
