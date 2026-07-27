@@ -174,7 +174,7 @@ async function doQuery(page = 1) {
 
     const groupId = document.getElementById("queryGroupId").value.trim();
     const senderId = document.getElementById("querySenderId").value.trim();
-    const keyword = document.getElementById("queryKeyword").value.trim();
+    const keyword = (document.getElementById("queryKeyword")?.value || "").trim();
     const timeStart = document.getElementById("queryTimeStart").value;
     const timeEnd = document.getElementById("queryTimeEnd").value;
 
