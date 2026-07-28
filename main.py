@@ -74,7 +74,7 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台",
-    "0.2.0",
+    "0.2.1",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -186,7 +186,7 @@ class GroupHistoryPlugin(Star):
                 )
 
         except Exception as e:
-            logger.error(f"[HistorySave] 处理群消息时出错: {e}")
+            logger.error(f"[HistorySave] 处理群消息时出错: {e}", exc_info=True)
 
     @filter.command("history_start")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -196,7 +196,7 @@ class GroupHistoryPlugin(Star):
         用法: /history_start [群号]
         不填群号则默认为当前群。
         """
-        target_group = await self._resolve_group_id(event, group_id)
+        target_group = self._resolve_group_id(event, group_id)
         if target_group is None:
             yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
             return
@@ -215,7 +215,7 @@ class GroupHistoryPlugin(Star):
         用法: /history_stop [群号]
         不填群号则默认为当前群。
         """
-        target_group = await self._resolve_group_id(event, group_id)
+        target_group = self._resolve_group_id(event, group_id)
         if target_group is None:
             yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
             return
@@ -299,7 +299,7 @@ class GroupHistoryPlugin(Star):
         else:
             yield event.plain_result("清理失败，请检查数据库连接。")
 
-    async def _resolve_group_id(
+    def _resolve_group_id(
         self, event: AstrMessageEvent, group_id_str: str
     ) -> int | None:
         """解析目标群号：优先使用参数，否则使用当前群。"""

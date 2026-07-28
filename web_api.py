@@ -18,6 +18,7 @@ from .db_mysql import MySQLManager
 PLUGIN_NAME = "astrbot_plugin_group_history_save_mysql"
 
 CHALLENGE_TTL = 300  # 清空验证题目有效期（秒）
+CHALLENGE_MAX = 1000  # 同时存留的验证题目上限，超过拒绝新建
 
 
 def make_challenge() -> tuple[str, str, int]:
@@ -208,7 +209,11 @@ class WebAPI:
 
     async def api_daily_stats(self):
         """获取每日存储统计。"""
-        days = request.query.get("days", 7, type=int)
+        days_str = request.query.get("days") or "7"
+        try:
+            days = int(days_str)
+        except (ValueError, TypeError):
+            days = 7
         if days < 1:
             days = 7
         if days > 90:
@@ -240,8 +245,17 @@ class WebAPI:
         time_start = request.query.get("time_start")
         time_end = request.query.get("time_end")
         keyword = (request.query.get("keyword") or "").strip() or None
-        page = request.query.get("page", 1, type=int)
-        page_size = request.query.get("page_size", 50, type=int)
+        # 显式转换，避免框架 type=int 行为不一致
+        page_str = request.query.get("page") or "1"
+        try:
+            page = int(page_str)
+        except (ValueError, TypeError):
+            page = 1
+        page_size_str = request.query.get("page_size") or "50"
+        try:
+            page_size = int(page_size_str)
+        except (ValueError, TypeError):
+            page_size = 50
 
         # 参数校验
         if page < 1:
@@ -273,6 +287,9 @@ class WebAPI:
         self._purge_challenges = {
             k: v for k, v in self._purge_challenges.items() if v[1] > now
         }
+        # 超过上限拒绝新建，防止高频调用导致内存膨胀
+        if len(self._purge_challenges) >= CHALLENGE_MAX:
+            return error_response("验证请求过于频繁，请稍后再试", status_code=429)
         challenge_id, question, answer = make_challenge()
         self._purge_challenges[challenge_id] = (answer, now + CHALLENGE_TTL)
         return json_response({"challenge_id": challenge_id, "question": question})
@@ -301,8 +318,12 @@ class WebAPI:
         if not result.get("success"):
             return error_response("清空数据失败，请检查数据库连接", status_code=500)
 
-        logger.warning(
-            f"[HistorySave] Web 后台执行清空所有数据：删除 {result['deleted_messages']} 条消息、"
-            f"{result['deleted_images']} 条图片"
-        )
+        if result.get("truncated"):
+            logger.warning("[HistorySave] Web 后台执行清空所有数据（TRUNCATE）")
+        else:
+            logger.warning(
+                f"[HistorySave] Web 后台执行清空所有数据（DELETE）：删除 "
+                f"{result['deleted_messages']} 条消息、"
+                f"{result['deleted_images']} 条图片"
+            )
         return json_response(result)

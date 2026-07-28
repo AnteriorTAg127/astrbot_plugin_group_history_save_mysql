@@ -257,7 +257,8 @@ async function refreshChallenge() {
     } catch (e) {
         purgeChallengeId = null;
         questionEl.textContent = "题目加载失败";
-        showToast("获取验证题目失败: " + e.message, "error");
+        // 429 错误时 e.message 已包含"频繁"提示，直接展示
+        showToast(e.message || "获取验证题目失败", "error");
         return false;
     }
 }
@@ -285,7 +286,12 @@ async function confirmPurge() {
     btn.disabled = true;
     try {
         const data = await bridge.apiPost("purge", { challenge_id: purgeChallengeId, answer: Number(answer) });
-        showToast(`已清空：${data.deleted_messages} 条消息、${data.deleted_images} 条图片`, "success");
+        // TRUNCATE 路径不返回精确条数，统一提示"已清空全部数据"
+        if (data.truncated) {
+            showToast("已清空全部数据", "success");
+        } else {
+            showToast(`已清空：${data.deleted_messages} 条消息、${data.deleted_images} 条图片`, "success");
+        }
         closePurgeModal();
         await loadStatus();
     } catch (e) {

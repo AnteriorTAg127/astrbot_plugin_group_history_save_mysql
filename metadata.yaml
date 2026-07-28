@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_history_save_mysql
 display_name: 群聊记录存储
 desc: 将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台。
-version: v0.2.0
+version: v0.2.1
 author: AnteriorTAg127
 repo: https://github.com/AnteriorTAg127/astrbot_plugin_group_history_save_mysql
 support_platforms:

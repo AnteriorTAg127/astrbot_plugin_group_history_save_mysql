@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.2.1] - 2026-07-28
+
+### Fixed
+
+- **连接池性能（严重）**：重构 `DynamicPool._get_connection` 和 `_health_check`，
+  将 `aiomysql.connect()` / `conn.ping()` 等网络 I/O 移出 `Condition` 锁外，
+  高并发下连接池不再退化为串行，吞吐量显著提升
+- **清空性能**：`purge_all` 优先使用 `TRUNCATE TABLE`（DDL，自动复位自增 ID），
+  大表清空从秒级降到毫秒级；无 DROP 权限时自动回退到 DELETE + ALTER 方式
+- **数据目录规范**：`db_config.py` 改用 `StarTools.get_data_dir()` 获取数据目录，
+  符合 AstrBot 插件规范（路径不变，存量 config.db 继续使用）
+- **cursor 资源管理**：aiosqlite 所有 cursor 统一改用 `async with` 管理，
+  避免长期运行资源泄漏
+- **add_group 副作用**：改用 SQLite UPSERT（`ON CONFLICT DO UPDATE`），
+  重复添加群时 `enabled` 强制为 1 但 `created_at` 不被重置
+- **toggle_group 竞态**：改用单条 `UPDATE ... SET enabled = 1 - enabled` 配合
+  `rowcount` 判断，消除 SELECT-then-UPDATE 竞态
+- **_resolve_group_id**：改为同步函数（内部无 await），调用处去掉 await
+- **异常日志**：`on_group_message` 异常日志增加 `exc_info=True`，保留完整堆栈
+- **清理退避**：`cleaner._cleanup_loop` 异常重试改为指数退避（60→120→300→600s），
+  连续失败 5 次告警，避免数据库不可用时无限刷日志
+- **challenge 上限**：`_purge_challenges` 增加 1000 条上限，超限返回 429
+- **参数转换**：`request.query.get` 的 `type=int` 改为显式 `try/except int()`，
+  转换失败回退默认值
+- **docstring 修正**：`insert_chat_message` 的 `message_type` 注释修正为 `text/mixed`
+
 ## [0.2.0] - 2026-07-28
 
 ### Fixed

@@ -5,12 +5,11 @@
 """
 
 from datetime import datetime
-from pathlib import Path
 
 import aiosqlite
 
 from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.api.star import StarTools
 
 PLUGIN_NAME = "astrbot_plugin_group_history_save_mysql"
 
@@ -19,8 +18,8 @@ class ConfigManager:
     """本地 aiosqlite 配置管理器。"""
 
     def __init__(self):
-        data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
-        data_dir.mkdir(parents=True, exist_ok=True)
+        # 使用 StarTools.get_data_dir() 获取规范的数据目录（返回 Path，已自动创建）
+        data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self.db_path = str(data_dir / "config.db")
         self.db: aiosqlite.Connection | None = None
 
@@ -79,14 +78,14 @@ class ConfigManager:
             list[dict]: 群配置列表 [{"group_id": int, "enabled": bool, "created_at": str}]
         """
         try:
-            cursor = await self.db.execute(
+            async with self.db.execute(
                 "SELECT group_id, enabled, created_at FROM group_config ORDER BY created_at DESC"
-            )
-            rows = await cursor.fetchall()
-            return [
-                {"group_id": row[0], "enabled": bool(row[1]), "created_at": row[2]}
-                for row in rows
-            ]
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {"group_id": row[0], "enabled": bool(row[1]), "created_at": row[2]}
+                    for row in rows
+                ]
         except Exception as e:
             logger.error(f"[HistorySave] 获取群列表失败: {e}")
             return []
@@ -101,8 +100,11 @@ class ConfigManager:
             bool: 是否成功
         """
         try:
+            # UPSERT：重复添加时强制 enabled=1，但不重置 created_at（保留首次加入时间）
             await self.db.execute(
-                "INSERT OR REPLACE INTO group_config (group_id, enabled, created_at) VALUES (?, 1, ?)",
+                "INSERT INTO group_config (group_id, enabled, created_at) "
+                "VALUES (?, 1, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET enabled = 1",
                 (group_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
             await self.db.commit()
@@ -140,19 +142,20 @@ class ConfigManager:
             bool: 切换后的状态，群不存在返回 None
         """
         try:
-            cursor = await self.db.execute(
-                "SELECT enabled FROM group_config WHERE group_id = ?", (group_id,)
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            new_state = 0 if row[0] else 1
-            await self.db.execute(
-                "UPDATE group_config SET enabled = ? WHERE group_id = ?",
-                (new_state, group_id),
-            )
+            # 单条 UPDATE 消除 SELECT-then-UPDATE 竞态，rowcount 判断群是否存在
+            async with self.db.execute(
+                "UPDATE group_config SET enabled = 1 - enabled WHERE group_id = ?",
+                (group_id,),
+            ) as cursor:
+                updated = cursor.rowcount
             await self.db.commit()
-            return bool(new_state)
+            if updated == 0:
+                return None
+            async with self.db.execute(
+                "SELECT enabled FROM group_config WHERE group_id = ?", (group_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            return bool(row[0]) if row else None
         except Exception as e:
             logger.error(f"[HistorySave] 切换群状态失败: {e}")
             return None
@@ -174,10 +177,10 @@ class ConfigManager:
             if all_mode == "true":
                 return True
             # 再检查群白名单
-            cursor = await self.db.execute(
+            async with self.db.execute(
                 "SELECT enabled FROM group_config WHERE group_id = ?", (group_id,)
-            )
-            row = await cursor.fetchone()
+            ) as cursor:
+                row = await cursor.fetchone()
             return bool(row[0]) if row else False
         except Exception as e:
             logger.error(f"[HistorySave] 检查群状态失败: {e}")
@@ -196,10 +199,10 @@ class ConfigManager:
             str: 设置值
         """
         try:
-            cursor = await self.db.execute(
+            async with self.db.execute(
                 "SELECT value FROM plugin_settings WHERE key_name = ?", (key,)
-            )
-            row = await cursor.fetchone()
+            ) as cursor:
+                row = await cursor.fetchone()
             return row[0] if row else default
         except Exception as e:
             logger.error(f"[HistorySave] 获取设置失败: {e}")
@@ -233,10 +236,10 @@ class ConfigManager:
             dict: 设置字典
         """
         try:
-            cursor = await self.db.execute(
+            async with self.db.execute(
                 "SELECT key_name, value FROM plugin_settings"
-            )
-            rows = await cursor.fetchall()
+            ) as cursor:
+                rows = await cursor.fetchall()
             return {row[0]: row[1] for row in rows}
         except Exception as e:
             logger.error(f"[HistorySave] 获取所有设置失败: {e}")

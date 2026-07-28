@@ -60,11 +60,12 @@ class DynamicPool:
         # 统计
         self._total_created = 0
         self._total_recycled = 0
+        self._pending = 0  # 正在创建但尚未入池的连接数（用于 max_size 预留）
 
     @property
     def size(self) -> int:
-        """当前总连接数（空闲 + 使用中）。"""
-        return len(self._free) + len(self._used)
+        """当前总连接数（空闲 + 使用中 + 创建中）。"""
+        return len(self._free) + len(self._used) + self._pending
 
     @property
     def free_size(self) -> int:
@@ -146,44 +147,84 @@ class DynamicPool:
             await self._release_connection(conn)
 
     async def _get_connection(self) -> aiomysql.Connection:
-        """从池中获取一个可用连接。"""
+        """从池中获取一个可用连接。
+
+        网络I/O（ping/connect）在锁外执行，避免高并发下连接池退化为串行。
+        锁内仅做 _free.pop / _used.add / _pending++ 等O(1)簿记操作。
+        """
         if self._closed:
             raise RuntimeError("连接池已关闭")
 
         deadline = time.monotonic() + self._acquire_timeout
 
-        async with self._not_empty:
-            while True:
-                # 尝试从空闲连接中取一个
-                while self._free:
-                    conn, _ = self._free.pop(0)
-                    conn = await self._ensure_connection(conn)
-                    self._used.add(conn)
-                    return conn
+        while True:
+            conn_to_check: aiomysql.Connection | None = None
+            should_create = False
 
-                # 无空闲连接，尝试扩容
-                if self.size < self._max_size:
+            # ---- 锁内：快速簿记 ----
+            async with self._not_empty:
+                if self._free:
+                    # 取一个空闲连接，立即标记为使用中
+                    conn_to_check, _ = self._free.pop(0)
+                    self._used.add(conn_to_check)
+                elif self.size < self._max_size:
+                    # 预留扩容槽位（_pending 计入 size，防止其他协程同时扩容超限）
+                    self._pending += 1
+                    should_create = True
+                else:
+                    # 已达上限，等待释放
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
+                            f"当前连接数: {self.size}/{self._max_size}"
+                        )
                     try:
-                        conn = await self._create_connection()
-                        self._used.add(conn)
-                        return conn
-                    except Exception as e:
-                        logger.error(f"[DynamicPool] 扩容创建连接失败: {e}")
+                        await asyncio.wait_for(
+                            self._not_empty.wait(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(
+                            f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
+                            f"当前连接数: {self.size}/{self._max_size}"
+                        )
+                    continue  # 被唤醒后重新尝试
 
-                # 已达上限，等待释放
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
-                        f"当前连接数: {self.size}/{self._max_size}"
-                    )
+            # ---- 锁外：网络 I/O ----
+
+            if conn_to_check is not None:
+                # 确保从空闲池取出的连接可用（ping/reconnect 在锁外）
                 try:
-                    await asyncio.wait_for(self._not_empty.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
-                        f"当前连接数: {self.size}/{self._max_size}"
-                    )
+                    conn = await self._ensure_connection(conn_to_check)
+                    if conn is not conn_to_check:
+                        # 原连接失效已被替换，更新 _used
+                        async with self._lock:
+                            self._used.discard(conn_to_check)
+                            self._used.add(conn)
+                    return conn
+                except Exception as e:
+                    # 确保连接失败，归还槽位并重试
+                    logger.error(f"[DynamicPool] 检查空闲连接失败: {e}")
+                    async with self._lock:
+                        self._used.discard(conn_to_check)
+                        self._not_empty.notify()
+                    continue
+
+            if should_create:
+                # 锁外创建新连接
+                try:
+                    conn = await self._create_connection()
+                    async with self._lock:
+                        self._pending -= 1
+                        self._used.add(conn)
+                    return conn
+                except Exception as e:
+                    logger.error(f"[DynamicPool] 扩容创建连接失败: {e}")
+                    async with self._lock:
+                        self._pending -= 1
+                        self._not_empty.notify()
+                    # 扩容失败后重新循环（可能等待其他连接释放）
+                    continue
 
     async def _release_connection(self, conn: aiomysql.Connection):
         """归还连接到池中。"""
@@ -239,28 +280,50 @@ class DynamicPool:
             )
 
     async def _health_check(self):
-        """检查空闲连接健康状态，移除失效连接。"""
-        to_remove = []
-        async with self._lock:
-            for conn, ts in self._free:
-                if conn.closed or not await self._is_alive(conn):
-                    to_remove.append((conn, ts))
-            for item in to_remove:
-                self._free.remove(item)
+        """检查空闲连接健康状态，移除失效连接。
 
-        for conn, _ in to_remove:
+        ping 操作在锁外执行，避免 reaper 巡检期间阻塞所有 acquire。
+        """
+        # 锁内快照空闲连接列表
+        async with self._lock:
+            snapshot = list(self._free)
+
+        # 锁外逐个 ping
+        dead: list[tuple[aiomysql.Connection, float]] = []
+        for conn, ts in snapshot:
+            if conn.closed or not await self._is_alive(conn):
+                dead.append((conn, ts))
+
+        # 锁内移除失效连接（跳过已被 acquire 取走的）
+        to_close: list[aiomysql.Connection] = []
+        if dead:
+            async with self._lock:
+                for item in dead:
+                    if item in self._free:
+                        self._free.remove(item)
+                        to_close.append(item[0])
+
+        # 锁外关闭失效连接
+        for conn in to_close:
             try:
                 conn.close()
             except Exception:
                 pass
 
         # 如果低于 min_size，补充连接
-        deficit = self._min_size - self.size
+        async with self._lock:
+            deficit = self._min_size - self.size
         if deficit > 0:
             for _ in range(deficit):
                 try:
                     conn = await self._create_connection()
                     async with self._lock:
+                        if self._closed:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            break
                         self._free.append((conn, time.monotonic()))
                 except Exception:
                     break
@@ -481,7 +544,7 @@ class MySQLManager:
             group_id: 群号（字符串形式）
             sender_id: 发送者 QQ 号（字符串形式）
             sender_name: 发送者昵称
-            message_type: 消息类型（text/image/mixed）
+            message_type: 消息类型（text/mixed，纯图片消息不入文本表）
             content: 文本内容
             message_id: 消息 ID
 
@@ -563,32 +626,70 @@ class MySQLManager:
     async def purge_all(self) -> dict:
         """清空所有聊天记录和图片记录（不可恢复），并复位自增 ID。
 
-        用 DELETE 清空（保留删除条数供前端提示），随后对每张表执行
-        ``ALTER TABLE ... AUTO_INCREMENT = 1`` 复位自增主键——因为 InnoDB 的
-        DELETE 不会自动复位自增计数，不复位会导致清空后新数据 ID 从旧最大值继续。
-        复位语句各自独立 try/except，失败仅记 warning，不影响清空本身。
+        优先使用 TRUNCATE TABLE（DDL，自动复位自增 ID，性能远优于 DELETE）。
+        若 MySQL 用户无 DROP 权限（TRUNCATE 需要），回退到 DELETE + ALTER 方式。
 
         Returns:
-            dict: {"success": bool, "deleted_messages": int, "deleted_images": int}
+            dict: {"success": bool, "deleted_messages": int, "deleted_images": int, "truncated": bool}
         """
-        result = {"success": False, "deleted_messages": 0, "deleted_images": 0}
+        result: dict = {
+            "success": False,
+            "deleted_messages": 0,
+            "deleted_images": 0,
+            "truncated": False,
+        }
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("DELETE FROM chat_history")
-                    result["deleted_messages"] = cur.rowcount
-                    await self._reset_auto_increment(cur, "chat_history")
-                    await cur.execute("DELETE FROM image_records")
-                    result["deleted_images"] = cur.rowcount
-                    await self._reset_auto_increment(cur, "image_records")
+                    # chat_history
+                    if await self._truncate_table(cur, "chat_history"):
+                        result["truncated"] = True
+                    else:
+                        await cur.execute("DELETE FROM chat_history")
+                        result["deleted_messages"] = cur.rowcount
+                        await self._reset_auto_increment(cur, "chat_history")
+                    # image_records
+                    if await self._truncate_table(cur, "image_records"):
+                        result["truncated"] = True
+                    else:
+                        await cur.execute("DELETE FROM image_records")
+                        result["deleted_images"] = cur.rowcount
+                        await self._reset_auto_increment(cur, "image_records")
             result["success"] = True
-            logger.warning(
-                f"[HistorySave] 已清空所有数据: 聊天记录 {result['deleted_messages']} 条, "
-                f"图片记录 {result['deleted_images']} 条"
-            )
+            if result["truncated"]:
+                logger.warning("[HistorySave] 已清空所有数据（TRUNCATE）")
+            else:
+                logger.warning(
+                    f"[HistorySave] 已清空所有数据（DELETE）: "
+                    f"聊天记录 {result['deleted_messages']} 条, "
+                    f"图片记录 {result['deleted_images']} 条"
+                )
         except Exception as e:
             logger.error(f"[HistorySave] 清空所有数据失败: {e}")
         return result
+
+    async def _truncate_table(self, cur, table: str) -> bool:
+        """尝试用 TRUNCATE TABLE 清空表。
+
+        TRUNCATE 是 DDL，自动复位自增 ID，性能远优于 DELETE。
+        需要 DROP 权限，权限不足或其他异常时返回 False 供调用方回退到 DELETE。
+
+        Args:
+            cur: 数据库游标
+            table: 表名（本类硬编码，无注入风险）
+
+        Returns:
+            bool: True 表示 TRUNCATE 成功，False 表示需回退到 DELETE
+        """
+        try:
+            await cur.execute(f"TRUNCATE TABLE {table}")
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[HistorySave] TRUNCATE {table} 失败（可能无 DROP 权限），"
+                f"回退到 DELETE: {e}"
+            )
+            return False
 
     async def _reset_auto_increment(self, cur, table: str) -> None:
         """表清空后将自增 ID 复位到 1。

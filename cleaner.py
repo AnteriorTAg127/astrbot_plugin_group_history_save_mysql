@@ -15,11 +15,15 @@ from .db_mysql import MySQLManager
 class ImageCleaner:
     """图片记录定时清理器。"""
 
+    # 异常退避序列（秒），上限 600s
+    _BACKOFF_SEQUENCE = [60, 120, 300, 600]
+
     def __init__(self, mysql_mgr: MySQLManager, config_mgr: ConfigManager):
         self.mysql_mgr = mysql_mgr
         self.config_mgr = config_mgr
         self._task: asyncio.Task | None = None
         self._running = False
+        self._fail_count = 0  # 连续失败次数（成功后重置）
 
     async def start(self):
         """启动定时清理任务。"""
@@ -40,7 +44,11 @@ class ImageCleaner:
         logger.info("[HistorySave] 图片清理定时任务已停止")
 
     async def _cleanup_loop(self):
-        """定时清理循环：每天凌晨 3:00 执行。"""
+        """定时清理循环：每天凌晨 3:00 执行。
+
+        异常后采用指数退避（60→120→300→600s），避免数据库长期不可用 时无限刷日志。
+        连续失败 5 次输出 warning 告警，成功后重置退避计数。
+        """
         from datetime import timedelta
 
         while self._running:
@@ -60,13 +68,23 @@ class ImageCleaner:
 
                 # 执行清理
                 await self._do_cleanup()
+                # 成功后重置退避
+                self._fail_count = 0
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[HistorySave] 清理任务异常: {e}")
-                # 出错后等 60 秒重试
-                await asyncio.sleep(60)
+                # 指数退避：60→120→300→600s（上限）
+                backoff = self._BACKOFF_SEQUENCE[
+                    min(self._fail_count, len(self._BACKOFF_SEQUENCE) - 1)
+                ]
+                self._fail_count += 1
+                if self._fail_count == 5:
+                    logger.warning(
+                        "[HistorySave] 清理任务连续失败 5 次，数据库可能不可用"
+                    )
+                await asyncio.sleep(backoff)
 
     async def _do_cleanup(self):
         """执行一次清理操作。"""
