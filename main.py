@@ -18,6 +18,10 @@ from .db_mysql import MySQLManager
 from .summary import SummaryService
 from .web_api import WebAPI
 
+# 后台 MySQL 初始化的最大连续失败次数：超过后放弃重试并停用存储功能，
+# 避免数据库长期不可用时无限刷日志。恢复方式：修正配置后在插件管理重启插件。
+MAX_INIT_ATTEMPTS = 5
+
 
 def extract_image_urls(message_obj, message_chain) -> list[str]:
     """提取图片的原始 http(s) 链接。
@@ -123,6 +127,8 @@ class GroupHistoryPlugin(Star):
 
         self._initialized = False
         self._init_task: asyncio.Task | None = None
+        # 重试耗尽后置 True：消息直接丢弃（不再缓冲），停止一切存储活动
+        self._db_gave_up = False
         # MySQL 后台初始化窗口内的消息缓冲（FIFO，溢出自动丢弃最旧记录）
         self._pending_records: deque[dict] = deque(maxlen=2000)
         self._last_drop_warn = 0.0  # 缓冲区溢出告警节流时间戳（monotonic 秒）
@@ -142,9 +148,10 @@ class GroupHistoryPlugin(Star):
         logger.info("[HistorySave] 插件已加载，MySQL 连接在后台初始化中")
 
     async def _background_mysql_init(self):
-        """后台初始化 MySQL，失败时周期性重试（每 60 秒一次）。
+        """后台初始化 MySQL，失败时每 60 秒重试一次。
 
-        每次初始化尝试用 10 秒强制兜底，防止任何意外挂起。
+        连续失败 MAX_INIT_ATTEMPTS 次后放弃重试：关闭连接池、停用存储功能，
+        避免数据库长期不可用时无限刷日志。每次尝试用 10 秒强制兜底。
         """
         retry_interval = 60
         init_timeout = 10
@@ -186,6 +193,19 @@ class GroupHistoryPlugin(Star):
                     f"[HistorySave] MySQL 初始化异常（第 {attempt} 次尝试）: {e}，"
                     f"{retry_interval}s 后重试..."
                 )
+            # 重试耗尽：放弃并停用存储功能（关闭连接池使后续操作快速失败）
+            if attempt >= MAX_INIT_ATTEMPTS:
+                self._db_gave_up = True
+                logger.error(
+                    f"[HistorySave] MySQL 连续 {attempt} 次连接失败，停止重试，"
+                    f"消息存储功能已停用。请检查数据库配置与连通性，"
+                    f"然后在插件管理中重启本插件以恢复。"
+                )
+                try:
+                    await self.mysql_mgr.close()
+                except Exception:
+                    pass
+                return
             # 等待后重试
             try:
                 await asyncio.sleep(retry_interval)
@@ -199,7 +219,10 @@ class GroupHistoryPlugin(Star):
 
         MySQL 后台初始化窗口内（首次启动/重连）消息先缓冲，
         初始化成功后统一补录，避免该窗口内的消息丢失。
+        重试耗尽（_db_gave_up）后直接丢弃，不再做任何存储动作。
         """
+        if self._db_gave_up:
+            return
         try:
             group_id = str(event.get_group_id())
             sender_id = str(event.get_sender_id())

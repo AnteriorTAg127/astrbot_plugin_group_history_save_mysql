@@ -62,6 +62,10 @@ class DynamicPool:
         self._total_recycled = 0
         self._pending = 0  # 正在创建但尚未入池的连接数（用于 max_size 预留）
 
+        # 建连失败日志节流状态（60s 窗口 + 窗口内累计次数）
+        self._create_err_log_ts = 0.0
+        self._create_err_count = 0
+
     @property
     def size(self) -> int:
         """当前总连接数（空闲 + 使用中 + 创建中）。"""
@@ -80,23 +84,46 @@ class DynamicPool:
     async def _create_connection(self) -> aiomysql.Connection:
         """创建一个新的数据库连接。
 
-        read_timeout/write_timeout 为所有网络读写（含 ping）兜底，
-        防止半开/黑洞 TCP 连接上的操作挂到操作系统 keepalive 周期（约 2 小时）。
+        不传 read_timeout/write_timeout：aiomysql 各版本支持不一致
+        （0.2.x 的 connect() 不接受这两个参数，直接 TypeError）。
+        防挂起改由两层版本无关的超时兜底：
+        - connect_timeout=10：aiomysql 内部 TCP 连接超时
+        - asyncio.wait_for(15s)：兜住 DNS 解析等 connect_timeout 覆盖不到的挂起
         """
-        conn = await aiomysql.connect(
-            host=self._host,
-            port=self._port,
-            user=self._user,
-            password=self._password,
-            db=self._db,
-            charset="utf8mb4",
-            autocommit=True,
-            connect_timeout=10,
-            read_timeout=30,
-            write_timeout=30,
+        conn = await asyncio.wait_for(
+            aiomysql.connect(
+                host=self._host,
+                port=self._port,
+                user=self._user,
+                password=self._password,
+                db=self._db,
+                charset="utf8mb4",
+                autocommit=True,
+                connect_timeout=10,
+            ),
+            timeout=15,
         )
         self._total_created += 1
         return conn
+
+    def _log_create_error(self, exc: BaseException):
+        """建连失败日志节流：60 秒窗口内最多一条 ERROR，附带累计次数。
+
+        数据库不可用时 Web 后台轮询会每隔几秒触发一次扩容建连，
+        逐条记日志会刷屏。首次失败立即输出，窗口内的后续次数
+        累计后在下一条日志中一并汇报。
+        """
+        now = time.monotonic()
+        self._create_err_count += 1
+        if now - self._create_err_log_ts < 60:
+            return
+        self._create_err_log_ts = now
+        count = self._create_err_count
+        self._create_err_count = 0
+        logger.error(
+            f"[DynamicPool] 创建连接失败（近期累计 {count} 次，"
+            f"抑制重复日志）: {exc}"
+        )
 
     async def initialize(self):
         """初始化连接池，启动 reaper，并尝试预创建 1 个连接。
@@ -329,8 +356,8 @@ class DynamicPool:
             # mode == "create"：锁外创建新连接
             try:
                 conn = await self._create_connection()
-            except BaseException:
-                logger.error("[DynamicPool] 扩容创建连接失败")
+            except BaseException as e:
+                self._log_create_error(e)
                 self._schedule_rollback()
                 raise
             return await self._finish_acquire(conn)
@@ -531,6 +558,25 @@ class MySQLManager:
             idle_timeout=pool_idle_timeout,
             acquire_timeout=pool_timeout,
         )
+        # 查询类操作错误日志节流状态：key -> (上次输出时间, 窗口内累计次数)
+        self._op_err_state: dict[str, tuple[float, int]] = {}
+
+    def _log_op_error(self, key: str, action: str, exc: Exception):
+        """查询类操作的错误日志节流（60s 窗口，按 key 独立累计）。
+
+        数据库不可用/连接池关闭后，Web 后台轮询会高频触发这些操作失败，
+        逐条记录会刷屏。首次失败立即输出 ERROR，窗口内的后续次数累计后
+        在下一条日志中一并汇报。写入类操作（insert/clean/purge）低频且
+        每次失败都意味着真实数据丢失，不走此节流。
+        """
+        now = time.monotonic()
+        last, count = self._op_err_state.get(key, (0.0, 0))
+        count += 1
+        if now - last < 60:
+            self._op_err_state[key] = (last, count)
+            return
+        self._op_err_state[key] = (now, 0)
+        logger.error(f"[HistorySave] {action}失败（近期累计 {count} 次）: {exc}")
 
     async def initialize(self) -> bool:
         """初始化连接池、创建表结构并迁移旧表结构。
@@ -963,7 +1009,7 @@ class MySQLManager:
                         stats["total_images"] = int(row[0] or 0)
                         stats["today_images"] = int(row[1] or 0)
         except Exception as e:
-            logger.error(f"[HistorySave] 获取统计信息失败: {e}")
+            self._log_op_error("get_stats", "获取统计信息", e)
         return stats
 
     async def get_daily_stats(self, days: int = 7) -> list[dict]:
@@ -1015,7 +1061,7 @@ class MySQLManager:
                             }
                         )
         except Exception as e:
-            logger.error(f"[HistorySave] 获取每日统计失败: {e}")
+            self._log_op_error("get_daily_stats", "获取每日统计", e)
         return result
 
     async def query_messages(
@@ -1097,7 +1143,7 @@ class MySQLManager:
                         row["timestamp"] = str(row["timestamp"])
                     result["records"] = rows
         except Exception as e:
-            logger.error(f"[HistorySave] 查询聊天记录失败: {e}")
+            self._log_op_error("query_messages", "查询聊天记录", e)
         return result
 
     async def ping(self) -> dict:
