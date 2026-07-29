@@ -452,9 +452,9 @@ function el(tag, className, text) {
     return node;
 }
 
-// ========== v0.3 Tab 1：总结设置（15 项配置分组表单） ==========
+// ========== v0.3 Tab 1：总结设置（16 项配置分组表单） ==========
 
-// 15 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
+// 16 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
 // kind 与后端 SUMMARY_TYPES（bool/int/float/list/str）一一对应，
 // 请求封装沿用 bridge.apiGet/apiPost（路径相对插件 API 前缀，响应已由桥接解包）
 const SUMMARY_FIELD_META = [
@@ -470,6 +470,7 @@ const SUMMARY_FIELD_META = [
     { key: "summary_onebot_max_fetch", group: "参数上限", label: "OneBot 最大拉取", desc: "单次从协议端最多拉取的历史消息条数", kind: "int", unit: "条", min: 1 },
     { key: "summary_min_mysql_ratio", group: "参数上限", label: "MySQL 补齐阈值", desc: "数量模式：MySQL 实得/请求 < 此值才拉 OneBot 补齐（0~1）", kind: "ratio" },
     { key: "summary_gap_tolerance_minutes", group: "参数上限", label: "缺口容忍分钟数", desc: "时间模式的缺口容忍分钟数", kind: "int", unit: "分钟", min: 0 },
+    { key: "summary_max_prompt_chars", group: "参数上限", label: "素材长度预算", desc: "送入 LLM 的完整提示词字符上限，超出从最旧消息开始截断（统计仍全量）", kind: "int", unit: "字符", min: 1000 },
     // —— 总结行为 ——
     { key: "summary_provider_id", group: "总结行为", label: "总结专用 LLM 提供商", desc: "留空时回退使用当前会话的 LLM 提供商", kind: "provider" },
     { key: "summary_prompt", group: "总结行为", label: "提示词模板", desc: "占位符：{stats} {messages} {time_range} {group_id} {format_constraint}", kind: "prompt" },
@@ -645,7 +646,7 @@ function fillSummaryForm(settings) {
     }
 }
 
-// 收集全部 15 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
+// 收集全部 16 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
 function collectSummarySettings() {
     const settings = {};
     for (const meta of SUMMARY_FIELD_META) {

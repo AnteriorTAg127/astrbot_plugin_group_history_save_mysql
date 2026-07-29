@@ -33,11 +33,18 @@
 - **结果持久化**：总结以 JSON 保存到 `data/plugin_data/astrbot_plugin_group_history_save_mysql/summaries/<群号>/<时间戳>.json`
   （含统计块、摘要原文、元数据），保留天数可配（`summary_retention_days` 默认 30 天），
   定时任务每天清理一次过期文件，随插件生命周期启停
-- **配置管理**：全部 15 项新配置存入 config.db **新增 `summary_settings` 表**（key/value，列表值 JSON 序列化），
+- **配置管理**：全部 16 项新配置存入 config.db **新增 `summary_settings` 表**（key/value，列表值 JSON 序列化），
   由 `ConfigManager` 统一建表、播种默认值与 CRUD；**不进入 `_conf_schema.json`**（原有插件配置文件保持不变），
   仅在 dashboard「总结设置」tab 修改，改后即时生效无需重启插件
-- **Web 管理后台新增 3 个 tab**：总结设置（15 项配置分组表单：基础与白名单 / 参数上限 / 总结行为 / 存储，
+- **Web 管理后台新增 3 个 tab**：总结设置（16 项配置分组表单：基础与白名单 / 参数上限 / 总结行为 / 存储，
   provider 下拉，提示词编辑与恢复默认）/ 忽略管理（每群忽略发送者增删查）/ 历史总结（按群浏览已存总结 + 详情弹层）
+- **OneBot 多轮翻页**：`fetch_group_history` 按 `message_seq` 从新到旧翻页累计（最多 5 轮、轮间短延迟防限频、
+  每轮 1.3x 超量请求补偿过滤损耗），兼容单次 count 硬限 ~200 条的协议端实现；支持大 count 的协议端
+  第一轮即因短页终止（行为等价单次调用）；首轮失败仍抛错降级，第 2 轮起失败返回已拉到的部分消息
+- **dashboard 两级导航**：顶部分区控件「存储库 / 消息总结」，总结三 tab 归入「消息总结」独立分区；
+  存储区启动不再预触总结接口，进入总结分区才惰性加载
+- **素材长度预算 Web 可配**：`summary_max_prompt_chars`（默认 60000 字符）可在 dashboard「总结设置 →
+  参数上限」调整，非法值回退常量默认；超限从最旧消息截断，统计块仍基于全量
 - **架构**：新功能代码全部位于 `summary/` 子包（service 编排层 / fetcher 混合获取 / onebot 协议端封装 /
   summarizer 总结引擎 / formatter 输出格式化 / storage JSON 持久化 / scheduler 定时清理），
   指令在 `main.py` 注册并薄封装异步委托子包；日志统一 `[HistorySummary]` 前缀；无新增 pip 依赖

@@ -33,7 +33,8 @@ from astrbot.api.star import Context
 from ..db_config import ConfigManager
 from .models import ChatMessage, StatsResult, SummaryResult
 
-# 渲染后完整 prompt 的字符数硬上限：防止 LLM 上下文爆掉（超窗口/高成本）。
+# 素材长度预算（完整 prompt 字符数）的默认值与兜底：防 LLM 上下文爆掉（超窗口/高成本）。
+# 正常以 Web 配置 summary_max_prompt_chars 为准（见 _get_max_prompt_chars）；
 # 超限时按时间从最旧开始逐条丢弃消息、保留最近的消息，直至不超限。
 MAX_PROMPT_CHARS = 60000
 
@@ -131,8 +132,9 @@ class Summarizer:
                 else _FORMAT_CONSTRAINT_FORWARD
             ),
         }
+        max_prompt_chars = await self._get_max_prompt_chars()
         prompt, messages_used, truncated = self._render_prompt(
-            template, values, material_lines
+            template, values, material_lines, max_prompt_chars
         )
         if truncated:
             # 统计始终基于全量消息，truncated 仅标记送入 LLM 的素材被削减
@@ -163,6 +165,16 @@ class Summarizer:
         # bool 是 int 子类需显式排除；配置层已兜底，此处仅防御
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return _DEFAULT_TOP_N
+        return value
+
+    async def _get_max_prompt_chars(self) -> int:
+        """读取素材长度预算配置（int，非法/非正数回退常量默认 MAX_PROMPT_CHARS）。"""
+        value = await self.config_mgr.get_summary_setting_typed(
+            "summary_max_prompt_chars"
+        )
+        # bool 是 int 子类需显式排除；配置层已兜底，此处仅防御
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return MAX_PROMPT_CHARS
         return value
 
     def _build_stats(self, messages: list[ChatMessage], top_n: int) -> StatsResult:
@@ -206,6 +218,7 @@ class Summarizer:
         template: str,
         values: dict[str, str],
         material_lines: list[str],
+        max_prompt_chars: int,
     ) -> tuple[str, int, bool]:
         """渲染占位符并对完整 prompt 应用长度预算。
 
@@ -221,7 +234,7 @@ class Summarizer:
 
         # 骨架长度（{messages} 替换为空）决定素材可用预算
         base_len = len(scaffold.replace("{messages}", ""))
-        available = MAX_PROMPT_CHARS - base_len
+        available = max_prompt_chars - base_len
 
         joined_all = "\n".join(material_lines)
         if len(joined_all) <= available:

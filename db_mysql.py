@@ -121,8 +121,7 @@ class DynamicPool:
         count = self._create_err_count
         self._create_err_count = 0
         logger.error(
-            f"[DynamicPool] 创建连接失败（近期累计 {count} 次，"
-            f"抑制重复日志）: {exc}"
+            f"[DynamicPool] 创建连接失败（近期累计 {count} 次，抑制重复日志）: {exc}"
         )
 
     async def initialize(self):

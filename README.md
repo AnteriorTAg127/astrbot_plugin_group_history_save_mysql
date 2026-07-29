@@ -100,13 +100,13 @@ SHOW TABLES;
 - **统计**：最近 7 天每日存储量
 - **查询**：按关键词（内容/昵称）、群号、QQ号、时间组合查询聊天记录
 - **数据维护**：手动清理过期图片；一键清空所有数据（需通过随机加减法验证，题目由后端生成、一次性有效）
-- **总结设置**（v0.3 新增）：总结功能全部 15 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
+- **总结设置**（v0.3 新增）：总结功能全部 16 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
 - **忽略管理**（v0.3 新增）：按群增删查忽略发送者，被忽略者的消息不参与总结
 - **历史总结**（v0.3 新增）：按群浏览已保存的总结 JSON，弹层查看总结详情（统计块 + LLM 摘要 + 元数据）
 
 ## 总结功能配置说明（v0.3 新增）
 
-> 总结功能全部 15 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
+> 总结功能全部 16 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
 > **不进入 `_conf_schema.json`**（插件原有配置保持不变）。配置仅在 dashboard「总结设置」tab 修改，
 > 改后即时生效，无需重启插件；默认值由 `ConfigManager` 初始化时自动播种。
 
@@ -126,6 +126,7 @@ SHOW TABLES;
 | summary_prompt | text | （内置 4 板块默认模板） | LLM 总结提示词，支持占位符 `{stats}` `{messages}` `{time_range}` `{group_id}` `{format_constraint}` |
 | summary_output_mode | string | forward | 输出形式：`forward`=合并转发（剥离 Markdown）；`image`=文转图（保留 Markdown） |
 | summary_rank_top_n | int | 5 | 活跃排行展示条数 |
+| summary_max_prompt_chars | int | 60000 | 素材长度预算（送入 LLM 的完整提示词字符上限），超出从最旧消息开始截断，统计仍基于全量 |
 | summary_retention_days | int | 30 | 总结 JSON 保留天数，定时任务每日清理过期文件 |
 
 占位符说明：`{stats}` 统计块、`{messages}` 格式化消息列表（每行 `[时间] 昵称: 内容`）、`{time_range}` 时间范围描述、`{group_id}` 群号、`{format_constraint}` 按输出模式注入的格式约束（合并转发=禁用 Markdown / 文转图=可用 Markdown）。
@@ -219,7 +220,7 @@ SHOW TABLES;
 
 | 表名 | 说明 |
 |------|------|
-| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），15 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
+| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），16 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
 | group_ignore_senders | 每群忽略发送者（group_id, sender_id, created_at，group_id + sender_id 联合唯一约束） |
 
 > 总结结果不入库，以 JSON 文件持久化，路径与清理策略见上文「总结工作原理 → 结果持久化」。

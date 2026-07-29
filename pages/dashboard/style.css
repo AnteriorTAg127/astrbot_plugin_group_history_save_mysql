@@ -576,7 +576,13 @@ body {
 
 .input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(22, 93, 255, 0.1); }
 
-.input-sm { width: 72px; text-align: center; }
+.input-sm {
+    width: 96px;
+    padding: 9px 10px;
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
 
 /* ===== Toast ===== */
 .toast {
