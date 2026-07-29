@@ -3,6 +3,8 @@
 监听 QQ 群消息，将文本和图片分别存入 MySQL，提供管理指令和 Web 管理后台。
 """
 
+import asyncio
+
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -106,23 +108,65 @@ class GroupHistoryPlugin(Star):
         self.web_api = WebAPI(context, self.mysql_mgr, self.config_mgr, self.cleaner)
 
         self._initialized = False
+        self._init_task: asyncio.Task | None = None
 
     async def initialize(self):
-        """异步初始化：连接数据库、启动定时任务。"""
-        # 初始化本地配置
+        """异步初始化：连接数据库、启动定时任务。
+
+        MySQL 连接放入后台任务执行，避免数据库不可达时阻塞 AstrBot 启动。
+        """
+        # 初始化本地配置（aiosqlite 本地文件，极快，不会阻塞）
         config_ok = await self.config_mgr.initialize()
         if not config_ok:
             logger.error("[HistorySave] 本地配置初始化失败，插件功能受限")
 
-        # 初始化 MySQL
-        mysql_ok = await self.mysql_mgr.initialize()
-        if mysql_ok:
-            self._initialized = True
-            # 启动图片清理任务
-            await self.cleaner.start()
-            logger.info("[HistorySave] 插件初始化完成，开始监听群消息")
-        else:
-            logger.error("[HistorySave] MySQL 连接失败，聊天记录将不会被保存")
+        # MySQL 初始化放入后台，不阻塞框架启动
+        self._init_task = asyncio.create_task(self._background_mysql_init())
+        logger.info("[HistorySave] 插件已加载，MySQL 连接在后台初始化中")
+
+    async def _background_mysql_init(self):
+        """后台初始化 MySQL，失败时周期性重试（每 60 秒一次）。
+
+        每次初始化尝试用 10 秒强制兜底，防止任何意外挂起。
+        """
+        retry_interval = 60
+        init_timeout = 10
+        attempt = 0
+        while not self._initialized:
+            attempt += 1
+            try:
+                mysql_ok = await asyncio.wait_for(
+                    self.mysql_mgr.initialize(), timeout=init_timeout
+                )
+                if mysql_ok:
+                    self._initialized = True
+                    await self.cleaner.start()
+                    logger.info(
+                        "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"[HistorySave] MySQL 连接失败（第 {attempt} 次尝试），"
+                        f"{retry_interval}s 后重试..."
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[HistorySave] MySQL 初始化超时（第 {attempt} 次尝试），"
+                    f"{retry_interval}s 后重试..."
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(
+                    f"[HistorySave] MySQL 初始化异常（第 {attempt} 次尝试）: {e}，"
+                    f"{retry_interval}s 后重试..."
+                )
+            # 等待后重试
+            try:
+                await asyncio.sleep(retry_interval)
+            except asyncio.CancelledError:
+                return
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -319,6 +363,13 @@ class GroupHistoryPlugin(Star):
 
     async def terminate(self):
         """插件卸载/停用时清理资源。"""
+        # 取消后台初始化任务（若仍在重试中）
+        if self._init_task and not self._init_task.done():
+            self._init_task.cancel()
+            try:
+                await self._init_task
+            except asyncio.CancelledError:
+                pass
         await self.cleaner.stop()
         await self.mysql_mgr.close()
         await self.config_mgr.close()

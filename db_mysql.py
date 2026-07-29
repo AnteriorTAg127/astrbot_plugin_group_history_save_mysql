@@ -93,22 +93,45 @@ class DynamicPool:
         return conn
 
     async def initialize(self):
-        """初始化连接池，预创建 min_size 个连接并启动 reaper。"""
+        """初始化连接池，启动 reaper，并尝试预创建 1 个连接。
+
+        预创建使用 2 秒短超时：成功则放入空闲池，失败仅记录 warning，
+        不会阻塞事件循环或 AstrBot 启动。后续连接按需创建。
+        """
         # 在事件循环内创建 asyncio 同步原语（避免插件重载时 loop 不一致）
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Condition(self._lock)
 
-        for _ in range(self._min_size):
+        # 清理上一次初始化残留（重试场景）
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
             try:
-                conn = await self._create_connection()
-                self._free.append((conn, time.monotonic()))
-            except Exception as e:
-                logger.warning(f"[DynamicPool] 预创建连接失败: {e}")
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
+        for conn, _ in self._free:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._free.clear()
+
+        # 仅尝试预创建 1 个连接，2 秒超时，避免阻塞启动
+        try:
+            conn = await asyncio.wait_for(
+                self._create_connection(), timeout=2
+            )
+            self._free.append((conn, time.monotonic()))
+        except asyncio.TimeoutError:
+            logger.warning("[DynamicPool] 预创建连接超时 (2s)，数据库当前可能不可用")
+        except Exception as e:
+            logger.warning(f"[DynamicPool] 预创建连接失败: {e}")
+
         self._reaper_task = asyncio.create_task(self._reaper_loop())
         logger.info(
             f"[DynamicPool] 初始化完成 | min={self._min_size} "
             f"max={self._max_size} idle_timeout={self._idle_timeout}s "
-            f"| 已预创建 {len(self._free)} 个连接"
+            f"| 预创建 {len(self._free)} 个连接"
         )
 
     async def _is_alive(self, conn: aiomysql.Connection) -> bool:
@@ -414,17 +437,56 @@ class MySQLManager:
     async def initialize(self) -> bool:
         """初始化连接池、创建表结构并迁移旧表结构。
 
+        连接池已尝试预创建 1 个连接；若预创建失败，再用 2 秒短超时探测一次。
+        探测失败立即返回 False，避免长时间阻塞。
+
         Returns:
             bool: 初始化是否成功
         """
         try:
             await self.pool.initialize()
+            # 预创建成功则跳过探测；否则 2 秒短超时探测
+            if self.pool.free_size == 0 and not await self._probe_connection(
+                timeout=2
+            ):
+                logger.warning(
+                    "[HistorySave] MySQL 连接探测失败，数据库当前不可用"
+                )
+                return False
             await self._create_tables()
             await self._migrate_schema()
             logger.info("[HistorySave] MySQL 动态连接池初始化成功")
             return True
         except Exception as e:
             logger.error(f"[HistorySave] MySQL 初始化失败: {e}")
+            return False
+
+    async def _probe_connection(self, timeout: int = 3) -> bool:
+        """尝试在指定超时内创建一个临时连接，验证 MySQL 是否可达。
+
+        Args:
+            timeout: 最大等待秒数
+
+        Returns:
+            bool: 是否连接成功
+        """
+        try:
+            conn = await asyncio.wait_for(
+                self.pool._create_connection(), timeout=timeout
+            )
+            try:
+                await conn.ping(reconnect=False)
+                return True
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except asyncio.TimeoutError:
+            logger.warning(f"[HistorySave] MySQL 连接探测超时 ({timeout}s)")
+            return False
+        except Exception as e:
+            logger.warning(f"[HistorySave] MySQL 连接探测失败: {e}")
             return False
 
     async def _create_tables(self):
