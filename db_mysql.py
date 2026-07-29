@@ -78,7 +78,11 @@ class DynamicPool:
         return len(self._used)
 
     async def _create_connection(self) -> aiomysql.Connection:
-        """创建一个新的数据库连接。"""
+        """创建一个新的数据库连接。
+
+        read_timeout/write_timeout 为所有网络读写（含 ping）兜底，
+        防止半开/黑洞 TCP 连接上的操作挂到操作系统 keepalive 周期（约 2 小时）。
+        """
         conn = await aiomysql.connect(
             host=self._host,
             port=self._port,
@@ -88,6 +92,8 @@ class DynamicPool:
             charset="utf8mb4",
             autocommit=True,
             connect_timeout=10,
+            read_timeout=30,
+            write_timeout=30,
         )
         self._total_created += 1
         return conn
@@ -97,10 +103,16 @@ class DynamicPool:
 
         预创建使用 2 秒短超时：成功则放入空闲池，失败仅记录 warning，
         不会阻塞事件循环或 AstrBot 启动。后续连接按需创建。
+
+        重试场景（被外部循环反复调用）下：
+        - 同步原语只创建一次，避免替换正在被等待的 Lock/Condition 使旧等待者永久收不到 notify
+        - 残留的 _free/_used/_pending 统一清理复位，防止历史泄漏槽位拖垮后续尝试
+        - 先启动 reaper 再做预创建，避免预创建被取消时 reaper 缺失
         """
-        # 在事件循环内创建 asyncio 同步原语（避免插件重载时 loop 不一致）
-        self._lock = asyncio.Lock()
-        self._not_empty = asyncio.Condition(self._lock)
+        # asyncio 同步原语只创建一次（Python 3.10+ 创建时不绑定事件循环，按需在等待时解析）
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+            self._not_empty = asyncio.Condition(self._lock)
 
         # 清理上一次初始化残留（重试场景）
         if self._reaper_task and not self._reaper_task.done():
@@ -109,25 +121,43 @@ class DynamicPool:
                 await self._reaper_task
             except asyncio.CancelledError:
                 pass
-        for conn, _ in self._free:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        self._free.clear()
+
+        async with self._lock:
+            for conn, _ in self._free:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._free.clear()
+            # 初始化重试意味着此前数据库不可用：在途连接已无意义，
+            # 统一关闭并复位簿记（借用方的 shielded 归还逻辑对已关闭连接是幂等的）
+            for conn in self._used:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._used.clear()
+            self._pending = 0
+
+        # 先启动 reaper，防止后续步骤被取消时巡检缺失
+        self._reaper_task = asyncio.create_task(self._reaper_loop())
 
         # 仅尝试预创建 1 个连接，2 秒超时，避免阻塞启动
         try:
-            conn = await asyncio.wait_for(
-                self._create_connection(), timeout=2
-            )
-            self._free.append((conn, time.monotonic()))
+            conn = await asyncio.wait_for(self._create_connection(), timeout=2)
+            async with self._lock:
+                if self._closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                else:
+                    self._free.append((conn, time.monotonic()))
         except asyncio.TimeoutError:
             logger.warning("[DynamicPool] 预创建连接超时 (2s)，数据库当前可能不可用")
         except Exception as e:
             logger.warning(f"[DynamicPool] 预创建连接失败: {e}")
 
-        self._reaper_task = asyncio.create_task(self._reaper_loop())
         logger.info(
             f"[DynamicPool] 初始化完成 | min={self._min_size} "
             f"max={self._max_size} idle_timeout={self._idle_timeout}s "
@@ -135,9 +165,9 @@ class DynamicPool:
         )
 
     async def _is_alive(self, conn: aiomysql.Connection) -> bool:
-        """检查连接是否存活。"""
+        """检查连接是否存活（5 秒超时兜底，防止半开连接上 ping 长期挂起）。"""
         try:
-            await conn.ping(reconnect=False)
+            await asyncio.wait_for(conn.ping(reconnect=False), timeout=5)
             return True
         except Exception:
             return False
@@ -162,38 +192,101 @@ class DynamicPool:
 
         如果无空闲连接且未达上限，自动创建新连接（扩容）。
         如果已达上限，等待直到有连接释放或超时。
+        归还路径用 asyncio.shield 包裹：调用方任务被取消时，
+        归还操作仍会在独立内部任务中执行完毕，连接不会无主泄漏。
         """
         conn = await self._get_connection()
         try:
             yield conn
         finally:
-            await self._release_connection(conn)
+            await asyncio.shield(self._release_connection(conn))
+
+    def _schedule_rollback(self, close_conn: aiomysql.Connection | None = None):
+        """以独立任务回滚一个 _pending 槽位（并可选关闭连接）。
+
+        专用于异常/取消路径：独立任务不受当前任务取消的影响，
+        即使当前任务无法安全地等待锁获取（CancelledError 会在锁等待点
+        打断清理），簿记回滚也一定执行。
+        """
+
+        async def _rollback():
+            try:
+                async with self._not_empty:
+                    self._pending -= 1
+                    self._not_empty.notify()
+            except Exception as e:
+                logger.error(f"[DynamicPool] 槽位回滚失败: {e}")
+            if close_conn is not None:
+                try:
+                    close_conn.close()
+                except Exception:
+                    pass
+
+        try:
+            asyncio.create_task(_rollback())
+        except RuntimeError:
+            # 事件循环不可用（本插件调用路径下几乎不会发生）：降级为同步修正
+            self._pending -= 1
+            if close_conn is not None:
+                try:
+                    close_conn.close()
+                except Exception:
+                    pass
+
+    async def _finish_acquire(self, conn: aiomysql.Connection) -> aiomysql.Connection:
+        """校验/创建成功后把连接登记进 _used（取消安全）。"""
+        try:
+            async with self._lock:
+                if self._closed:
+                    raise RuntimeError("连接池已关闭")
+                self._pending -= 1
+                self._used.add(conn)
+            return conn
+        except BaseException:
+            # 池已关闭或在登记点被取消：关闭连接并回滚槽位后原样抛出
+            self._schedule_rollback(close_conn=conn)
+            raise
 
     async def _get_connection(self) -> aiomysql.Connection:
         """从池中获取一个可用连接。
 
-        网络I/O（ping/connect）在锁外执行，避免高并发下连接池退化为串行。
-        锁内仅做 _free.pop / _used.add / _pending++ 等O(1)簿记操作。
-        """
-        if self._closed:
-            raise RuntimeError("连接池已关闭")
+        网络I/O（ping/connect）在锁外执行，避免高并发下连接池退化为串行；
+        锁内仅做 _free.pop / _pending / _used.add 等O(1)簿记操作。
 
+        正确性保证：
+        - deadline 在每轮循环开头复检：建连反复失败也会按 acquire_timeout 超时，不会无限自旋
+        - 校验中的连接计入 _pending（size 保持恒定）：既防止超量扩容，也保证 reaper
+          校验与 acquire 不会并发使用同一连接
+        - 所有可取消的 await 点都通过 _schedule_rollback 回滚簿记：CancelledError
+          （BaseException）不会泄漏 _pending 槽位或把连接钉死在 _used
+        - 等待超时后回到循环顶部复检 _free/deadline：与超时撞期的 notify() 不会丢失
+        """
         deadline = time.monotonic() + self._acquire_timeout
 
         while True:
+            if self._closed:
+                raise RuntimeError("连接池已关闭")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
+                    f"当前连接数: {self.size}/{self._max_size}"
+                )
+
+            mode: str | None = None
             conn_to_check: aiomysql.Connection | None = None
-            should_create = False
+            conn_ts = 0.0
 
             # ---- 锁内：快速簿记 ----
             async with self._not_empty:
                 if self._free:
-                    # 取一个空闲连接，立即标记为使用中
-                    conn_to_check, _ = self._free.pop(0)
-                    self._used.add(conn_to_check)
+                    # 取一个空闲连接进入“校验中”状态（free-1 / pending+1，size 不变）
+                    conn_to_check, conn_ts = self._free.pop(0)
+                    self._pending += 1
+                    mode = "check"
                 elif self.size < self._max_size:
                     # 预留扩容槽位（_pending 计入 size，防止其他协程同时扩容超限）
                     self._pending += 1
-                    should_create = True
+                    mode = "create"
                 else:
                     # 已达上限，等待释放
                     remaining = deadline - time.monotonic()
@@ -207,47 +300,40 @@ class DynamicPool:
                             self._not_empty.wait(), timeout=remaining
                         )
                     except asyncio.TimeoutError:
-                        raise TimeoutError(
-                            f"[DynamicPool] 获取连接超时 ({self._acquire_timeout}s)，"
-                            f"当前连接数: {self.size}/{self._max_size}"
-                        )
-                    continue  # 被唤醒后重新尝试
-
-            # ---- 锁外：网络 I/O ----
-
-            if conn_to_check is not None:
-                # 确保从空闲池取出的连接可用（ping/reconnect 在锁外）
-                try:
-                    conn = await self._ensure_connection(conn_to_check)
-                    if conn is not conn_to_check:
-                        # 原连接失效已被替换，更新 _used
-                        async with self._lock:
-                            self._used.discard(conn_to_check)
-                            self._used.add(conn)
-                    return conn
-                except Exception as e:
-                    # 确保连接失败，归还槽位并重试
-                    logger.error(f"[DynamicPool] 检查空闲连接失败: {e}")
-                    async with self._lock:
-                        self._used.discard(conn_to_check)
-                        self._not_empty.notify()
+                        # 不立即抛错：回到循环顶部复检 _free 与 deadline，
+                        # 避免与超时撞期的 notify() 被吞掉
+                        pass
                     continue
 
-            if should_create:
-                # 锁外创建新连接
+            # ---- 锁外：网络 I/O（异常/取消时经独立任务回滚簿记） ----
+
+            if mode == "check":
                 try:
-                    conn = await self._create_connection()
-                    async with self._lock:
-                        self._pending -= 1
-                        self._used.add(conn)
-                    return conn
-                except Exception as e:
-                    logger.error(f"[DynamicPool] 扩容创建连接失败: {e}")
-                    async with self._lock:
-                        self._pending -= 1
-                        self._not_empty.notify()
-                    # 扩容失败后重新循环（可能等待其他连接释放）
-                    continue
+                    # 连接年龄超过 pool_recycle 时直接换新（复用已预留的槽位）
+                    if (
+                        self._pool_recycle
+                        and (time.monotonic() - conn_ts) > self._pool_recycle
+                    ):
+                        try:
+                            conn_to_check.close()
+                        except Exception:
+                            pass
+                        conn = await self._create_connection()
+                    else:
+                        conn = await self._ensure_connection(conn_to_check)
+                except BaseException:
+                    self._schedule_rollback(close_conn=conn_to_check)
+                    raise
+                return await self._finish_acquire(conn)
+
+            # mode == "create"：锁外创建新连接
+            try:
+                conn = await self._create_connection()
+            except BaseException:
+                logger.error("[DynamicPool] 扩容创建连接失败")
+                self._schedule_rollback()
+                raise
+            return await self._finish_acquire(conn)
 
     async def _release_connection(self, conn: aiomysql.Connection):
         """归还连接到池中。"""
@@ -280,10 +366,9 @@ class DynamicPool:
         to_close = []
 
         async with self._lock:
-            # 只回收超出 min_size 的空闲连接
+            # 只回收超出 min_size 的空闲连接（_min_size 至少为 1，列表非空已蕴含）
             while (
                 len(self._free) > self._min_size
-                and self._free
                 and (now - self._free[0][1]) > self._idle_timeout
             ):
                 conn, _ = self._free.pop(0)
@@ -305,51 +390,59 @@ class DynamicPool:
     async def _health_check(self):
         """检查空闲连接健康状态，移除失效连接。
 
-        ping 操作在锁外执行，避免 reaper 巡检期间阻塞所有 acquire。
+        采用“租约”模式：把待检查的连接从 _free 移入 _pending 校验槽，
+        acquire 在此期间取不到它，杜绝 reaper 的 ping 与业务查询并发
+        使用同一 aiomysql 连接造成的协议错乱；ping 仍在锁外执行，
+        巡检不会阻塞 acquire。
         """
-        # 锁内快照空闲连接列表
-        async with self._lock:
-            snapshot = list(self._free)
-
-        # 锁外逐个 ping
-        dead: list[tuple[aiomysql.Connection, float]] = []
-        for conn, ts in snapshot:
-            if conn.closed or not await self._is_alive(conn):
-                dead.append((conn, ts))
-
-        # 锁内移除失效连接（跳过已被 acquire 取走的）
-        to_close: list[aiomysql.Connection] = []
-        if dead:
+        while True:
+            # 锁内：租出一个空闲连接（free-1 / pending+1，size 恒定）
             async with self._lock:
-                for item in dead:
-                    if item in self._free:
-                        self._free.remove(item)
-                        to_close.append(item[0])
-
-        # 锁外关闭失效连接
-        for conn in to_close:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        # 如果低于 min_size，补充连接
-        async with self._lock:
-            deficit = self._min_size - self.size
-        if deficit > 0:
-            for _ in range(deficit):
-                try:
-                    conn = await self._create_connection()
-                    async with self._lock:
-                        if self._closed:
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                            break
-                        self._free.append((conn, time.monotonic()))
-                except Exception:
+                if not self._free:
                     break
+                conn, ts = self._free.pop(0)
+                self._pending += 1
+
+            # 锁外：ping（取消时经独立任务回滚槽位）
+            try:
+                alive = not conn.closed and await self._is_alive(conn)
+            except BaseException:
+                self._schedule_rollback(close_conn=conn)
+                raise
+
+            # 锁内：存活则归还（保留原空闲时间戳），失效则丢弃
+            async with self._lock:
+                self._pending -= 1
+                if alive and not self._closed:
+                    self._free.append((conn, ts))
+                else:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        # 如果低于 min_size，经预留槽位补充连接（严格不超过 max_size）
+        while True:
+            async with self._lock:
+                if self._closed or self.size >= self._min_size:
+                    break
+                if self.size >= self._max_size:
+                    break
+                self._pending += 1
+            try:
+                conn = await self._create_connection()
+            except BaseException:
+                self._schedule_rollback()
+                break
+            async with self._lock:
+                self._pending -= 1
+                if self._closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    break
+                self._free.append((conn, time.monotonic()))
 
     def get_pool_info(self) -> dict:
         """获取连接池状态信息。"""
@@ -365,7 +458,12 @@ class DynamicPool:
         }
 
     async def close(self):
-        """关闭连接池，释放所有连接。"""
+        """关闭连接池，释放所有连接。
+
+        - 唤醒所有等待者，使其检测到 _closed 后立即失败（而非白等满 acquire_timeout）
+        - 不强关 _used 中的连接：借用方的 shielded 归还逻辑会检测到 _closed 并关闭，
+          避免把正在执行中的查询（如多语句清空操作）从中间打断
+        """
         self._closed = True
         if self._reaper_task:
             self._reaper_task.cancel()
@@ -384,21 +482,21 @@ class DynamicPool:
             self._free.clear()
             return
 
-        async with self._lock:
+        async with self._not_empty:
             for conn, _ in self._free:
                 try:
                     conn.close()
                 except Exception:
                     pass
             self._free.clear()
+            # 唤醒全部等待协程：循环顶部复检 _closed 后会立即抛 RuntimeError
+            self._not_empty.notify_all()
 
-            for conn in self._used:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._used.clear()
-
+        if self._used:
+            logger.info(
+                f"[DynamicPool] 连接池已关闭（{len(self._used)} 个连接仍在使用中，"
+                f"将由借用方归还时关闭）"
+            )
         logger.info("[DynamicPool] 连接池已关闭")
 
 
@@ -446,12 +544,8 @@ class MySQLManager:
         try:
             await self.pool.initialize()
             # 预创建成功则跳过探测；否则 2 秒短超时探测
-            if self.pool.free_size == 0 and not await self._probe_connection(
-                timeout=2
-            ):
-                logger.warning(
-                    "[HistorySave] MySQL 连接探测失败，数据库当前不可用"
-                )
+            if self.pool.free_size == 0 and not await self._probe_connection(timeout=2):
+                logger.warning("[HistorySave] MySQL 连接探测失败，数据库当前不可用")
                 return False
             await self._create_tables()
             await self._migrate_schema()
@@ -614,6 +708,13 @@ class MySQLManager:
             bool: 是否插入成功
         """
         try:
+            # TEXT 列上限 65535 字节：超长内容截断并留标记，
+            # 避免严格 sql_mode 下整条插入失败导致消息彻底丢失
+            if content and len(content.encode("utf-8")) > 60000:
+                content = (
+                    content.encode("utf-8")[:60000].decode("utf-8", "ignore")
+                    + "\n…[内容过长已截断]"
+                )
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -649,6 +750,14 @@ class MySQLManager:
         Returns:
             bool: 是否插入成功
         """
+        # image_url 列为 VARCHAR(1024)：超长链接跳过入库并告警，
+        # 避免严格模式下整条插入失败（且不影响同消息的文本记录）
+        if len(image_url) > 1024:
+            logger.warning(
+                f"[HistorySave] 图片链接超长（{len(image_url)} 字符），已跳过入库: "
+                f"{image_url[:80]}..."
+            )
+            return False
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
@@ -673,6 +782,9 @@ class MySQLManager:
             int: 删除的记录数，失败返回 -1
         """
         try:
+            # 钳制到安全范围，防止异常大的设置值使 timedelta/日期运算
+            # 抛 OverflowError 导致清理功能永久失效
+            retention_days = min(max(int(retention_days), 0), 36500)
             cutoff = datetime.now() - timedelta(days=retention_days)
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
@@ -703,32 +815,72 @@ class MySQLManager:
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
-                    # chat_history
-                    if await self._truncate_table(cur, "chat_history"):
-                        result["truncated"] = True
-                    else:
-                        await cur.execute("DELETE FROM chat_history")
-                        result["deleted_messages"] = cur.rowcount
-                        await self._reset_auto_increment(cur, "chat_history")
-                    # image_records
-                    if await self._truncate_table(cur, "image_records"):
-                        result["truncated"] = True
-                    else:
-                        await cur.execute("DELETE FROM image_records")
-                        result["deleted_images"] = cur.rowcount
-                        await self._reset_auto_increment(cur, "image_records")
-            result["success"] = True
-            if result["truncated"]:
-                logger.warning("[HistorySave] 已清空所有数据（TRUNCATE）")
-            else:
-                logger.warning(
-                    f"[HistorySave] 已清空所有数据（DELETE）: "
-                    f"聊天记录 {result['deleted_messages']} 条, "
-                    f"图片记录 {result['deleted_images']} 条"
-                )
+                    # 两表独立清空：一张表失败不影响另一张，
+                    # 成功状态由各自的返回值汇总
+                    messages_ok = await self._purge_table(
+                        cur, "chat_history", result, "deleted_messages"
+                    )
+                    images_ok = await self._purge_table(
+                        cur, "image_records", result, "deleted_images"
+                    )
+            result["success"] = messages_ok and images_ok
         except Exception as e:
             logger.error(f"[HistorySave] 清空所有数据失败: {e}")
+        # 所有路径都输出审计日志（含部分失败情形）；
+        # TRUNCATE 无 rowcount，计数取自操作前的 SELECT COUNT(*)
+        if result["success"]:
+            logger.warning(
+                f"[HistorySave] 已清空所有数据"
+                f"{' (TRUNCATE)' if result['truncated'] else ' (DELETE)'}: "
+                f"聊天记录 {result['deleted_messages']} 条, "
+                f"图片记录 {result['deleted_images']} 条"
+            )
+        else:
+            logger.error(
+                f"[HistorySave] 清空所有数据未完全成功: "
+                f"聊天记录 {result['deleted_messages']} 条, "
+                f"图片记录 {result['deleted_images']} 条"
+            )
         return result
+
+    async def _purge_table(self, cur, table: str, result: dict, count_key: str) -> bool:
+        """清空单张表并把删除条数写入 result。
+
+        TRUNCATE 是 DDL，没有 rowcount，因此操作前先 SELECT COUNT(*)
+        取得条数用于审计日志。表名来自本类硬编码，无注入风险。
+
+        Args:
+            cur: 数据库游标
+            table: 表名
+            result: 用于写入删除条数的结果字典
+            count_key: result 中删除条数的键名
+
+        Returns:
+            bool: 该表是否清空成功
+        """
+        try:
+            await cur.execute(f"SELECT COUNT(*) FROM {table}")
+            row = await cur.fetchone()
+            pre_count = int(row[0]) if row else 0
+        except Exception as e:
+            logger.error(f"[HistorySave] 预统计 {table} 行数失败: {e}")
+            return False
+
+        if await self._truncate_table(cur, table):
+            result["truncated"] = True
+            result[count_key] = pre_count
+            return True
+
+        try:
+            await cur.execute(f"DELETE FROM {table}")
+            deleted = cur.rowcount
+            # rowcount 异常（如 -1）时回退到预统计值，保证审计计数合理
+            result[count_key] = deleted if deleted >= 0 else pre_count
+            await self._reset_auto_increment(cur, table)
+            return True
+        except Exception as e:
+            logger.error(f"[HistorySave] DELETE FROM {table} 失败: {e}")
+            return False
 
     async def _truncate_table(self, cur, table: str) -> bool:
         """尝试用 TRUNCATE TABLE 清空表。
@@ -769,6 +921,10 @@ class MySQLManager:
     async def get_stats(self) -> dict:
         """获取统计信息（今日消息数、今日图片数、总消息数、总图片数）。
 
+        每张表用一条 SQL 完成总数与今日数的条件聚合（SUM 布尔表达式），
+        避免 DATE(timestamp) 包裹列导致索引失效；"今日"区间在 bot 侧按
+        datetime.now() 的当天零点计算，与写入侧时区语义保持一致。
+
         Returns:
             dict: 统计信息字典
         """
@@ -779,30 +935,33 @@ class MySQLManager:
             "total_images": 0,
         }
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today_start = datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            tomorrow_start = today_start + timedelta(days=1)
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT COUNT(*) FROM chat_history WHERE DATE(timestamp) = %s",
-                        (today,),
+                        "SELECT COUNT(*), "
+                        "SUM(timestamp >= %s AND timestamp < %s) "
+                        "FROM chat_history",
+                        (today_start, tomorrow_start),
                     )
                     row = await cur.fetchone()
-                    stats["today_messages"] = row[0] if row else 0
+                    if row:
+                        stats["total_messages"] = int(row[0] or 0)
+                        stats["today_messages"] = int(row[1] or 0)
 
                     await cur.execute(
-                        "SELECT COUNT(*) FROM image_records WHERE DATE(timestamp) = %s",
-                        (today,),
+                        "SELECT COUNT(*), "
+                        "SUM(timestamp >= %s AND timestamp < %s) "
+                        "FROM image_records",
+                        (today_start, tomorrow_start),
                     )
                     row = await cur.fetchone()
-                    stats["today_images"] = row[0] if row else 0
-
-                    await cur.execute("SELECT COUNT(*) FROM chat_history")
-                    row = await cur.fetchone()
-                    stats["total_messages"] = row[0] if row else 0
-
-                    await cur.execute("SELECT COUNT(*) FROM image_records")
-                    row = await cur.fetchone()
-                    stats["total_images"] = row[0] if row else 0
+                    if row:
+                        stats["total_images"] = int(row[0] or 0)
+                        stats["today_images"] = int(row[1] or 0)
         except Exception as e:
             logger.error(f"[HistorySave] 获取统计信息失败: {e}")
         return stats
@@ -818,14 +977,20 @@ class MySQLManager:
         """
         result = []
         try:
+            # 时间窗口在 bot 侧计算（今天零点往前推 N 天至今），
+            # 不依赖 DB 服务器的 CURDATE()，避免 DB 与 bot 时区不一致
+            # 导致窗口边界偏移
+            cutoff = datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) - timedelta(days=days)
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """SELECT DATE(timestamp) as date, COUNT(*) as count
                            FROM chat_history
-                           WHERE timestamp >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                           WHERE timestamp >= %s
                            GROUP BY DATE(timestamp) ORDER BY date""",
-                        (days,),
+                        (cutoff,),
                     )
                     msg_rows = await cur.fetchall()
                     msg_map = {str(row[0]): row[1] for row in msg_rows}
@@ -833,9 +998,9 @@ class MySQLManager:
                     await cur.execute(
                         """SELECT DATE(timestamp) as date, COUNT(*) as count
                            FROM image_records
-                           WHERE timestamp >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                           WHERE timestamp >= %s
                            GROUP BY DATE(timestamp) ORDER BY date""",
-                        (days,),
+                        (cutoff,),
                     )
                     img_rows = await cur.fetchall()
                     img_map = {str(row[0]): row[1] for row in img_rows}

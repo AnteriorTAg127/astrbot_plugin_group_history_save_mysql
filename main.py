@@ -4,6 +4,8 @@
 """
 
 import asyncio
+import time
+from collections import deque
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -13,6 +15,7 @@ from astrbot.api.star import Context, Star, register
 from .cleaner import ImageCleaner
 from .db_config import ConfigManager
 from .db_mysql import MySQLManager
+from .summary import SummaryService
 from .web_api import WebAPI
 
 
@@ -75,8 +78,8 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
-    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台",
-    "0.2.1",
+    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）",
+    "0.3.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -104,11 +107,25 @@ class GroupHistoryPlugin(Star):
         # 初始化图片清理器
         self.cleaner = ImageCleaner(self.mysql_mgr, self.config_mgr)
 
-        # 初始化 Web API
-        self.web_api = WebAPI(context, self.mysql_mgr, self.config_mgr, self.cleaner)
+        # 初始化总结服务（v0.3，须在 WebAPI 之前构造，以便注入其存储实例）
+        self.summary_service = SummaryService(
+            context, self.config_mgr, self.mysql_mgr, self
+        )
+
+        # 初始化 Web API（注入总结存储实例供总结历史端点使用）
+        self.web_api = WebAPI(
+            context,
+            self.mysql_mgr,
+            self.config_mgr,
+            self.cleaner,
+            summary_storage=self.summary_service.storage,
+        )
 
         self._initialized = False
         self._init_task: asyncio.Task | None = None
+        # MySQL 后台初始化窗口内的消息缓冲（FIFO，溢出自动丢弃最旧记录）
+        self._pending_records: deque[dict] = deque(maxlen=2000)
+        self._last_drop_warn = 0.0  # 缓冲区溢出告警节流时间戳（monotonic 秒）
 
     async def initialize(self):
         """异步初始化：连接数据库、启动定时任务。
@@ -140,7 +157,14 @@ class GroupHistoryPlugin(Star):
                 )
                 if mysql_ok:
                     self._initialized = True
+                    # 先补录初始化窗口内缓冲的消息，再启动定时清理
+                    await self._flush_pending_records()
                     await self.cleaner.start()
+                    # 启动总结清理调度器（失败仅记日志，不阻断插件启动）
+                    try:
+                        await self.summary_service.start()
+                    except Exception as e:
+                        logger.error(f"[HistorySummary] 启动总结服务失败: {e}")
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )
@@ -171,10 +195,11 @@ class GroupHistoryPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_group_message(self, event: AstrMessageEvent):
-        """监听群消息并保存到 MySQL。"""
-        if not self._initialized:
-            return
+        """监听群消息并保存到 MySQL。
 
+        MySQL 后台初始化窗口内（首次启动/重连）消息先缓冲，
+        初始化成功后统一补录，避免该窗口内的消息丢失。
+        """
         try:
             group_id = str(event.get_group_id())
             sender_id = str(event.get_sender_id())
@@ -207,30 +232,121 @@ class GroupHistoryPlugin(Star):
             if image_count > 0 and not image_urls:
                 logger.warning("[HistorySave] 图片消息未能提取到原始链接,已跳过入库")
 
-            # 保存文本消息
-            if text_parts:
-                content = "\n".join(text_parts)
-                msg_type = "mixed" if image_urls else "text"
-                await self.mysql_mgr.insert_chat_message(
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    sender_name=sender_name,
-                    message_type=msg_type,
-                    content=content,
-                    message_id=message_id,
-                )
+            if not text_parts and not image_urls:
+                return
 
-            # 保存图片记录
-            for url in image_urls:
-                await self.mysql_mgr.insert_image_record(
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    image_url=url,
-                    sender_name=sender_name,
+            if not self._initialized:
+                # MySQL 尚在后台初始化：缓冲待补录，避免启动窗口丢消息
+                self._buffer_message(
+                    group_id,
+                    sender_id,
+                    sender_name,
+                    text_parts,
+                    image_urls,
+                    message_id,
                 )
+                return
+
+            await self._persist_message(
+                group_id,
+                sender_id,
+                sender_name,
+                text_parts,
+                image_urls,
+                message_id,
+            )
 
         except Exception as e:
             logger.error(f"[HistorySave] 处理群消息时出错: {e}", exc_info=True)
+
+    def _buffer_message(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        text_parts: list[str],
+        image_urls: list[str],
+        message_id: str,
+    ):
+        """MySQL 初始化窗口内缓冲消息，待初始化成功后补录。
+
+        缓冲区为固定容量 deque（maxlen=2000），溢出时自动丢弃最旧记录；
+        丢弃告警每 60 秒最多输出一次，避免刷屏。
+        """
+        if len(self._pending_records) == self._pending_records.maxlen:
+            now = time.monotonic()
+            if now - self._last_drop_warn >= 60:
+                self._last_drop_warn = now
+                logger.warning(
+                    "[HistorySave] MySQL 未就绪且消息缓冲区已满，最旧的缓冲消息将被丢弃"
+                )
+        self._pending_records.append(
+            {
+                "group_id": group_id,
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "text_parts": text_parts,
+                "image_urls": image_urls,
+                "message_id": message_id,
+            }
+        )
+
+    async def _persist_message(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        text_parts: list[str],
+        image_urls: list[str],
+        message_id: str,
+    ):
+        """将一条已解析的消息写入 MySQL（文本记录 + 图片记录）。"""
+        # 保存文本消息
+        if text_parts:
+            content = "\n".join(text_parts)
+            msg_type = "mixed" if image_urls else "text"
+            await self.mysql_mgr.insert_chat_message(
+                group_id=group_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                message_type=msg_type,
+                content=content,
+                message_id=message_id,
+            )
+
+        # 保存图片记录
+        for url in image_urls:
+            await self.mysql_mgr.insert_image_record(
+                group_id=group_id,
+                sender_id=sender_id,
+                image_url=url,
+                sender_name=sender_name,
+            )
+
+    async def _flush_pending_records(self):
+        """将初始化窗口内缓冲的消息补录到 MySQL。
+
+        单条失败仅记日志并继续，避免一条坏数据阻塞整批补录。
+        """
+        if not self._pending_records:
+            return
+        pending = list(self._pending_records)
+        self._pending_records.clear()
+        ok = 0
+        for record in pending:
+            try:
+                await self._persist_message(
+                    record["group_id"],
+                    record["sender_id"],
+                    record["sender_name"],
+                    record["text_parts"],
+                    record["image_urls"],
+                    record["message_id"],
+                )
+                ok += 1
+            except Exception as e:
+                logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
+        logger.info(f"[HistorySave] 启动窗口缓冲消息补录完成: {ok}/{len(pending)} 条")
 
     @filter.command("history_start")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -328,20 +444,40 @@ class GroupHistoryPlugin(Star):
                 if clean_days < 1:
                     yield event.plain_result("天数不能小于 1。")
                     return
+                if clean_days > 36500:
+                    yield event.plain_result("天数过大（上限 36500 天）。")
+                    return
             except ValueError:
                 yield event.plain_result("请提供有效的天数（正整数）。")
                 return
 
         deleted = await self.cleaner.manual_clean(clean_days)
         if deleted >= 0:
-            actual_days = clean_days or int(
-                await self.config_mgr.get_setting("image_retention_days", "3")
-            )
+            if clean_days is not None:
+                actual_days = clean_days
+            else:
+                # 配置值可能被篡改为非数字，兜底默认 3 天，避免指令抛异常
+                try:
+                    actual_days = int(
+                        await self.config_mgr.get_setting("image_retention_days", "3")
+                    )
+                except (ValueError, TypeError):
+                    actual_days = 3
             yield event.plain_result(
                 f"清理完成：删除了 {deleted} 条 {actual_days} 天前的图片记录。"
             )
         else:
             yield event.plain_result("清理失败，请检查数据库连接。")
+
+    @filter.command("消息总结", alias={"总结"})
+    async def summary_count(self, event: AstrMessageEvent, arg: str = ""):
+        """按条数总结群聊记录。用法: /消息总结 <数量>，如 /消息总结 512"""
+        await self.summary_service.handle_count_command(event, arg)
+
+    @filter.command("消息总结时间", alias={"总结时间"})
+    async def summary_window(self, event: AstrMessageEvent, arg: str = ""):
+        """按时间范围总结群聊记录。用法: /消息总结时间 <时长>，如 /消息总结时间 24h 或 1d"""
+        await self.summary_service.handle_window_command(event, arg)
 
     def _resolve_group_id(
         self, event: AstrMessageEvent, group_id_str: str
@@ -370,6 +506,11 @@ class GroupHistoryPlugin(Star):
                 await self._init_task
             except asyncio.CancelledError:
                 pass
+        # 停止总结清理调度器（与 cleaner 停止并列，吞 CancelledError 不阻塞后续清理）
+        try:
+            await self.summary_service.stop()
+        except asyncio.CancelledError:
+            pass
         await self.cleaner.stop()
         await self.mysql_mgr.close()
         await self.config_mgr.close()

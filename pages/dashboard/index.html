@@ -4,27 +4,47 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.2.1">
+    <link rel="stylesheet" href="./style.css?v=0.3.1">
 </head>
 <body>
     <div class="app">
         <!-- 顶栏 -->
         <header class="header">
             <div class="header-left">
-                <span class="header-icon">💬</span>
-                <h1>群聊记录存储</h1>
+                <span class="header-icon" id="headerIcon">💬</span>
+                <h1 id="headerTitle">群聊记录存储</h1>
             </div>
             <div class="header-right">
                 <span class="db-badge" id="dbBadge">检测中</span>
             </div>
         </header>
 
-        <!-- Tab 导航 -->
-        <nav class="tabs">
+        <!-- 顶层功能分区：存储库 / 消息总结（滑动高光分段控件） -->
+        <div class="scope-switch" role="tablist" aria-label="功能分区">
+            <button class="scope-btn active" data-scope="storage" role="tab" aria-selected="true">
+                <span class="scope-ico" aria-hidden="true">🗄️</span>
+                <span class="scope-label">存储库</span>
+            </button>
+            <button class="scope-btn" data-scope="summary" role="tab" aria-selected="false">
+                <span class="scope-ico" aria-hidden="true">🧠</span>
+                <span class="scope-label">消息总结</span>
+            </button>
+            <span class="scope-glow" aria-hidden="true"></span>
+        </div>
+
+        <!-- 存储库子 Tab -->
+        <nav class="tabs tabs-storage">
             <button class="tab active" data-tab="overview">概览</button>
             <button class="tab" data-tab="groups">群管理</button>
             <button class="tab" data-tab="query">查询</button>
             <button class="tab" data-tab="settings">设置</button>
+        </nav>
+
+        <!-- 消息总结子 Tab（v0.3 三 tab 归入此分区） -->
+        <nav class="tabs tabs-summary hidden">
+            <button class="tab" data-tab="summary-settings">总结设置</button>
+            <button class="tab" data-tab="ignore">忽略管理</button>
+            <button class="tab" data-tab="summary-history">历史总结</button>
         </nav>
 
         <!-- 概览页 -->
@@ -218,6 +238,99 @@
                 </div>
             </div>
         </section>
+
+        <!-- 总结设置页（v0.3）：15 项配置由 app.js 按分组动态渲染 -->
+        <section class="page" id="page-summary-settings">
+            <div class="section-card">
+                <div class="section-title"><span>🧠 总结功能设置</span></div>
+                <div id="summarySettingsForm">
+                    <div class="loading">加载中...</div>
+                </div>
+                <div class="summary-actions">
+                    <button id="saveSummaryBtn" class="btn btn-primary">保存全部</button>
+                    <button id="resetSummaryAllBtn" class="btn btn-ghost">恢复全部默认</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 忽略管理页（v0.3）：每群独立的总结忽略发送者名单 -->
+        <section class="page" id="page-ignore">
+            <div class="section-card">
+                <div class="section-title"><span>🙈 总结忽略管理</span></div>
+                <div class="setting-desc ignore-hint">名单内的发送者（其他 bot 等）消息不纳入总结；bot 自身消息默认自动过滤，无需手动添加。</div>
+                <div class="add-group-bar">
+                    <input type="text" id="ignoreGroupId" placeholder="输入群号..." class="input">
+                    <button id="ignoreLoadBtn" class="btn btn-primary">加载</button>
+                </div>
+                <div class="section-title ignore-groups-title"><span>已有忽略记录的群</span></div>
+                <div id="ignoreGroupChips" class="chip-list">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+            <div class="section-card" id="ignoreListCard" style="display:none;">
+                <div class="section-title"><span id="ignoreListTitle">忽略名单</span></div>
+                <div class="add-group-bar">
+                    <input type="text" id="ignoreSenderId" placeholder="输入要忽略的 QQ 号..." class="input">
+                    <button id="ignoreAddBtn" class="btn btn-primary">
+                        <span>＋</span> 添加
+                    </button>
+                </div>
+                <div class="table-wrap">
+                    <table id="ignoreTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>QQ 号</th>
+                                <th>添加时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ignoreTableBody"></tbody>
+                    </table>
+                    <div id="ignoreEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>该群暂无忽略的发送者</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 历史总结页（v0.3）：按群浏览已存总结，点击查看详情 -->
+        <section class="page" id="page-summary-history">
+            <div class="section-card">
+                <div class="section-title"><span>🗂️ 历史总结</span></div>
+                <div class="add-group-bar">
+                    <input type="text" id="historyGroupId" placeholder="群号过滤（留空 = 全部群）" class="input">
+                    <button id="historyRefreshBtn" class="btn btn-primary">刷新</button>
+                </div>
+                <div class="query-meta">
+                    <span id="historyInfo"></span>
+                </div>
+                <div class="table-wrap">
+                    <table id="historyTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>生成时间</th>
+                                <th>群号</th>
+                                <th>范围</th>
+                                <th>Provider</th>
+                                <th>消息条数</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="historyTableBody"></tbody>
+                    </table>
+                    <div id="historyEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>暂无历史总结，群里触发的总结会自动归档到这里</p>
+                    </div>
+                </div>
+                <div class="pagination" id="historyPagination" style="display:none;">
+                    <button id="historyPrevBtn" class="btn btn-ghost">← 上一页</button>
+                    <span id="historyPageInfo" class="page-info">1 / 1</span>
+                    <button id="historyNextBtn" class="btn btn-ghost">下一页 →</button>
+                </div>
+            </div>
+        </section>
     </div>
 
     <!-- 清空验证弹窗 -->
@@ -234,9 +347,20 @@
         </div>
     </div>
 
+    <!-- 历史总结详情弹窗（v0.3）：内容由 app.js 以纯文本方式填充，防 XSS -->
+    <div class="modal-mask" id="historyDetailModal" style="display:none;">
+        <div class="modal-card modal-lg">
+            <div class="modal-title" id="historyDetailTitle">📄 总结详情</div>
+            <div id="historyDetailBody" class="detail-body"></div>
+            <div class="modal-actions">
+                <button id="historyDetailCloseBtn" class="btn btn-ghost">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast -->
     <div id="toast" class="toast"></div>
 
-    <script type="module" src="./app.js?v=0.2.1"></script>
+    <script type="module" src="./app.js?v=0.3.1"></script>
 </body>
 </html>

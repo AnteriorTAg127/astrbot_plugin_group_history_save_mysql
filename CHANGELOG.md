@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.3.0] - 2026-07-30
+
+### Added
+
+- **群聊历史自动总结（新功能）**：新增群指令 `/消息总结 <数量>`（别名 `/总结`）与 `/消息总结时间 <时长>`
+  （别名 `/总结时间`，`h`=小时 / `d`=天，仅支持单点「最近 X」，不支持区间语法），
+  白名单群内任何成员可用，仅当前群生效；私聊中使用回复「请在群内使用」
+- **指令参数校验**：缺参/非法参数（非正整数、不符合 `^\d+[hd]$`、≤0）回复用法提示（不查库、不消耗 LLM）；
+  超出 Web 配置上限（`summary_max_count` 默认 1000 条 / `summary_max_hours` 默认 168 小时）拒绝执行并提示上限；
+  功能关闭回复「功能未启用」、群不在白名单回复「本群未开启总结功能」、冷却中回复剩余等待秒数
+- **混合数据源**：总结优先查本插件 MySQL `chat_history`，不足时经 OneBot v11 `get_group_msg_history`
+  从协议端在线补齐（数量模式按 `summary_min_mysql_ratio` 判定，时间模式按窗口条数与
+  `summary_gap_tolerance_minutes` 判定），两源按 `message_id` 去重（无 message_id 时退化为
+  「秒级时间戳 + 发送者 + 内容前 32 字符」），按时间升序合并
+- **OneBot 数据不回填**：协议端拉到的消息仅本次总结使用，不写入 `chat_history`；
+  任一数据源失败自动降级为可用数据继续，两源皆空回复无可总结消息提示
+- **总结内容**：规则统计块（消息总数/参与者人数/时间跨度/发言条数排行 Top N）
+  + LLM 四板块摘要（📢 重要通知与结论 / 💬 讨论要点·争议 / 🎉 有趣片段 / ✅ TODO·待跟进，
+  每个条目含参与者与大致时间）
+- **输出形式**（Web 可配 `summary_output_mode`）：合并转发 `forward`（1 个统计节点 + 4 个板块节点，
+  提示词约束 + 发送前程序化剥离双重保障去除 Markdown 标记）/ 文转图 `image`（保留 Markdown，渲染成图片发送）
+- **LLM 提供商**：Web 可指定总结专用 provider（`summary_provider_id`，dashboard 下拉选择），
+  未配置时回退该群会话当前 provider，两者皆不可用回复错误提示
+- **提示词模板**（`summary_prompt`）：内置占位符 `{stats}` `{messages}` `{time_range}` `{group_id}`
+  `{format_constraint}`，dashboard 多行文本框可自由编辑调试，支持一键恢复默认模板
+- **权限与限流**：独立群白名单（`summary_group_whitelist` + `whitelist`/`all` 模式，
+  与现有录制白名单 group_config 表互不干扰）+ 用户/群双冷却（`summary_user_cooldown` 默认 60s /
+  `summary_group_cooldown` 默认 120s），冷却表存内存、重启清零
+- **素材过滤**：非文本消息完全忽略（不占位、不统计、不送 LLM）；默认过滤 bot 自身消息（硬编码）；
+  每群可配置忽略发送者（dashboard「忽略管理」tab 增删查，存 config.db `group_ignore_senders` 表）
+- **结果持久化**：总结以 JSON 保存到 `data/plugin_data/astrbot_plugin_group_history_save_mysql/summaries/<群号>/<时间戳>.json`
+  （含统计块、摘要原文、元数据），保留天数可配（`summary_retention_days` 默认 30 天），
+  定时任务每天清理一次过期文件，随插件生命周期启停
+- **配置管理**：全部 15 项新配置存入 config.db **新增 `summary_settings` 表**（key/value，列表值 JSON 序列化），
+  由 `ConfigManager` 统一建表、播种默认值与 CRUD；**不进入 `_conf_schema.json`**（原有插件配置文件保持不变），
+  仅在 dashboard「总结设置」tab 修改，改后即时生效无需重启插件
+- **Web 管理后台新增 3 个 tab**：总结设置（15 项配置分组表单：基础与白名单 / 参数上限 / 总结行为 / 存储，
+  provider 下拉，提示词编辑与恢复默认）/ 忽略管理（每群忽略发送者增删查）/ 历史总结（按群浏览已存总结 + 详情弹层）
+- **架构**：新功能代码全部位于 `summary/` 子包（service 编排层 / fetcher 混合获取 / onebot 协议端封装 /
+  summarizer 总结引擎 / formatter 输出格式化 / storage JSON 持久化 / scheduler 定时清理），
+  指令在 `main.py` 注册并薄封装异步委托子包；日志统一 `[HistorySummary]` 前缀；无新增 pip 依赖
+
+### Changed
+
+- metadata.yaml 版本升至 v0.3.0，desc 更新为「将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）」
+- 完全向后兼容 v0.2.1 数据与配置：`chat_history` / `image_records` 表结构不变，新配置由 `ConfigManager` 初始化自动播种默认值
+
 ## [0.2.1] - 2026-07-28
 
 ### Fixed

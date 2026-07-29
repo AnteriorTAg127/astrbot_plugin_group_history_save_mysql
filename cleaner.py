@@ -46,8 +46,9 @@ class ImageCleaner:
     async def _cleanup_loop(self):
         """定时清理循环：每天凌晨 3:00 执行。
 
-        异常后采用指数退避（60→120→300→600s），避免数据库长期不可用 时无限刷日志。
-        连续失败 5 次输出 warning 告警，成功后重置退避计数。
+        清理失败后按指数退避（60→120→300→600s）立即重试，而不是等到
+        次日凌晨 3:00；数据库长期不可用时限流日志（600s 一条 error，
+        连续失败 5 次输出 warning 告警），成功后重置退避计数。
         """
         from datetime import timedelta
 
@@ -66,16 +67,30 @@ class ImageCleaner:
                 if not self._running:
                     break
 
-                # 执行清理
-                await self._do_cleanup()
-                # 成功后重置退避
-                self._fail_count = 0
+                # 执行清理（失败时内部按退避立即重试，成功后返回）
+                await self._cleanup_with_backoff()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[HistorySave] 清理任务异常: {e}")
-                # 指数退避：60→120→300→600s（上限）
+                await asyncio.sleep(60)
+
+    async def _cleanup_with_backoff(self):
+        """执行一次清理，失败按指数退避立即重试直至成功。
+
+        退避序列 60→120→300→600s（上限）。连续失败 5 次输出 warning 告警，
+        成功后重置失败计数并返回外层循环（继续排定下一个 3:00）。
+        """
+        while self._running:
+            try:
+                await self._do_cleanup()
+                self._fail_count = 0
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[HistorySave] 清理执行失败: {e}")
                 backoff = self._BACKOFF_SEQUENCE[
                     min(self._fail_count, len(self._BACKOFF_SEQUENCE) - 1)
                 ]
@@ -87,7 +102,11 @@ class ImageCleaner:
                 await asyncio.sleep(backoff)
 
     async def _do_cleanup(self):
-        """执行一次清理操作。"""
+        """执行一次清理操作。
+
+        Raises:
+            RuntimeError: 数据库清理失败（由上层按退避重试）
+        """
         try:
             retention_days = int(
                 await self.config_mgr.get_setting("image_retention_days", "3")
@@ -102,7 +121,9 @@ class ImageCleaner:
                 f"（保留 {retention_days} 天）"
             )
         else:
-            logger.warning("[HistorySave] 自动清理执行失败")
+            # 抛异常触发上层退避重试；若仅告警返回，失败会被静默吞掉，
+            # 下一次清理要等到次日凌晨，过期图片持续堆积
+            raise RuntimeError("clean_old_images 返回失败（数据库不可用？）")
 
     async def manual_clean(self, days: int | None = None) -> int:
         """手动触发清理。
