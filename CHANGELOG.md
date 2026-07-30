@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.3.2] - 2026-07-31
+
+### Added
+
+- **自研 T2I 报告模板**：图片总结改用插件自带模板 `summary/templates/summary_report.html`（860px 画布、
+  与管理面板同款双主题设计令牌、移动端友好字号），含报告头、四统计卡、发言人排行、分板块 Markdown 内容与页脚，
+  替代原最小化渲染模板
+- **多路 JS CDN 容灾**：模板内联加载器按 `summary_t2i_cdn_providers` 顺序尝试
+  （默认国内镜像优先 bootcdn/npmmirror/staticfile → jsdelivr/unpkg），单节点 8 秒超时自动切换；
+  加载 `marked`（Markdown + GFM 表格）与 `echarts`（柱状图）；全部失败自动降级为服务端预转换 HTML 与纯 CSS 柱状图，
+  图片仍可产出
+- **发言人排行柱状图**：把活跃排行 Top N 渲染为横向柱状图（ECharts 主题色板 + 纯 CSS 渐变横条双形态互为兜底）
+- **白天/夜间自动主题**：`summary_t2i_theme_mode`（auto/light/dark）+ `summary_t2i_dark_start`/
+  `summary_t2i_light_start`（默认 22:00/08:00，HH:MM 可配），按服务器本地时间判定，22 点后深色、8 点后浅色
+- **渲染超时可配**：`summary_t2i_timeout`（默认 30 秒，5–300），两轮渲染 R1 PNG(T) / R2 JPEG 质量 80(2T)，
+  并对截图结果做文件头魔数校验，防止把渲染服务返回的错误页面当成图片
+- **图片渲染配置组**：dashboard「总结设置」新增「图片渲染」分组，含主题模式 / 深色起点 / 浅色起点 / 渲染超时 /
+  CDN 节点顺序 5 项
+- **备用模型列表交互改版**：原内联长复选框列表改为触发按钮 + 弹窗——弹窗内「降级顺序」区可拖拽排序、
+  「可选模型」区滚动勾选，点击遮罩不关闭（防误触丢失排序），失效模型保留可拖可删
+
+### Changed
+
+- 图片模式格式约束放开并**推荐 Markdown 表格**（GFM 管道符语法），表格在图片中正常渲染
+- 图片渲染兜底链路改为「自研模板 → `text_to_image` → 纯文本」
+- 总结配置项 19 → 24（新增 5 项图片渲染配置）
+- metadata.yaml 版本升至 v0.3.2
+- 完全向后兼容 v0.3.1：新配置由 `ConfigManager` 初始化自动播种默认值，无需迁移，已存配置不受影响
+
+## [0.3.1] - 2026-07-31
+
+### Added
+
+- **备用模型降级链**：新增 `summary_fallback_providers` 配置（Web 后台多选），LLM 总结按
+  「主选提供商 → 备用列表按序 → 会话模型兜底」调用，任一节点失败（异常/空文本）自动降级，
+  历史总结记录实际使用的模型
+- **总结触发反馈**：新增 `summary_feedback_mode`（`reaction`/`text`/`none`，默认 `reaction`）与
+  `summary_feedback_text` 配置，指令生效后即时确认（贴 👍 表情或文字提示）；协议端不支持
+  贴表情时自动降级文字
+
+### Changed
+
+- 面板改为两级导航：「存储库 / 消息总结」分区（总结三 tab 归入消息总结分区，惰性加载）
+- OneBot 历史拉取改为 `message_seq` 多轮翻页（最多 5 轮、轮间短延迟防限频、每轮 1.3x 超量请求
+  补偿过滤损耗），兼容单次条数受限（~200 条硬限）的协议端；第 2 轮起失败返回已拉到的部分消息
+- 素材长度预算 `summary_max_prompt_chars` 升级为 Web 可配（默认 60000，非法值回退常量默认）
+- 总结设置数字输入框加宽，长数字不再被旋钮挤占
+- 总结配置项 15 → 19（长度预算升级为配置 + 本版新增备用模型列表与反馈 3 项）
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
@@ -33,18 +82,11 @@
 - **结果持久化**：总结以 JSON 保存到 `data/plugin_data/astrbot_plugin_group_history_save_mysql/summaries/<群号>/<时间戳>.json`
   （含统计块、摘要原文、元数据），保留天数可配（`summary_retention_days` 默认 30 天），
   定时任务每天清理一次过期文件，随插件生命周期启停
-- **配置管理**：全部 16 项新配置存入 config.db **新增 `summary_settings` 表**（key/value，列表值 JSON 序列化），
+- **配置管理**：全部 15 项新配置存入 config.db **新增 `summary_settings` 表**（key/value，列表值 JSON 序列化），
   由 `ConfigManager` 统一建表、播种默认值与 CRUD；**不进入 `_conf_schema.json`**（原有插件配置文件保持不变），
   仅在 dashboard「总结设置」tab 修改，改后即时生效无需重启插件
-- **Web 管理后台新增 3 个 tab**：总结设置（16 项配置分组表单：基础与白名单 / 参数上限 / 总结行为 / 存储，
+- **Web 管理后台新增 3 个 tab**：总结设置（15 项配置分组表单：基础与白名单 / 参数上限 / 总结行为 / 存储，
   provider 下拉，提示词编辑与恢复默认）/ 忽略管理（每群忽略发送者增删查）/ 历史总结（按群浏览已存总结 + 详情弹层）
-- **OneBot 多轮翻页**：`fetch_group_history` 按 `message_seq` 从新到旧翻页累计（最多 5 轮、轮间短延迟防限频、
-  每轮 1.3x 超量请求补偿过滤损耗），兼容单次 count 硬限 ~200 条的协议端实现；支持大 count 的协议端
-  第一轮即因短页终止（行为等价单次调用）；首轮失败仍抛错降级，第 2 轮起失败返回已拉到的部分消息
-- **dashboard 两级导航**：顶部分区控件「存储库 / 消息总结」，总结三 tab 归入「消息总结」独立分区；
-  存储区启动不再预触总结接口，进入总结分区才惰性加载
-- **素材长度预算 Web 可配**：`summary_max_prompt_chars`（默认 60000 字符）可在 dashboard「总结设置 →
-  参数上限」调整，非法值回退常量默认；超限从最旧消息截断，统计块仍基于全量
 - **架构**：新功能代码全部位于 `summary/` 子包（service 编排层 / fetcher 混合获取 / onebot 协议端封装 /
   summarizer 总结引擎 / formatter 输出格式化 / storage JSON 持久化 / scheduler 定时清理），
   指令在 `main.py` 注册并薄封装异步委托子包；日志统一 `[HistorySummary]` 前缀；无新增 pip 依赖

@@ -6,16 +6,21 @@
 2. **素材格式化**：每行 ``[YYYY-MM-DD HH:MM] 昵称: 内容``；
 3. **长度预算**：渲染后的完整 prompt 超过 :data:`MAX_PROMPT_CHARS` 时，按时间
    **保留最近的消息**逐条削减（统计不受影响，仅 ``stats.truncated`` 置 True）；
-4. **Provider 解析**：配置 ``summary_provider_id`` 优先；为空回退
-   ``context.get_current_chat_provider_id(event.unified_msg_origin)``；
-   皆无则抛 :class:`SummaryProviderError`（由 service 层兜底文案）；
+4. **Provider 降级链**：按「主选 ``summary_provider_id`` → 备用列表
+   ``summary_fallback_providers`` → 会话 provider
+   ``context.get_current_chat_provider_id(event.unified_msg_origin)``」三段按序尝试；
+   会话 provider **惰性解析**（已配置段全部失败后才查询，主选成功时零会话查询）；
+   任一节点调用异常或返回空文本即降级下一个；三段皆空抛
+   :class:`SummaryProviderError`（由 service 层兜底文案）；
 5. **占位符渲染**：替换 ``{stats}`` ``{messages}`` ``{time_range}`` ``{group_id}``
    ``{format_constraint}`` 五个占位符（模板取自配置，用户可自定义），
    渲染后正则自检并清除遗漏占位符；
 6. **LLM 调用**：经 ``context.llm_generate(chat_provider_id=..., prompt=...)``
    （AstrBot v4.5.7+ SDK，见 docs/zh/dev/star/guides/ai.md），返回
    :class:`LLMResponse`，取 ``completion_text`` 属性提取纯文本；
-   调用异常 ``logger.error(..., exc_info=True)`` 后**原样向上抛**，不吞；
+   逐节点尝试：非末尾节点失败记 warning（provider id + 简要原因，不打 prompt
+   全文、不挂 exc_info 降噪）；整链耗尽记 error（末次失败为异常时挂其上下文）
+   后**原样向上抛**（异常原样 / 空文本 RuntimeError），不吞；
 7. **板块解析**（best-effort）：按 4 个板块标题行宽松切分 LLM 输出，
    切出少于 2 个板块则回退单段 ``[("全部", raw)]``。
 
@@ -55,11 +60,11 @@ _SECTION_MATCH_RULES: tuple[tuple[str, str], ...] = (
     ("TODO", SECTION_TITLES[3]),
 )
 
-# format_constraint 占位符取值：forward（合并转发）需剥 Markdown，image（文转图）可保留
+# format_constraint 占位符取值：forward（合并转发）需剥 Markdown，image（文转图）保留 Markdown 并推荐表格
 _FORMAT_CONSTRAINT_FORWARD = (
     "不要使用任何 Markdown 格式（不要出现 #、*、>、`、[] 等标记符号）"
 )
-_FORMAT_CONSTRAINT_IMAGE = "可以使用 Markdown 格式"
+_FORMAT_CONSTRAINT_IMAGE = "可以使用 Markdown 格式，推荐使用 Markdown 表格（GFM 管道符语法）呈现结构化信息；可使用标题、粗体、列表"
 
 # 渲染自检：识别形如 {xxx} 的遗漏占位符（用户自定义模板可能含未知占位符）
 _PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
@@ -89,7 +94,7 @@ class Summarizer:
         """对给定消息列表执行统计 + LLM 总结，产出 :class:`SummaryResult`。
 
         Args:
-            event: 当前消息事件（用于 provider 回退与群号兜底）。
+            event: 当前消息事件（用于降级链的会话模型兜底与群号兜底）。
             messages: 归一化消息列表（fetcher 已去重/过滤，通常时间升序；
                 内部仍按时间排序兜底，保证截断策略始终保留最近的消息）。
             scope_desc: 范围描述，如「最近 512 条」/「最近 24 小时」，渲染
@@ -99,12 +104,14 @@ class Summarizer:
 
         Returns:
             SummaryResult: 统计（基于全量消息）+ 板块摘要 + 元数据。
+            ``provider_id`` 记录降级链中**实际调用成功**的 provider；
             ``sources`` 留空 dict（由 service 层注入）。
 
         Raises:
-            SummaryProviderError: 未配置总结 provider 且无法获取会话 provider。
-            RuntimeError: LLM 返回空文本。
-            Exception: LLM 调用异常原样向上抛（已记 error 日志），由 service 层兜底。
+            SummaryProviderError: 三段皆空（主选空、备用列表空且会话 provider 取不到）。
+            RuntimeError: 降级链耗尽且最后失败节点返回空文本。
+            Exception: 降级链耗尽且最后失败节点为调用异常——原样向上抛
+                （已记 error 日志），由 service 层兜底。
         """
         # 兜底按时间升序：截断「保留最近」与时间跨度统计都依赖该顺序
         ordered = sorted(messages, key=lambda m: m.timestamp)
@@ -112,8 +119,11 @@ class Summarizer:
         top_n = await self._get_top_n()
         stats = self._build_stats(ordered, top_n)
 
-        # provider 解析前置：无法确定 provider 时快速失败，不做无谓的渲染
-        provider_id = await self._resolve_provider_id(event)
+        # 构建已配置段降级链（主选 + 备用列表）。惰性设计：此处不查询会话
+        # provider —— 仅在已配置段全部失败（或已配置段为空）时，才由
+        # _call_llm_chain 内部解析会话兜底；主选成功时全程零会话查询。
+        # 故 SummaryProviderError（三段皆空）也延迟至 _call_llm_chain 内抛出。
+        chain = await self._build_configured_chain()
 
         template = await self.config_mgr.get_summary_setting("summary_prompt")
         if not template.strip():
@@ -144,14 +154,14 @@ class Summarizer:
                 f"实际送入 {messages_used} 条"
             )
 
-        raw = await self._call_llm(provider_id, prompt)
+        raw, used_provider = await self._call_llm_chain(chain, prompt, event)
         sections = self._parse_sections(raw)
 
         return SummaryResult(
             stats=stats,
             sections=sections,
             raw_llm_text=raw,
-            provider_id=provider_id,
+            provider_id=used_provider,
             messages_used=messages_used,
             sources={},
             scope_desc=scope_desc,
@@ -268,35 +278,55 @@ class Summarizer:
 
         return prompt, len(kept), truncated
 
-    # ========== Provider 解析 ==========
+    # ========== Provider 降级链 ==========
 
-    async def _resolve_provider_id(self, event: AstrMessageEvent) -> str:
-        """解析总结用 LLM provider：配置优先，回退会话 provider，皆无则抛异常。
+    async def _build_configured_chain(self) -> list[str]:
+        """构建已配置段降级链：主选 → 备用列表（不含会话 provider，惰性兜底）。
 
-        注意：``context.get_current_chat_provider_id(umo)`` 在未找到时
-        **抛出 ProviderNotFoundError**（而非返回空值），此处统一捕获视为回退失败。
+        - 主选：``summary_provider_id`` strip 后非空入链；
+        - 备用列表：``summary_fallback_providers`` 经 typed 读取（非 list 视为
+          空列表），逐项过滤——仅保留 strip 后非空的 str（非字符串/空串静默
+          丢弃），保持配置顺序去重（与主选或前序项重复的只保留首份）；
+        - 两段皆空时返回空列表：会话 provider 兜底在 :meth:`_call_llm_chain`
+          内惰性解析（已配置段为空时立即解析，等价 v0.3.0 空配置路径）。
         """
-        configured = (
+        chain: list[str] = []
+        primary = (
             await self.config_mgr.get_summary_setting("summary_provider_id")
         ).strip()
-        if configured:
-            return configured
+        if primary:
+            chain.append(primary)
 
+        fallbacks = await self.config_mgr.get_summary_setting_typed(
+            "summary_fallback_providers"
+        )
+        if not isinstance(fallbacks, list):
+            fallbacks = []
+        for item in fallbacks:
+            if not isinstance(item, str):
+                continue
+            pid = item.strip()
+            if pid and pid not in chain:
+                chain.append(pid)
+        return chain
+
+    async def _resolve_session_provider(self, event: AstrMessageEvent) -> str:
+        """惰性解析会话 provider（最终兜底）；异常/空白一律视为取不到，返回空串。
+
+        注意：``context.get_current_chat_provider_id(umo)`` 在未找到时
+        **抛出 ProviderNotFoundError**（而非返回空值），此处统一捕获视为取不到。
+        """
         try:
             provider_id = await self.context.get_current_chat_provider_id(
                 event.unified_msg_origin
             )
         except Exception as e:
             logger.warning(
-                f"[HistorySummary] 获取会话 provider 失败（将视为未配置）: {e}"
+                f"[HistorySummary] 获取会话 provider 失败（将视为取不到）: "
+                f"{type(e).__name__}: {e}"
             )
-            provider_id = ""
-
-        if not provider_id:
-            raise SummaryProviderError(
-                "未配置总结 provider（summary_provider_id 为空）且无法获取会话 provider"
-            )
-        return provider_id
+            return ""
+        return (provider_id or "").strip()
 
     def _resolve_group_id(
         self, event: AstrMessageEvent, messages: list[ChatMessage]
@@ -330,33 +360,103 @@ class Summarizer:
             lines.append("活跃排行: 无数据")
         return "\n".join(lines)
 
-    # ========== LLM 调用 ==========
+    # ========== LLM 调用（降级链） ==========
 
-    async def _call_llm(self, provider_id: str, prompt: str) -> str:
-        """调用 LLM 并提取纯文本。
+    async def _call_llm_chain(
+        self, chain: list[str], prompt: str, event: AstrMessageEvent
+    ) -> tuple[str, str]:
+        """按「主选 → 备用列表 → 会话兜底」逐节点尝试，返回 (纯文本, 实际成功的 provider id)。
 
-        使用 AstrBot v4.5.7+ SDK：``context.llm_generate(chat_provider_id=...,
-        prompt=...)``，返回 :class:`LLMResponse`，经 ``completion_text`` 属性
-        提取纯文本（该属性优先取 result_chain 的纯文本拼接）。
+        惰性设计：入参 ``chain`` 仅为已配置段（见 :meth:`_build_configured_chain`）；
+        会话 provider 仅在已配置段**全部失败后**才惰性解析并追加为末尾节点
+        （已配置段为空时立即解析作为唯一节点，等价 v0.3.0 空配置路径；
+        因此主选成功时不会产生任何 ``get_current_chat_provider_id`` 调用）。
+
+        降级规则：任一节点**调用异常或返回空文本**即尝试下一个；非末尾节点
+        失败记 warning（provider id + 失败原因：异常取 type+str、空文本注明，
+        不打 prompt 全文、warning 不挂 exc_info 降噪）。
 
         Raises:
-            RuntimeError: LLM 返回空文本。
-            Exception: 调用异常记 error 日志后原样向上抛。
+            SummaryProviderError: 三段皆空（已配置段为空且会话 provider 取不到）。
+            RuntimeError: 整链耗尽且最后失败节点返回空文本。
+            Exception: 整链耗尽且最后失败节点为调用异常——原样向上抛。
         """
-        try:
-            llm_resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-            )
-        except Exception:
-            logger.error("[HistorySummary] LLM 调用失败", exc_info=True)
-            raise
+        nodes = list(chain)
+        tried: list[str] = []
+        session_resolved = False
 
-        raw = (getattr(llm_resp, "completion_text", "") or "").strip()
-        if not raw:
-            logger.error("[HistorySummary] LLM 调用失败：返回文本为空")
-            raise RuntimeError("LLM 返回空总结文本")
-        return raw
+        if not nodes:
+            # 已配置段为空：直接解析会话 provider 作为唯一节点（等价 v0.3.0 空配置路径）
+            session_resolved = True
+            session_pid = await self._resolve_session_provider(event)
+            if session_pid:
+                nodes.append(session_pid)
+            else:
+                raise SummaryProviderError(
+                    "总结 provider 三段皆空：主选 summary_provider_id 为空、"
+                    "备用列表 summary_fallback_providers 为空且会话 provider 取不到"
+                )
+
+        last_exc: Exception | None = None  # 最近一次失败的异常（空文本失败时为 None）
+        last_reason = ""  # 最近一次失败的简要原因（供 warning/error 日志）
+
+        idx = 0
+        while True:
+            if idx >= len(nodes):
+                # 已配置段耗尽：惰性解析会话 provider 追加为末尾节点
+                if not session_resolved:
+                    session_resolved = True
+                    session_pid = await self._resolve_session_provider(event)
+                    if session_pid and session_pid not in tried:
+                        logger.warning(
+                            f"[HistorySummary] 已配置模型均失败，降级会话模型："
+                            f"provider={tried[-1]}，原因：{last_reason}"
+                        )
+                        nodes.append(session_pid)
+                        continue
+                break  # 会话取不到/已尝试过 → 整链耗尽
+
+            pid = nodes[idx]
+            tried.append(pid)
+            try:
+                # AstrBot v4.5.7+ SDK：返回 LLMResponse，completion_text 属性
+                # 优先取 result_chain 的纯文本拼接
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=pid,
+                    prompt=prompt,
+                )
+            except Exception as e:
+                last_exc = e
+                last_reason = f"调用异常 {type(e).__name__}: {e}"
+            else:
+                raw = (getattr(llm_resp, "completion_text", "") or "").strip()
+                if raw:
+                    return raw, pid
+                last_exc = None
+                last_reason = "返回文本为空"
+
+            # 非末尾节点失败 → warning 降级日志（末尾失败由链耗尽 error 统一记录）
+            if idx + 1 < len(nodes):
+                logger.warning(
+                    f"[HistorySummary] 总结模型调用失败，降级下一节点："
+                    f"provider={pid}，原因：{last_reason}"
+                )
+            idx += 1
+
+        # 整链耗尽：error 日志后按最后一次失败类型向上抛（与 v0.3.0 单节点行为对齐，
+        # 由 service 层兜底文案）
+        if last_exc is not None:
+            logger.error(
+                f"[HistorySummary] 总结模型降级链耗尽，最后失败 provider={tried[-1]}："
+                f"{last_reason}",
+                exc_info=last_exc,
+            )
+            raise last_exc
+        logger.error(
+            f"[HistorySummary] 总结模型降级链耗尽，最后失败 provider={tried[-1]}："
+            f"{last_reason}"
+        )
+        raise RuntimeError("LLM 返回空总结文本")
 
     # ========== 板块解析 ==========
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.3.3">
+    <link rel="stylesheet" href="./style.css?v=0.3.6">
 </head>
 <body>
     <div class="app">
@@ -239,7 +239,7 @@
             </div>
         </section>
 
-        <!-- 总结设置页（v0.3）：16 项配置由 app.js 按分组动态渲染 -->
+        <!-- 总结设置页（v0.3）：24 项配置由 app.js 按分组动态渲染 -->
         <section class="page" id="page-summary-settings">
             <div class="section-card">
                 <div class="section-title"><span>🧠 总结功能设置</span></div>
@@ -358,9 +358,29 @@
         </div>
     </div>
 
+    <!-- 备用模型多选弹窗（v0.3.2）：滚动勾选 + 拖拽排序；点遮罩不关闭 -->
+    <div class="modal-mask" id="providerMultiModal" style="display:none;">
+        <div class="modal-card modal-lg">
+            <div class="modal-title">🔀 备用总结模型 · 降级顺序</div>
+            <div class="modal-desc">勾选模型加入备用列表，<strong>拖动 ⠿ 手柄</strong>调整降级顺序（从上到下逐个尝试，全部失败回退会话模型）。点击弹窗外部不会关闭，请用下方按钮。</div>
+            <div class="pm-selected">
+                <div class="pm-zone-title">降级顺序 <span class="pm-badge" id="pmSelectedCount">0</span></div>
+                <div class="pm-zone-list" id="pmSelectedZone"></div>
+            </div>
+            <div class="pm-available">
+                <div class="pm-zone-title">可选模型 <span class="pm-hint">（滚动勾选）</span></div>
+                <div class="pm-zone-list pm-scroll" id="pmAvailableList"></div>
+            </div>
+            <div class="modal-actions">
+                <button id="pmCancelBtn" class="btn btn-ghost">取消</button>
+                <button id="pmDoneBtn" class="btn btn-primary">完成</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast -->
     <div id="toast" class="toast"></div>
 
-    <script type="module" src="./app.js?v=0.3.3"></script>
+    <script type="module" src="./app.js?v=0.3.6"></script>
 </body>
 </html>

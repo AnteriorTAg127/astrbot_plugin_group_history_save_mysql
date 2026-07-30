@@ -452,9 +452,9 @@ function el(tag, className, text) {
     return node;
 }
 
-// ========== v0.3 Tab 1：总结设置（16 项配置分组表单） ==========
+// ========== v0.3 Tab 1：总结设置（24 项配置分组表单） ==========
 
-// 16 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
+// 24 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
 // kind 与后端 SUMMARY_TYPES（bool/int/float/list/str）一一对应，
 // 请求封装沿用 bridge.apiGet/apiPost（路径相对插件 API 前缀，响应已由桥接解包）
 const SUMMARY_FIELD_META = [
@@ -473,11 +473,20 @@ const SUMMARY_FIELD_META = [
     { key: "summary_max_prompt_chars", group: "参数上限", label: "素材长度预算", desc: "送入 LLM 的完整提示词字符上限，超出从最旧消息开始截断（统计仍全量）", kind: "int", unit: "字符", min: 1000 },
     // —— 总结行为 ——
     { key: "summary_provider_id", group: "总结行为", label: "总结专用 LLM 提供商", desc: "留空时回退使用当前会话的 LLM 提供商", kind: "provider" },
+    { key: "summary_fallback_providers", group: "总结行为", label: "备用总结模型列表", desc: "主选模型失败后按勾选顺序逐个尝试，全部失败回退会话模型", kind: "provider_multi" },
     { key: "summary_prompt", group: "总结行为", label: "提示词模板", desc: "占位符：{stats} {messages} {time_range} {group_id} {format_constraint}", kind: "prompt" },
     { key: "summary_output_mode", group: "总结行为", label: "输出形态", desc: "forward=合并转发（剥 Markdown）；image=文转图（保留 Markdown）", kind: "select", options: [["forward", "合并转发（forward）"], ["image", "文转图（image）"]] },
+    { key: "summary_feedback_mode", group: "总结行为", label: "触发反馈模式", desc: "reaction=在触发消息上贴 👍（协议端不支持自动降级文字）；text=文字提示；none=关闭", kind: "select", options: [["reaction", "贴表情回应（reaction）"], ["text", "文字提示（text）"], ["none", "关闭（none）"]] },
+    { key: "summary_feedback_text", group: "总结行为", label: "触发反馈文案", desc: "text 模式的提示文案；reaction 失败降级时同用；留空回退内置默认", kind: "text" },
     { key: "summary_rank_top_n", group: "总结行为", label: "活跃排行条数", desc: "活跃排行展示条数", kind: "int", unit: "条", min: 0 },
     // —— 存储 ——
     { key: "summary_retention_days", group: "存储", label: "总结保留天数", desc: "总结 JSON 保留天数，每日定时清理过期文件", kind: "int", unit: "天", min: 1 },
+    // —— 图片渲染（v0.3.2）——
+    { key: "summary_t2i_theme_mode", group: "图片渲染", label: "主题模式", desc: "自动：按服务器时间切换——浅色时段起点至深色时段起点为浅色，其余为深色", kind: "select", options: [["auto", "自动（auto）"], ["light", "浅色（light）"], ["dark", "深色（dark）"]] },
+    { key: "summary_t2i_dark_start", group: "图片渲染", label: "深色时段起点", desc: "HH:MM 24 小时制，服务器本地时间", kind: "hhmm", placeholder: "22:00" },
+    { key: "summary_t2i_light_start", group: "图片渲染", label: "浅色时段起点", desc: "HH:MM 24 小时制，服务器本地时间", kind: "hhmm", placeholder: "08:00" },
+    { key: "summary_t2i_timeout", group: "图片渲染", label: "渲染超时", desc: "单轮截图超时；页面过大渲染不完时调大。失败后自动以双倍超时重试第二轮（JPEG 降质）", kind: "int", unit: "秒", min: 5 },
+    { key: "summary_t2i_cdn_providers", group: "图片渲染", label: "CDN 节点顺序", desc: "加载 Markdown/图表脚本的 CDN 尝试顺序，逗号分隔；任一节点失败自动切换下一个。可选值：bootcdn / npmmirror / staticfile / jsdelivr / unpkg，留空=默认（国内镜像优先）", kind: "csv_list" },
 ];
 
 let summaryProviders = []; // LLM 提供商列表（可能为空数组 → 下拉仅含回退项）
@@ -516,7 +525,7 @@ function renderSummaryForm(settings) {
 }
 
 function buildSummaryItem(meta, rawValue) {
-    const stacked = meta.kind === "prompt" || meta.kind === "whitelist";
+    const stacked = meta.kind === "prompt" || meta.kind === "whitelist" || meta.kind === "provider_multi";
     const item = el("div", "s-item" + (stacked ? " s-item-stack" : ""));
     const info = el("div", "setting-info");
     info.appendChild(el("div", "setting-name", meta.label));
@@ -599,6 +608,55 @@ function buildSummaryItem(meta, rawValue) {
             control.appendChild(select);
             break;
         }
+        case "provider_multi": {
+            // 备用模型多选（v0.3.2 改版）：内联长列表 → 触发按钮 + 弹窗编辑。
+            // 真实值存于隐藏 input[data-key]（JSON 字符串数组，collect/fill 据此读写），
+            // 弹窗内「降级顺序」区可拖拽排序、「可选模型」区滚动勾选；点遮罩不关闭。
+            control.className = "setting-control";
+            const selected = parseProviderMultiValue(rawValue);
+            const hidden = document.createElement("input");
+            hidden.type = "hidden";
+            hidden.dataset.key = meta.key;
+            hidden.value = JSON.stringify(selected);
+            control.appendChild(hidden);
+            const trigger = el("button", "btn btn-ghost provider-multi-trigger");
+            trigger.type = "button";
+            control.appendChild(trigger);
+            refreshProviderMultiTrigger(trigger, selected);
+            trigger.addEventListener("click", () => openProviderMultiModal(meta.key, trigger));
+            break;
+        }
+        case "text": {
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "input input-text";
+            input.dataset.key = meta.key;
+            input.value = String(rawValue ?? "");
+            control.appendChild(input);
+            break;
+        }
+        case "hhmm": {
+            // v0.3.2 图片渲染：HH:MM 时段起点文本框；前端不强校验，非法值由后端回退默认并记 warning
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "input input-sm";
+            if (meta.placeholder) input.placeholder = meta.placeholder;
+            input.dataset.key = meta.key;
+            input.value = String(rawValue ?? "");
+            control.appendChild(input);
+            break;
+        }
+        case "csv_list": {
+            // v0.3.2 图片渲染：有序字符串列表（CDN 节点顺序）以逗号分隔文本框编辑，
+            // 后端以 JSON 字符串数组存储（与 provider_multi 同语义）
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "input input-text";
+            input.dataset.key = meta.key;
+            input.value = jsonArrayToCsv(rawValue);
+            control.appendChild(input);
+            break;
+        }
         case "whitelist": {
             control.className = "setting-control control-wide";
             const input = document.createElement("input");
@@ -633,6 +691,205 @@ function buildSummaryItem(meta, rawValue) {
     return item;
 }
 
+// provider_multi 值解析：后端 summary_settings 表以 JSON 字符串数组存储（如 '["id1","id2"]'），
+// 解析失败 / 非数组一律视为 []；条目仅保留非空字符串（与后端非法条目静默过滤的语义一致）
+function parseProviderMultiValue(rawValue) {
+    let arr = rawValue;
+    if (typeof rawValue === "string") {
+        try {
+            arr = JSON.parse(rawValue);
+        } catch {
+            return [];
+        }
+    }
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((s) => typeof s === "string" && s !== "");
+}
+
+// v0.3.2 有序字符串列表（CDN 节点顺序）与逗号分隔文本的互转：
+// 后端 list 值以 JSON 字符串数组存储，解析复用 parseProviderMultiValue（非数组/解析失败 → []）
+function jsonArrayToCsv(rawValue) {
+    return parseProviderMultiValue(rawValue).join(",");
+}
+
+// 逗号分隔文本 → 字符串数组：逐项 trim 并过滤空串（兼容全角逗号，与白名单解析同款）
+function csvToArray(text) {
+    return String(text)
+        .split(/[,，]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+// ========== v0.3.2 备用模型多选：触发按钮 + 弹窗（滚动勾选 + 拖拽排序）==========
+// 设计：内联长 checkbox 列表改为点击触发按钮 → 弹窗编辑。弹窗分两区：
+//   上「降级顺序」= 已选模型，可拖拽排序（顺序即后端降级调用顺序）；
+//   下「可选模型」= 全量 provider 滚动勾选，勾选加入顺序区、取消则移除。
+// 弹窗不可点遮罩关闭（仅 取消/完成 按钮），避免误触丢失排序。
+
+// id → 展示名（providers 拉取后构建；失效 id 回退原值）
+function providerNameOf(id) {
+    const p = (summaryProviders || []).find((x) => x.id === id);
+    return p ? p.name || p.id : id;
+}
+
+// 刷新触发按钮摘要文案（已选数量 + 前两个名称，或「未配置」提示）
+function refreshProviderMultiTrigger(trigger, ids) {
+    if (!trigger) return;
+    const arr = Array.isArray(ids) ? ids : [];
+    if (arr.length === 0) {
+        trigger.innerHTML = '<span class="pm-trigger-empty">未配置（回退会话模型）</span><span class="pm-trigger-edit">编辑 ›</span>';
+        return;
+    }
+    const head = arr.slice(0, 2).map(providerNameOf).join("、");
+    const more = arr.length > 2 ? ` 等 ${arr.length} 个` : "";
+    trigger.innerHTML =
+        `<span class="pm-trigger-count">${arr.length}</span>` +
+        `<span class="pm-trigger-names">${head}${more}</span>` +
+        `<span class="pm-trigger-edit">编辑 ›</span>`;
+}
+
+// 打开弹窗：以隐藏 input 当前值为工作副本渲染两区
+function openProviderMultiModal(key, trigger) {
+    const mask = document.getElementById("providerMultiModal");
+    if (!mask) return;
+    const hidden = document.querySelector(`#summarySettingsForm [data-key="${key}"]`);
+    const selected = hidden ? parseProviderMultiValue(hidden.value) : [];
+    mask.dataset.key = key;
+    mask._pmTrigger = trigger;
+    mask._pmSelected = selected.slice();
+    renderProviderMultiModal();
+    mask.style.display = "flex";
+}
+
+function closeProviderMultiModal() {
+    const mask = document.getElementById("providerMultiModal");
+    if (mask) mask.style.display = "none";
+}
+
+// 完成：写回隐藏 input + 刷新触发摘要
+function confirmProviderMultiModal() {
+    const mask = document.getElementById("providerMultiModal");
+    if (!mask) return;
+    const key = mask.dataset.key;
+    const order = mask._pmSelected || [];
+    const hidden = document.querySelector(`#summarySettingsForm [data-key="${key}"]`);
+    if (hidden) hidden.value = JSON.stringify(order);
+    refreshProviderMultiTrigger(mask._pmTrigger, order);
+    closeProviderMultiModal();
+}
+
+// 渲染两区：顺序区（已选，可拖拽）+ 可选区（未选，滚动勾选）
+function renderProviderMultiModal() {
+    const mask = document.getElementById("providerMultiModal");
+    const selectedZone = document.getElementById("pmSelectedZone");
+    const availableZone = document.getElementById("pmAvailableList");
+    const countEl = document.getElementById("pmSelectedCount");
+    selectedZone.innerHTML = "";
+    availableZone.innerHTML = "";
+    const selected = mask._pmSelected || [];
+    const selSet = new Set(selected);
+
+    // 顺序区
+    if (selected.length === 0) {
+        selectedZone.appendChild(el("div", "pm-zone-empty", "尚未选择，请在下方勾选模型"));
+    } else {
+        selected.forEach((id, idx) => selectedZone.appendChild(buildPmRow(id, true, idx, selected.length)));
+    }
+    if (countEl) countEl.textContent = String(selected.length);
+
+    // 可选区：未选 provider + 已失效项（在 selected 但不在 providers 中者已在顺序区显示，此处不重复）
+    const known = new Set((summaryProviders || []).map((p) => p.id));
+    const avail = (summaryProviders || []).filter((p) => !selSet.has(p.id));
+    if (avail.length === 0) {
+        availableZone.appendChild(el("div", "pm-zone-empty", selected.length ? "其余模型均已加入顺序" : "暂无可用提供商"));
+    } else {
+        avail.forEach((p) => availableZone.appendChild(buildPmRow(p.id, false, -1, 0)));
+    }
+    // 失效项若未被选中（理论上选中才进 selected，此处兜底不处理）—忽略
+    void known;
+}
+
+// 构造一行：selected=true → 拖拽手柄 + 序号 + 名称 + 移除(×)；false → 复选框 + 名称
+function buildPmRow(id, selected, idx, total) {
+    const stale = !(summaryProviders || []).some((p) => p.id === id);
+    const row = el("div", "pm-row" + (selected ? " pm-row-selected" : "") + (stale ? " pm-row-stale" : ""));
+    row.dataset.id = id;
+    if (selected) {
+        row.draggable = true;
+        const handle = el("span", "pm-handle", "⠿");
+        handle.title = "拖动以调整降级顺序";
+        row.appendChild(handle);
+        row.appendChild(el("span", "pm-index", String(idx + 1)));
+        row.appendChild(el("span", "pm-name" + (stale ? " pm-name-stale" : ""), stale ? `${id}（已不可用）` : providerNameOf(id)));
+        const rm = el("button", "pm-remove", "×");
+        rm.type = "button";
+        rm.title = "移除";
+        rm.addEventListener("click", () => {
+            const mask = document.getElementById("providerMultiModal");
+            mask._pmSelected = (mask._pmSelected || []).filter((x) => x !== id);
+            renderProviderMultiModal();
+        });
+        row.appendChild(rm);
+        wirePmDrag(row);
+    } else {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "pm-check";
+        cb.addEventListener("change", () => {
+            const mask = document.getElementById("providerMultiModal");
+            if (cb.checked) mask._pmSelected = [...(mask._pmSelected || []), id];
+            else mask._pmSelected = (mask._pmSelected || []).filter((x) => x !== id);
+            renderProviderMultiModal();
+        });
+        row.appendChild(cb);
+        row.appendChild(el("span", "pm-name" + (stale ? " pm-name-stale" : ""), stale ? `${id}（已不可用）` : providerNameOf(id)));
+        row.addEventListener("click", (e) => {
+            if (e.target !== cb) {
+                cb.checked = !cb.checked;
+                cb.dispatchEvent(new Event("change"));
+            }
+        });
+    }
+    return row;
+}
+
+// 顺序区拖拽排序（HTML5 DnD，仅在同区内重排；拖动时高亮插入位置）
+function wirePmDrag(row) {
+    row.addEventListener("dragstart", (e) => {
+        row.classList.add("pm-dragging");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", row.dataset.id);
+    });
+    row.addEventListener("dragend", () => {
+        row.classList.remove("pm-dragging");
+        const zone = document.getElementById("pmSelectedZone");
+        if (zone) zone.querySelectorAll(".pm-row").forEach((r) => r.classList.remove("pm-drop-before"));
+    });
+    row.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        const zone = document.getElementById("pmSelectedZone");
+        zone.querySelectorAll(".pm-row").forEach((r) => r.classList.remove("pm-drop-before"));
+        const rect = row.getBoundingClientRect();
+        if (e.clientY < rect.top + rect.height / 2) row.classList.add("pm-drop-before");
+    });
+    row.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const mask = document.getElementById("providerMultiModal");
+        const dragId = e.dataTransfer.getData("text/plain");
+        const targetId = row.dataset.id;
+        if (!dragId || dragId === targetId) return;
+        const arr = (mask._pmSelected || []).filter((x) => x !== dragId);
+        let ti = arr.indexOf(targetId);
+        const rect = row.getBoundingClientRect();
+        if (e.clientY >= rect.top + rect.height / 2) ti += 1;
+        if (ti < 0) ti = 0;
+        arr.splice(ti, 0, dragId);
+        mask._pmSelected = arr;
+        renderProviderMultiModal();
+    });
+}
+
 // 用接口返回的全量 settings 回填表单（保存/重置成功后复用）
 function fillSummaryForm(settings) {
     for (const meta of SUMMARY_FIELD_META) {
@@ -642,11 +899,19 @@ function fillSummaryForm(settings) {
         const raw = settings[meta.key];
         if (meta.kind === "bool") ctrl.checked = String(raw).toLowerCase() === "true";
         else if (meta.kind === "whitelist") ctrl.value = whitelistJsonToText(raw).text;
+        else if (meta.kind === "csv_list") ctrl.value = jsonArrayToCsv(raw);
+        else if (meta.kind === "provider_multi") {
+            // v0.3.2：ctrl 为隐藏 input[data-key]，写入 JSON 字符串数组并刷新同列触发按钮摘要
+            const ids = parseProviderMultiValue(raw);
+            ctrl.value = JSON.stringify(ids);
+            const trig = ctrl.parentElement?.querySelector(".provider-multi-trigger");
+            if (trig) refreshProviderMultiTrigger(trig, ids);
+        }
         else ctrl.value = String(raw ?? "");
     }
 }
 
-// 收集全部 16 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
+// 收集全部 24 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
 function collectSummarySettings() {
     const settings = {};
     for (const meta of SUMMARY_FIELD_META) {
@@ -687,6 +952,14 @@ function collectSummarySettings() {
                     return null;
                 }
                 break;
+            case "provider_multi":
+                // v0.3.2：值存于隐藏 input（JSON 字符串数组，顺序即降级顺序，含 stale 失效项）
+                settings[meta.key] = parseProviderMultiValue(ctrl.value);
+                break;
+            case "csv_list":
+                // v0.3.2：CDN 节点顺序文本框 → split + trim + 过滤空串 → 数组提交（后端 list 类型 JSON 序列化）
+                settings[meta.key] = csvToArray(ctrl.value);
+                break;
             default:
                 settings[meta.key] = ctrl.value;
         }
@@ -711,7 +984,7 @@ async function saveSummarySettings() {
 }
 
 async function resetSummaryAll() {
-    if (!confirm("确定将全部 15 项总结设置恢复为默认值吗？此操作不可撤销。")) return;
+    if (!confirm("确定将全部 24 项总结设置恢复为默认值吗？此操作不可撤销。")) return;
     try {
         // 省略 keys = 全部重置（后端约定）
         const data = await bridge.apiPost("summary/settings/reset", {});
@@ -1081,6 +1354,19 @@ function bindSummaryEvents() {
         if (e.target === detailMask) closeSummaryDetail();
     });
     document.getElementById("historyDetailCloseBtn").addEventListener("click", closeSummaryDetail);
+
+    // 备用模型多选弹窗：仅按钮关闭，点遮罩/卡片内部均不关闭（防误触丢失排序）
+    const pmMask = document.getElementById("providerMultiModal");
+    if (pmMask) {
+        document.getElementById("pmCancelBtn").addEventListener("click", closeProviderMultiModal);
+        document.getElementById("pmDoneBtn").addEventListener("click", confirmProviderMultiModal);
+        pmMask.addEventListener("click", (e) => {
+            // 阻止冒泡到遮罩，确保点击卡片空白/滚动条不触发关闭
+            if (e.target === pmMask) e.stopPropagation();
+        });
+        const pmCard = pmMask.querySelector(".modal-card");
+        if (pmCard) pmCard.addEventListener("click", (e) => e.stopPropagation());
+    }
 }
 
 init();

@@ -48,7 +48,9 @@ class DynamicPool:
         self._idle_timeout = idle_timeout
         self._acquire_timeout = acquire_timeout
         self._pool_recycle = pool_recycle
-        self._ping_cooldown = max(1, ping_cooldown)  # 最少 1 秒，防止设为 0 导致永不 ping
+        self._ping_cooldown = max(
+            1, ping_cooldown
+        )  # 最少 1 秒，防止设为 0 导致永不 ping
 
         # 连接存储: list of (connection, last_used_timestamp, last_pinged_timestamp)
         self._free: list[tuple[aiomysql.Connection, float, float]] = []
@@ -83,7 +85,9 @@ class DynamicPool:
         """使用中连接数。"""
         return len(self._used)
 
-    def _record_destroyed(self, conn: aiomysql.Connection | None = None, count: int = 1):
+    def _record_destroyed(
+        self, conn: aiomysql.Connection | None = None, count: int = 1
+    ):
         """记录连接销毁（用于统计：created - recycled = free + used）。
 
         所有连接销毁路径（替换失效连接、pool_recycle 换新、reaper 回收、

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<!--
+  群聊总结 · T2I 报告模板（模块 C / v0.3.2）
+
+  由 SummaryFormatter._render_image 经 Star.html_render（标准 Jinja2 环境）渲染为图片。
+  单文件自包含：CSS / JS 全部内联，外部依赖仅 marked + echarts（页面尾部 CDN 加载器
+  按 provider 顺序容灾加载，全挂时降级为服务端预转换 HTML + 纯 CSS 柱图，页面依然完整）。
+
+  数据契约（渲染核心注入，键名不可更改）：
+    theme / title / generated_at / meta{scope,provider,time_start,time_end}
+    stats{total,participants,sources[{name,count}],truncated} / bars[{name,count,percent}]
+    bars_max / sections[{title,raw,fallback_html}] / cdn{providers,libs{marked,echarts}}
+
+  安全约定：
+    - LLM 原文经 |tojson 注入（Jinja2 tojson 自带 HTML 转义，< > & ' 均被 Unicode 转义），
+      data-raw 属性用单引号包裹 JSON 双引号字符串字面量，JS 侧 JSON.parse 还原；
+    - fallback_html 为服务端全量 html.escape 后的安全 HTML，|safe 直出。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }}</title>
+<style>
+/* ===== 设计令牌（与 pages/dashboard/style.css 同款，双主题；组件禁止硬编码色值） ===== */
+:root {
+    --bg: #f0f2f5;
+    --surface: #ffffff;
+    --surface-hover: #f8f9fa;
+    --text: #1d2129;
+    --text-2: #4e5969;
+    --text-3: #86909c;
+    --border: #e5e6eb;
+    --primary: #165dff;
+    --primary-light: #e8f3ff;
+    --primary-hover: #4080ff;
+    --success: #00b42a;
+    --success-light: #e8ffea;
+    --danger: #f53f3f;
+    --danger-light: #ffece8;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+    /* 模板专用补充令牌（dashboard 同源） */
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08);
+    --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    --dot: rgba(22, 93, 255, 0.055);        /* 页面点阵纹理 */
+    --headwash: rgba(22, 93, 255, 0.06);     /* 页首主色晕染 */
+}
+
+[data-theme="dark"] {
+    --bg: #17171a;
+    --surface: #232324;
+    --surface-hover: #2a2a2b;
+    --text: #f6f6f6;
+    --text-2: #c9cdd4;
+    --text-3: #86909c;
+    --border: #3f3f3f;
+    --primary: #3c7eff;
+    --primary-light: #1a2a44;
+    --primary-hover: #5a94ff;
+    --success: #23c343;
+    --success-light: #162e1a;
+    --danger: #f76560;
+    --danger-light: #3d1f1e;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.3);
+    --dot: rgba(60, 126, 255, 0.07);
+    --headwash: rgba(60, 126, 255, 0.09);
+}
+
+/* ===== 基础 ===== */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--text);
+    background-color: var(--bg);
+    /* 分层氛围背景：页首主色晕染 + 细点阵纹理（全部走令牌，双主题自适应） */
+    background-image:
+        linear-gradient(180deg, var(--headwash) 0, transparent 280px),
+        radial-gradient(var(--dot) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* 画布：860px 宽（手机竖屏缩放后仍清晰），内容容器 24px 内边距 */
+.page {
+    width: 860px;
+    margin: 0 auto;
+    padding: 24px;
+}
+
+/* ===== 报告头 ===== */
+.report-head { padding: 6px 4px 0; }
+
+.head-row { display: flex; align-items: center; gap: 14px; }
+
+.head-badge {
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    border-radius: var(--radius);
+    background: var(--primary-light);
+    box-shadow: var(--shadow);
+}
+
+.head-title {
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.25;
+    letter-spacing: 0.5px;
+}
+
+.head-sub {
+    margin-top: 8px;
+    font-size: 14px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+
+.head-rule {
+    margin-top: 16px;
+    width: 72px;
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, var(--primary), var(--primary-hover));
+}
+
+/* ===== 统计卡片行（对齐 dashboard .stat-card 形态） ===== */
+.stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-top: 20px;
+}
+
+.stat-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 18px 16px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    transition: var(--transition);
+}
+
+.stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+
+.stat-icon {
+    width: 42px;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 10px;
+    font-size: 1.2rem;
+    flex-shrink: 0;
+}
+
+/* 图标块底色（与 dashboard 同款辅色 + 深色覆盖） */
+.stat-blue .stat-icon { background: var(--primary-light); }
+.stat-green .stat-icon { background: var(--success-light); }
+.stat-orange .stat-icon { background: #fff7e8; }
+.stat-purple .stat-icon { background: #f5e8ff; }
+[data-theme="dark"] .stat-orange .stat-icon { background: #332a1a; }
+[data-theme="dark"] .stat-purple .stat-icon { background: #2a1f3d; }
+
+.stat-value {
+    font-size: 1.4rem;
+    font-weight: 700;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 长数值（时间跨度 / 数据源构成）收窄字号，保证四卡布局不溢出 */
+.stat-value--sm { font-size: 1rem; line-height: 1.35; }
+
+.stat-label {
+    font-size: 0.75rem;
+    color: var(--text-3);
+    margin-top: 2px;
+}
+
+/* 截断提示条 */
+.truncated-tip {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    background: var(--danger-light);
+    color: var(--danger);
+    font-size: 15px;
+    font-weight: 600;
+}
+
+/* ===== 通用 Section 卡片（对齐 dashboard .section-card） ===== */
+.section-card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-top: 16px;
+    box-shadow: var(--shadow);
+}
+
+/* 区块标题 22px/700 + 主色渐变侧标 */
+.section-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 22px;
+    font-weight: 700;
+    margin-bottom: 14px;
+}
+
+.section-heading::before {
+    content: "";
+    flex-shrink: 0;
+    width: 5px;
+    height: 20px;
+    border-radius: 3px;
+    background: linear-gradient(180deg, var(--primary), var(--primary-hover));
+}
+
+/* ===== 发言人排行 ===== */
+.rank-chart { width: 100%; height: 340px; }
+
+.rank-css { display: flex; flex-direction: column; gap: 12px; }
+
+.rank-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 64px;
+    align-items: center;
+    gap: 12px;
+}
+
+.rank-name {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-2);
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 横条轨道与柱体（dashboard .daily-bar 同款主色渐变，加高至 26px） */
+.rank-track {
+    height: 26px;
+    background: var(--bg);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.rank-bar {
+    height: 100%;
+    min-width: 3px;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--primary), var(--primary-hover));
+    transition: width 0.6s ease;
+}
+
+.rank-count {
+    font-size: 15px;
+    font-weight: 700;
+    text-align: right;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ===== Markdown 内容（marked 渲染目标；fallback HTML 共用同一套样式） ===== */
+.md {
+    font-size: 16px;
+    line-height: 1.75;
+    color: var(--text);
+    word-break: break-word;
+}
+
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+
+/* 板块内 h1 降为 1.3em，防止与 22px 区块标题撞级 */
+.md h1 { font-size: 1.3em; font-weight: 700; margin: 18px 0 10px; }
+.md h2 { font-size: 1.2em; font-weight: 700; margin: 16px 0 8px; }
+.md h3 { font-size: 1.1em; font-weight: 600; margin: 14px 0 8px; }
+.md h4 { font-size: 1em; font-weight: 600; margin: 12px 0 6px; }
+
+.md p { margin: 8px 0; }
+
+.md ul, .md ol { padding-left: 1.6em; margin: 8px 0; }
+.md li { margin: 4px 0; }
+
+.md a { color: var(--primary); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+
+.md blockquote {
+    border-left: 3px solid var(--primary);
+    background: var(--surface-hover);
+    padding: 8px 14px;
+    margin: 10px 0;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    color: var(--text-2);
+}
+
+.md code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+    background: var(--surface-hover);
+    padding: 2px 6px;
+    border-radius: 6px;
+}
+
+.md pre {
+    background: var(--surface-hover);
+    padding: 12px;
+    margin: 10px 0;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+}
+
+.md pre code { background: transparent; padding: 0; }
+
+/* GFM 表格：表头主色强调 + 斑马纹 + 防溢出换行 */
+.md table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 15px;
+}
+
+.md th {
+    background: var(--primary-light);
+    color: var(--primary);
+    font-weight: 700;
+}
+
+.md td, .md th {
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    word-break: break-word;
+}
+
+.md tbody tr:nth-child(even) { background: rgba(0, 0, 0, 0.02); }
+[data-theme="dark"] .md tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.06); }
+
+.md hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+
+.md img { max-width: 100%; border-radius: var(--radius-sm); }
+
+/* ===== 页脚 ===== */
+.report-foot {
+    margin-top: 20px;
+    padding: 0 4px 4px;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--text-3);
+}
+</style>
+</head>
+<body data-theme="{{ theme }}">
+<div class="page">
+
+    <!-- ===== 报告头 ===== -->
+    <header class="report-head">
+        <div class="head-row">
+            <div class="head-badge">💬</div>
+            <h1 class="head-title">{{ title }}</h1>
+        </div>
+        <p class="head-sub">{{ meta.time_start }} ~ {{ meta.time_end }} · 生成于 {{ generated_at }}</p>
+        <div class="head-rule"></div>
+    </header>
+
+    <!-- ===== 统计卡片行 ===== -->
+    <section class="stat-row">
+        <div class="stat-card stat-blue">
+            <div class="stat-icon">💬</div>
+            <div>
+                <div class="stat-value">{{ stats.total }}</div>
+                <div class="stat-label">消息总数</div>
+            </div>
+        </div>
+        <div class="stat-card stat-green">
+            <div class="stat-icon">👥</div>
+            <div>
+                <div class="stat-value">{{ stats.participants }}</div>
+                <div class="stat-label">参与者</div>
+            </div>
+        </div>
+        <div class="stat-card stat-orange">
+            <div class="stat-icon">⏱️</div>
+            <div>
+                <div class="stat-value stat-value--sm">{{ meta.time_start }}<br>~ {{ meta.time_end }}</div>
+                <div class="stat-label">时间跨度</div>
+            </div>
+        </div>
+        <div class="stat-card stat-purple">
+            <div class="stat-icon">🗄️</div>
+            <div>
+                <div class="stat-value stat-value--sm">{% for src in stats.sources %}{{ src.name }} {{ src.count }}{% if not loop.last %} + {% endif %}{% endfor %}</div>
+                <div class="stat-label">数据源构成</div>
+            </div>
+        </div>
+    </section>
+
+    {% if stats.truncated %}
+    <div class="truncated-tip">⚠️ 素材超长，已截断保留最近消息</div>
+    {% endif %}
+
+    {% if bars %}
+    <!-- ===== 发言人排行：ECharts 容器初始隐藏，marked/echarts 加载成功后显示并隐藏 CSS 兜底横条 ===== -->
+    <section class="section-card">
+        <h2 class="section-heading">📊 发言人排行</h2>
+        <div id="rank-chart" class="rank-chart" style="display:none"></div>
+        <div id="rank-css" class="rank-css">
+            {% for item in bars %}
+            <div class="rank-row">
+                <span class="rank-name" title="{{ item.name }}">{{ item.name }}</span>
+                <div class="rank-track">
+                    <div class="rank-bar" style="width:{{ '%.2f'|format(item.percent) }}%"></div>
+                </div>
+                <span class="rank-count">{{ item.count }}</span>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    <!-- ===== 板块内容：先直出服务端预转换的兜底 HTML，marked 加载成功后用 data-raw 原文重渲染 ===== -->
+    {% for s in sections %}
+    <section class="section-card">
+        <h2 class="section-heading">{{ s.title }}</h2>
+        <div class="md" data-raw='{{ s.raw | tojson }}'>{{ s.fallback_html | safe }}</div>
+    </section>
+    {% endfor %}
+
+    <!-- ===== 页脚 ===== -->
+    <footer class="report-foot">模型 {{ meta.provider }} · 由 群聊总结 生成</footer>
+
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    /* ===== 数据注入（|tojson 自带 HTML 转义，防 XSS / 模板逃逸） ===== */
+    var CDN = {{ cdn | tojson }};
+    var BARS = {{ bars | tojson }};
+
+    /* ===== CDN 加载器 =====
+     * URL 拼装规则表：与 Python 侧配置解析一致的冗余实现，加载器自包含、
+     * 不依赖 Python；未知 provider key 自动忽略，列表为空回退默认顺序。 */
+    var CDN_URLS = {
+        bootcdn: function (p, v, f) { return "https://cdn.bootcdn.net/ajax/libs/" + p + "/" + v + "/" + f; },
+        npmmirror: function (p, v, f) { return "https://registry.npmmirror.com/" + p + "/" + v + "/files/" + f; },
+        staticfile: function (p, v, f) { return "https://cdn.staticfile.org/" + p + "/" + v + "/" + f; },
+        jsdelivr: function (p, v, f) { return "https://cdn.jsdelivr.net/npm/" + p + "@" + v + "/" + f; },
+        unpkg: function (p, v, f) { return "https://unpkg.com/" + p + "@" + v + "/" + f; }
+    };
+    var DEFAULT_PROVIDERS = ["bootcdn", "npmmirror", "staticfile", "jsdelivr", "unpkg"];
+    var NODE_TIMEOUT = 8000; /* 单节点脚本级超时（ms） */
+
+    /* 按 provider 顺序加载单个库。
+     * 成功判定：onload 触发 且 window[lib.global] 存在；
+     * 失败判定：onerror 或 8s 超时 → 立即切换下一节点；
+     * 全部节点失败 resolve(null)，永不 reject（降级交给 CSS 兜底形态）。 */
+    function loadLib(lib) {
+        return new Promise(function (resolve) {
+            var providers = (CDN && CDN.providers && CDN.providers.length)
+                ? CDN.providers : DEFAULT_PROVIDERS;
+            var idx = 0;
+
+            function tryNext() {
+                while (idx < providers.length && !CDN_URLS[providers[idx]]) { idx++; }
+                if (idx >= providers.length) { resolve(null); return; }
+                var key = providers[idx++];
+                var script = document.createElement("script");
+                script.src = CDN_URLS[key](lib.pkg, lib.ver, lib.file);
+                var settled = false;
+                var timer = setTimeout(fail, NODE_TIMEOUT);
+
+                function fail() {
+                    if (settled) { return; }
+                    settled = true;
+                    clearTimeout(timer);
+                    script.onload = script.onerror = null;
+                    if (script.parentNode) { script.parentNode.removeChild(script); }
+                    console.warn("[HistorySummary] CDN 节点不可用: " + key + "（" + lib.pkg + "），切换下一节点");
+                    tryNext();
+                }
+
+                script.onerror = fail;
+                script.onload = function () {
+                    if (window[lib.global]) {
+                        if (settled) { return; }
+                        settled = true;
+                        clearTimeout(timer);
+                        console.info("[HistorySummary] " + lib.pkg + " 经 " + key + " 加载成功");
+                        resolve(key);
+                    } else {
+                        fail(); /* 脚本返回但全局对象缺失 → 视为节点失败 */
+                    }
+                };
+                document.head.appendChild(script);
+            }
+
+            tryNext();
+        });
+    }
+
+    /* ===== Markdown 渲染（marked 成功后） ===== */
+    function renderMarkdown() {
+        var opts = { gfm: true, breaks: true };
+        try {
+            if (typeof marked.setOptions === "function") { marked.setOptions(opts); }
+        } catch (e) { /* 个别版本差异忽略，parse 调用仍携带 opts */ }
+        document.querySelectorAll(".md").forEach(function (el) {
+            var raw = readRaw(el);
+            if (!raw) { return; }
+            try {
+                el.innerHTML = marked.parse(raw, opts);
+            } catch (e) { /* 解析异常：保留服务端兜底 HTML */ }
+        });
+    }
+
+    /* data-raw 属性值是 |tojson 产出的 JSON 字符串字面量（带首尾双引号、
+     * 单引号已转 '），须 JSON.parse 还原原文；还原失败退回属性原值。 */
+    function readRaw(el) {
+        var v = el.dataset.raw;
+        if (!v) { return ""; }
+        try { return JSON.parse(v); } catch (e) { return v; }
+    }
+
+    /* ===== 发言人排行图表（echarts 成功后） ===== */
+    function renderChart() {
+        var box = document.getElementById("rank-chart");
+        var cssBox = document.getElementById("rank-css");
+        /* 容器缺失（bars 为空时区块整体不输出）或数据为空 → 跳过 */
+        if (!box || !cssBox || !BARS || !BARS.length) { return; }
+        box.style.display = "block"; /* 先显示容器，保证 echarts.init 拿到真实宽高 */
+        try {
+            var dark = document.body.dataset.theme === "dark";
+            /* 主题色板（取自设计令牌同组色值，浅/深两套） */
+            var palette = dark
+                ? ["#3c7eff", "#23c343", "#ff9a2e", "#f76560", "#9254de"]
+                : ["#165dff", "#00b42a", "#ff7d00", "#f53f3f", "#722ed1"];
+            /* 轴/标签文字颜色直接读 CSS 令牌，避免硬编码泄漏 */
+            var cs = getComputedStyle(document.body);
+            function tv(name, fb) {
+                var v = cs.getPropertyValue(name);
+                return (v && v.trim()) ? v.trim() : fb;
+            }
+            var chart = echarts.init(box);
+            chart.setOption({
+                grid: { left: 110, right: 64, top: 12, bottom: 28 },
+                xAxis: {
+                    type: "value",
+                    axisLabel: { fontSize: 14, color: tv("--text-3", "#86909c") },
+                    splitLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                yAxis: {
+                    type: "category",
+                    inverse: true, /* 保持第一名在最上 */
+                    data: BARS.map(function (b) { return b.name; }),
+                    axisLabel: { fontSize: 15, color: tv("--text-2", "#4e5969") },
+                    axisTick: { show: false },
+                    axisLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                series: [{
+                    type: "bar",
+                    barWidth: 22,
+                    data: BARS.map(function (b, i) {
+                        return {
+                            value: b.count,
+                            itemStyle: {
+                                color: palette[i % palette.length],
+                                borderRadius: [0, 6, 6, 0]
+                            }
+                        };
+                    }),
+                    label: {
+                        show: true,
+                        position: "right",
+                        fontSize: 14,
+                        fontWeight: 600,
+                        color: tv("--text-2", "#4e5969")
+                    }
+                }]
+            });
+            cssBox.style.display = "none"; /* 图表就绪 → 隐藏 CSS 兜底横条 */
+        } catch (e) {
+            /* 初始化失败 → 还原 CSS 兜底横条（降级而非渲染失败） */
+            box.style.display = "none";
+            cssBox.style.display = "";
+        }
+    }
+
+    /* ===== 主流程：marked 与 echarts 并行加载，互不阻塞 ===== */
+    var libs = (CDN && CDN.libs) || {};
+    Promise.all([
+        libs.marked ? loadLib(libs.marked) : Promise.resolve(null),
+        libs.echarts ? loadLib(libs.echarts) : Promise.resolve(null)
+    ]).then(function () {
+        if (window.marked) { renderMarkdown(); }
+        if (window.echarts) { renderChart(); }
+    });
+})();
+</script>
+</body>
+</html>
