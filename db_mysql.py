@@ -429,16 +429,21 @@ class DynamicPool:
         连接在 _ping_cooldown 秒内刚被验证过的直接跳过，减少不必要的
         MySQL 往返（reaper 30s 一次，cooldown 默认 5s，正常场景下
         大部分连接不必再 ping）。
-        """
-        while True:
-            # 锁内：租出一个空闲连接（free-1 / pending+1，size 恒定）
-            async with self._lock:
-                if not self._free:
-                    break
-                conn, ts, last_pinged = self._free.pop(0)
-                self._pending += 1
 
-            # 锁外：ping 冷却内的连接跳过检查直接归还
+        关键：遍历 _free 的**快照**，一轮即止。旧实现用 while True
+        循环 pop+append 无限往复，冷却跳过使循环体变纯 CPU 路径后
+        会陷入忙等死循环把 CPU 打到 100%。
+        """
+        # 快照当前所有空闲连接，一轮检查完毕即停
+        async with self._lock:
+            if not self._free:
+                return
+            snapshot = list(self._free)
+            self._free.clear()
+            self._pending += len(snapshot)
+
+        for conn, ts, last_pinged in snapshot:
+            # 锁外：ping 冷却内的连接跳过检查
             try:
                 now = time.monotonic()
                 if (
@@ -446,13 +451,12 @@ class DynamicPool:
                     and (now - last_pinged) < self._ping_cooldown
                     and not conn.closed
                 ):
-                    # 冷却内且明显未关闭：跳过 ping，直接视为存活
                     alive = True
                 else:
                     alive = not conn.closed and await self._is_alive(conn)
             except BaseException:
                 self._schedule_rollback(close_conn=conn)
-                raise
+                continue
 
             # 锁内：存活则归还（保留原空闲时间戳，更新 ping 时间戳），失效则丢弃
             async with self._lock:
