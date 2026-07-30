@@ -16,6 +16,8 @@
 - 🤖 群聊历史自动总结（v0.3 新增）：`/消息总结 <数量>`、`/消息总结时间 <时长>` 两条群指令，白名单群内任何成员可用
 - 🔀 总结混合数据源：MySQL 优先 + OneBot 协议端在线补齐，按 message_id 去重合并，协议端数据不回填数据库
 - 📊 规则统计块 + LLM 四板块摘要，合并转发 / 文转图两种输出形式（Web 可配）
+- 🛡️ 备用模型降级链（v0.3.1 新增）：总结 LLM 按「主选提供商 → 备用列表按序 → 会话模型兜底」调用，任一节点失败自动降级，历史总结记录实际使用的模型
+- 👍 总结触发反馈（v0.3.1 新增）：指令生效后即时确认（默认贴表情回应，协议端不支持时自动降级文字提示，可配文字模式或关闭）
 
 ## 安装
 
@@ -100,13 +102,13 @@ SHOW TABLES;
 - **统计**：最近 7 天每日存储量
 - **查询**：按关键词（内容/昵称）、群号、QQ号、时间组合查询聊天记录
 - **数据维护**：手动清理过期图片；一键清空所有数据（需通过随机加减法验证，题目由后端生成、一次性有效）
-- **总结设置**（v0.3 新增）：总结功能全部 16 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
+- **总结设置**（v0.3 新增）：总结功能全部 19 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
 - **忽略管理**（v0.3 新增）：按群增删查忽略发送者，被忽略者的消息不参与总结
 - **历史总结**（v0.3 新增）：按群浏览已保存的总结 JSON，弹层查看总结详情（统计块 + LLM 摘要 + 元数据）
 
 ## 总结功能配置说明（v0.3 新增）
 
-> 总结功能全部 16 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
+> 总结功能全部 19 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
 > **不进入 `_conf_schema.json`**（插件原有配置保持不变）。配置仅在 dashboard「总结设置」tab 修改，
 > 改后即时生效，无需重启插件；默认值由 `ConfigManager` 初始化时自动播种。
 
@@ -122,12 +124,15 @@ SHOW TABLES;
 | summary_min_mysql_ratio | float | 0.8 | 数量模式补齐阈值：MySQL 实得/请求 < 此值才拉协议端 |
 | summary_gap_tolerance_minutes | int | 30 | 时间模式缺口容忍：MySQL 最早消息晚于窗口起点 + 此值才拉协议端 |
 | summary_onebot_max_fetch | int | 200 | 单次从协议端最多拉取条数（协议端自身上限内） |
-| summary_provider_id | string（页内下拉） | "" | 总结专用 LLM 提供商；空=回退该群会话当前 provider |
+| summary_provider_id | string（页内下拉） | "" | 总结专用 LLM 提供商（主选）；失败后按序尝试 `summary_fallback_providers` 备用列表，全部失败兜底该群会话当前 provider |
 | summary_prompt | text | （内置 4 板块默认模板） | LLM 总结提示词，支持占位符 `{stats}` `{messages}` `{time_range}` `{group_id}` `{format_constraint}` |
 | summary_output_mode | string | forward | 输出形式：`forward`=合并转发（剥离 Markdown）；`image`=文转图（保留 Markdown） |
 | summary_rank_top_n | int | 5 | 活跃排行展示条数 |
 | summary_max_prompt_chars | int | 60000 | 素材长度预算（送入 LLM 的完整提示词字符上限），超出从最旧消息开始截断，统计仍基于全量 |
 | summary_retention_days | int | 30 | 总结 JSON 保留天数，定时任务每日清理过期文件 |
+| summary_fallback_providers | list（JSON 存储） | [] | 备用总结模型列表，主选失败后按序尝试，全部失败回退会话模型 |
+| summary_feedback_mode | string | reaction | 触发反馈模式：reaction 贴表情 / text 文字提示 / none 关闭 |
+| summary_feedback_text | string | 📝 收到！正在总结中，请稍候… | 文字反馈文案（reaction 降级时同用） |
 
 占位符说明：`{stats}` 统计块、`{messages}` 格式化消息列表（每行 `[时间] 昵称: 内容`）、`{time_range}` 时间范围描述、`{group_id}` 群号、`{format_constraint}` 按输出模式注入的格式约束（合并转发=禁用 Markdown / 文转图=可用 Markdown）。
 
@@ -220,7 +225,7 @@ SHOW TABLES;
 
 | 表名 | 说明 |
 |------|------|
-| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），16 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
+| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），19 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
 | group_ignore_senders | 每群忽略发送者（group_id, sender_id, created_at，group_id + sender_id 联合唯一约束） |
 
 > 总结结果不入库，以 JSON 文件持久化，路径与清理策略见上文「总结工作原理 → 结果持久化」。

@@ -22,7 +22,7 @@ class ConfigManager:
 
     # ========== 总结功能配置常量（v0.3） ==========
 
-    # 总结功能 16 项配置的默认值。值一律字符串存储；列表类型 JSON 序列化。
+    # 总结功能 19 项配置的默认值。值一律字符串存储；列表类型 JSON 序列化。
     # 同时作为初始化播种目标与 dashboard「恢复默认」的目标值。
     SUMMARY_DEFAULTS: dict[str, str] = {
         "summary_enabled": "true",
@@ -36,7 +36,13 @@ class ConfigManager:
         "summary_gap_tolerance_minutes": "30",
         "summary_onebot_max_fetch": "200",
         "summary_provider_id": "",
+        # 备用总结模型 provider id 列表（JSON 存储）；主选失败后按序尝试，全失败兜底会话模型
+        "summary_fallback_providers": "[]",
         "summary_output_mode": "forward",
+        # 触发反馈模式：reaction 贴表情 / text 文字提示 / none 关闭
+        "summary_feedback_mode": "reaction",
+        # 文字反馈文案（reaction 失败降级时同用）
+        "summary_feedback_text": "📝 收到！正在总结中，请稍候…",
         "summary_rank_top_n": "5",
         "summary_max_prompt_chars": "60000",
         "summary_retention_days": "30",
@@ -78,7 +84,10 @@ class ConfigManager:
         "summary_gap_tolerance_minutes": int,
         "summary_onebot_max_fetch": int,
         "summary_provider_id": str,
+        "summary_fallback_providers": list,
         "summary_output_mode": str,
+        "summary_feedback_mode": str,
+        "summary_feedback_text": str,
         "summary_rank_top_n": int,
         "summary_max_prompt_chars": int,
         "summary_retention_days": int,
@@ -151,7 +160,7 @@ class ConfigManager:
                 value TEXT DEFAULT ''
             )
         """)
-        # v0.3：总结功能配置表（key/value 形式，16 项配置统一落库）
+        # v0.3：总结功能配置表（key/value 形式，19 项配置统一落库）
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS summary_settings (
                 key TEXT PRIMARY KEY,
@@ -180,7 +189,7 @@ class ConfigManager:
                 "INSERT OR IGNORE INTO plugin_settings (key_name, value) VALUES (?, ?)",
                 (key, value),
             )
-        # v0.3：总结功能 16 项配置播种。INSERT OR IGNORE 仅插入缺失键，
+        # v0.3：总结功能 19 项配置播种。INSERT OR IGNORE 仅插入缺失键，
         # 不覆盖用户已在 dashboard 修改的值（升级/自愈重连时可安全重复执行）
         for key, value in self.SUMMARY_DEFAULTS.items():
             await self.db.execute(
@@ -424,7 +433,7 @@ class ConfigManager:
         default 为 None 时回退 SUMMARY_DEFAULTS.get(key, "")。
 
         Args:
-            key: 配置键（SUMMARY_DEFAULTS 16 项之一）
+            key: 配置键（SUMMARY_DEFAULTS 19 项之一）
             default: 自定义回退值；为 None 时使用 SUMMARY_DEFAULTS 中的默认值
 
         Returns:
@@ -474,7 +483,7 @@ class ConfigManager:
             return False
 
     async def get_all_summary_settings(self) -> dict[str, str]:
-        """获取全部总结功能配置（完整 16 项，缺失以默认值补全）。
+        """获取全部总结功能配置（完整 19 项，缺失以默认值补全）。
 
         Returns:
             dict[str, str]: 按 SUMMARY_DEFAULTS 顺序的完整配置字典，值均为字符串
@@ -486,7 +495,7 @@ class ConfigManager:
             ) as cursor:
                 rows = await cursor.fetchall()
             stored = {row[0]: row[1] for row in rows}
-            # 以 SUMMARY_DEFAULTS 为骨架补全缺失项，保证返回恒为完整 16 项
+            # 以 SUMMARY_DEFAULTS 为骨架补全缺失项，保证返回恒为完整 19 项
             return {
                 key: stored.get(key, value)
                 for key, value in self.SUMMARY_DEFAULTS.items()
@@ -501,7 +510,7 @@ class ConfigManager:
         """将总结功能配置重置为默认值。
 
         Args:
-            keys: 需要重置的键列表；为 None 时重置全部 16 项；未知键跳过并告警
+            keys: 需要重置的键列表；为 None 时重置全部 19 项；未知键跳过并告警
 
         Returns:
             dict[str, str]: 重置后的全量配置（失败时返回空字典）

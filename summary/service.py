@@ -17,13 +17,17 @@
 4. 限流**检查**（用户/群双冷却，内存 dict + ``time.monotonic()``；只检查不盖章）
 5. 参数解析校验（count ``^\\d+$`` / window ``^\\d+[hd]$``、>0、≤ 上限，
    超限拒绝并提示上限）
-6. 限流**盖章**（参数校验通过、真正开始执行前才写时间戳，避免无效指令白耗冷却）
+6. 限流**盖章**（参数校验通过、真正开始执行前才写时间戳，避免无效指令白耗冷却），
+   盖章后立即发**触发反馈**（``summary_feedback_mode``：reaction 在触发消息贴 👍 /
+   text 文字提示 / none 关闭；reaction 失败自动降级文字，配置项见
+   ``summary_feedback_text``）
 
 错误兜底（分级，任何异常不冒泡到 main.py handler）：
 
 - :class:`SummaryProviderError` → 提示配置总结模型
 - LLM / 其他异常 → ``logger.error(..., exc_info=True)`` + 「总结生成失败，请稍后重试」
 - 提示性消息发送失败仅 warning，避免二次崩溃
+- 触发反馈失败仅 warning，不影响主流程（绝不冒泡、绝不阻断总结）
 
 框架 API 核实记录（AstrBot 主项目 ``astrbot/core/platform/astr_message_event.py``）：
 
@@ -87,6 +91,11 @@ _DEFAULT_USER_COOLDOWN = 60
 _DEFAULT_GROUP_COOLDOWN = 120
 _DEFAULT_MAX_COUNT = 1000
 _DEFAULT_MAX_HOURS = 168
+
+# ---------- 触发反馈（指令生效后即时确认，见 SummaryService._send_feedback） ----------
+_DEFAULT_FEEDBACK_TEXT = "📝 收到！正在总结中，请稍候…"
+_REACTION_ACTION = "set_msg_emoji_like"
+_REACTION_EMOJI_CODE = "128077"  # 👍 的 Unicode 码点（十进制字符串）
 
 
 class SummaryService:
@@ -161,6 +170,7 @@ class SummaryService:
             if count is None:
                 return
             self._stamp_cooldown(sender_id, group_id)
+            await self._send_feedback(event)
 
             outcome = await self._fetcher.fetch_by_count(
                 group_id=group_id, event=event, count=count
@@ -186,6 +196,7 @@ class SummaryService:
                 return
             delta, scope_desc = parsed
             self._stamp_cooldown(sender_id, group_id)
+            await self._send_feedback(event)
 
             window_end = datetime.now()
             outcome = await self._fetcher.fetch_by_window(
@@ -364,6 +375,95 @@ class SummaryService:
 
         chain = await self._formatter.render(result, output_mode)
         await event.send(chain)
+
+    # ------------------------------------------------------------------
+    # 触发反馈（限流盖章后、fetch/LLM 前的即时确认）
+    # ------------------------------------------------------------------
+
+    async def _send_feedback(self, event: AstrMessageEvent) -> None:
+        """指令生效后即时反馈：reaction 贴表情（失败降级文字）/ text 文字 / none 关闭。
+
+        模式取 ``summary_feedback_mode``（strip/lower 归一）；未知值（配置污染）
+        记 warning 且不发消息，避免意外打扰。任何异常仅 warning，
+        绝不冒泡、绝不阻断主流程。
+        """
+        try:
+            mode = (
+                (await self._config_mgr.get_summary_setting("summary_feedback_mode"))
+                .strip()
+                .lower()
+            )
+            if mode == "none":
+                return
+            if mode == "text":
+                await self._reply(event, await self._feedback_text())
+                return
+            if mode == "reaction":
+                if await self._react_to_trigger(event):
+                    return
+                # 贴表情失败 → 降级文字提示，保证用户始终收到确认
+                await self._reply(event, await self._feedback_text())
+                return
+            logger.warning(
+                "[HistorySummary] 未知的 summary_feedback_mode: %r，跳过触发反馈",
+                mode,
+            )
+        except Exception:
+            logger.warning("[HistorySummary] 触发反馈失败，不影响主流程", exc_info=True)
+
+    async def _feedback_text(self) -> str:
+        """反馈文案：读 ``summary_feedback_text``；用户清空（空白）回退内置默认。"""
+        text = (
+            await self._config_mgr.get_summary_setting("summary_feedback_text")
+        ).strip()
+        return text or _DEFAULT_FEEDBACK_TEXT
+
+    async def _react_to_trigger(self, event: AstrMessageEvent) -> bool:
+        """经 OneBot 扩展 action 在触发消息上贴 👍（``set_msg_emoji_like``）。
+
+        成功返回 True；任何失败返回 False（warning 日志），失败路径共四种：
+        无 message_id / 取不到协议端 client / message_id 无法转 int /
+        协议端不支持该 action（抛 ActionFailed 等）——均由调用方降级文字。
+        client 获取方式参照 onebot.py 的防御式写法（getattr 取 bot、
+        hasattr 检查 api）。
+        """
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None)
+        if not message_id:
+            logger.warning(
+                "[HistorySummary] 触发消息缺少 message_id，贴表情不可用，降级文字提示"
+            )
+            return False
+        client = getattr(event, "bot", None)
+        if client is None or not hasattr(client, "api"):
+            logger.warning(
+                "[HistorySummary] 贴表情失败：取不到协议端 client"
+                "（event.bot 为空或非 aiocqhttp 平台），降级文字提示"
+            )
+            return False
+        try:
+            message_id_int = int(str(message_id))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[HistorySummary] 贴表情失败：message_id 无法转为整数（%r），"
+                "降级文字提示",
+                message_id,
+            )
+            return False
+        try:
+            await client.api.call_action(
+                _REACTION_ACTION,
+                message_id=message_id_int,
+                code=_REACTION_EMOJI_CODE,
+            )
+        except Exception:
+            logger.warning(
+                "[HistorySummary] 贴表情失败（协议端可能不支持 %s），降级文字提示",
+                _REACTION_ACTION,
+                exc_info=True,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # 内部工具

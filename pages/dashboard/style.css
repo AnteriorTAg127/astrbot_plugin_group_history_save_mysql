@@ -584,6 +584,8 @@ body {
     text-align: center;
 }
 
+.input-text { width: 260px; max-width: 100%; }
+
 /* ===== Toast ===== */
 .toast {
     position: fixed;
@@ -762,6 +764,30 @@ body {
 }
 
 .provider-select { min-width: 220px; max-width: 100%; }
+
+/* 备用总结模型多选（provider_multi checkbox 组）：纵向排列，勾选顺序即降级顺序 */
+.provider-checks { display: flex; flex-direction: column; gap: 6px; }
+
+.provider-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: fit-content;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 0.84rem;
+    color: var(--text-2);
+    transition: var(--transition);
+}
+
+.provider-check:hover { background: var(--surface-hover); }
+
+.provider-check input { accent-color: var(--primary); }
+
+/* stale 项（provider 已删除）：弱化显示但勾选保留，保存时不静默清空 */
+.provider-check-stale span { color: var(--text-3); }
+.provider-check-stale input { cursor: not-allowed; }
 
 /* 提示词模板：等宽字体 + 足够高度 */
 .prompt-textarea {

@@ -452,9 +452,9 @@ function el(tag, className, text) {
     return node;
 }
 
-// ========== v0.3 Tab 1：总结设置（16 项配置分组表单） ==========
+// ========== v0.3 Tab 1：总结设置（19 项配置分组表单） ==========
 
-// 16 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
+// 19 项总结配置元数据：分组 / 展示名 / 说明 / 控件类型。
 // kind 与后端 SUMMARY_TYPES（bool/int/float/list/str）一一对应，
 // 请求封装沿用 bridge.apiGet/apiPost（路径相对插件 API 前缀，响应已由桥接解包）
 const SUMMARY_FIELD_META = [
@@ -473,8 +473,11 @@ const SUMMARY_FIELD_META = [
     { key: "summary_max_prompt_chars", group: "参数上限", label: "素材长度预算", desc: "送入 LLM 的完整提示词字符上限，超出从最旧消息开始截断（统计仍全量）", kind: "int", unit: "字符", min: 1000 },
     // —— 总结行为 ——
     { key: "summary_provider_id", group: "总结行为", label: "总结专用 LLM 提供商", desc: "留空时回退使用当前会话的 LLM 提供商", kind: "provider" },
+    { key: "summary_fallback_providers", group: "总结行为", label: "备用总结模型列表", desc: "主选模型失败后按勾选顺序逐个尝试，全部失败回退会话模型", kind: "provider_multi" },
     { key: "summary_prompt", group: "总结行为", label: "提示词模板", desc: "占位符：{stats} {messages} {time_range} {group_id} {format_constraint}", kind: "prompt" },
     { key: "summary_output_mode", group: "总结行为", label: "输出形态", desc: "forward=合并转发（剥 Markdown）；image=文转图（保留 Markdown）", kind: "select", options: [["forward", "合并转发（forward）"], ["image", "文转图（image）"]] },
+    { key: "summary_feedback_mode", group: "总结行为", label: "触发反馈模式", desc: "reaction=在触发消息上贴 👍（协议端不支持自动降级文字）；text=文字提示；none=关闭", kind: "select", options: [["reaction", "贴表情回应（reaction）"], ["text", "文字提示（text）"], ["none", "关闭（none）"]] },
+    { key: "summary_feedback_text", group: "总结行为", label: "触发反馈文案", desc: "text 模式的提示文案；reaction 失败降级时同用；留空回退内置默认", kind: "text" },
     { key: "summary_rank_top_n", group: "总结行为", label: "活跃排行条数", desc: "活跃排行展示条数", kind: "int", unit: "条", min: 0 },
     // —— 存储 ——
     { key: "summary_retention_days", group: "存储", label: "总结保留天数", desc: "总结 JSON 保留天数，每日定时清理过期文件", kind: "int", unit: "天", min: 1 },
@@ -516,7 +519,7 @@ function renderSummaryForm(settings) {
 }
 
 function buildSummaryItem(meta, rawValue) {
-    const stacked = meta.kind === "prompt" || meta.kind === "whitelist";
+    const stacked = meta.kind === "prompt" || meta.kind === "whitelist" || meta.kind === "provider_multi";
     const item = el("div", "s-item" + (stacked ? " s-item-stack" : ""));
     const info = el("div", "setting-info");
     info.appendChild(el("div", "setting-name", meta.label));
@@ -599,6 +602,53 @@ function buildSummaryItem(meta, rawValue) {
             control.appendChild(select);
             break;
         }
+        case "provider_multi": {
+            // 备用模型多选：checkbox 组纵向排列，勾选顺序即降级顺序（后端按数组顺序调用）
+            control.className = "setting-control control-wide";
+            const wrap = el("div", "provider-checks");
+            wrap.dataset.key = meta.key;
+            const selected = parseProviderMultiValue(rawValue);
+            if (summaryProviders.length === 0) {
+                wrap.appendChild(el("div", "chips-empty", "暂无可用提供商"));
+            }
+            const knownIds = new Set();
+            for (const prov of summaryProviders) {
+                const row = el("label", "provider-check");
+                const cb = document.createElement("input");
+                cb.type = "checkbox";
+                cb.value = prov.id;
+                cb.checked = selected.includes(prov.id);
+                row.appendChild(cb);
+                row.appendChild(el("span", null, prov.name || prov.id));
+                wrap.appendChild(row);
+                knownIds.add(prov.id);
+            }
+            // 当前值中存在但不在 providers 中的 id（provider 已删除）→ 以禁用勾选保留，
+            // 避免保存时静默清空（与 provider 单选的 stale 保留策略一致）
+            for (const id of selected) {
+                if (knownIds.has(id)) continue;
+                const row = el("label", "provider-check provider-check-stale");
+                const cb = document.createElement("input");
+                cb.type = "checkbox";
+                cb.value = id;
+                cb.checked = true;
+                cb.disabled = true;
+                row.appendChild(cb);
+                row.appendChild(el("span", null, `${id}（已不可用）`));
+                wrap.appendChild(row);
+            }
+            control.appendChild(wrap);
+            break;
+        }
+        case "text": {
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "input input-text";
+            input.dataset.key = meta.key;
+            input.value = String(rawValue ?? "");
+            control.appendChild(input);
+            break;
+        }
         case "whitelist": {
             control.className = "setting-control control-wide";
             const input = document.createElement("input");
@@ -633,6 +683,21 @@ function buildSummaryItem(meta, rawValue) {
     return item;
 }
 
+// provider_multi 值解析：后端 summary_settings 表以 JSON 字符串数组存储（如 '["id1","id2"]'），
+// 解析失败 / 非数组一律视为 []；条目仅保留非空字符串（与后端非法条目静默过滤的语义一致）
+function parseProviderMultiValue(rawValue) {
+    let arr = rawValue;
+    if (typeof rawValue === "string") {
+        try {
+            arr = JSON.parse(rawValue);
+        } catch {
+            return [];
+        }
+    }
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((s) => typeof s === "string" && s !== "");
+}
+
 // 用接口返回的全量 settings 回填表单（保存/重置成功后复用）
 function fillSummaryForm(settings) {
     for (const meta of SUMMARY_FIELD_META) {
@@ -642,11 +707,18 @@ function fillSummaryForm(settings) {
         const raw = settings[meta.key];
         if (meta.kind === "bool") ctrl.checked = String(raw).toLowerCase() === "true";
         else if (meta.kind === "whitelist") ctrl.value = whitelistJsonToText(raw).text;
+        else if (meta.kind === "provider_multi") {
+            // ctrl 为容器 div[data-key]：按后端返回的 JSON 字符串数组刷新各 checkbox 勾选态
+            const ids = parseProviderMultiValue(raw);
+            ctrl.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                cb.checked = ids.includes(cb.value);
+            });
+        }
         else ctrl.value = String(raw ?? "");
     }
 }
 
-// 收集全部 16 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
+// 收集全部 19 项组装 save 载荷；前端基础校验失败返回 null（后端 400 为最终裁决）
 function collectSummarySettings() {
     const settings = {};
     for (const meta of SUMMARY_FIELD_META) {
@@ -687,6 +759,11 @@ function collectSummarySettings() {
                     return null;
                 }
                 break;
+            case "provider_multi":
+                // 收集容器内所有勾选项的 value 组成字符串数组（含 disabled 的 stale 项：
+                // 其 checked 且 value 有效，保留以避免静默清空）；后端对 list 值做 JSON 序列化，直接传数组
+                settings[meta.key] = [...ctrl.querySelectorAll('input[type="checkbox"]:checked')].map((cb) => cb.value);
+                break;
             default:
                 settings[meta.key] = ctrl.value;
         }
@@ -711,7 +788,7 @@ async function saveSummarySettings() {
 }
 
 async function resetSummaryAll() {
-    if (!confirm("确定将全部 15 项总结设置恢复为默认值吗？此操作不可撤销。")) return;
+    if (!confirm("确定将全部 19 项总结设置恢复为默认值吗？此操作不可撤销。")) return;
     try {
         // 省略 keys = 全部重置（后端约定）
         const data = await bridge.apiPost("summary/settings/reset", {});
