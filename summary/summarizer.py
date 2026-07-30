@@ -60,11 +60,11 @@ _SECTION_MATCH_RULES: tuple[tuple[str, str], ...] = (
     ("TODO", SECTION_TITLES[3]),
 )
 
-# format_constraint 占位符取值：forward（合并转发）需剥 Markdown，image（文转图）可保留
+# format_constraint 占位符取值：forward（合并转发）需剥 Markdown，image（文转图）保留 Markdown 并推荐表格
 _FORMAT_CONSTRAINT_FORWARD = (
     "不要使用任何 Markdown 格式（不要出现 #、*、>、`、[] 等标记符号）"
 )
-_FORMAT_CONSTRAINT_IMAGE = "可以使用 Markdown 格式"
+_FORMAT_CONSTRAINT_IMAGE = "可以使用 Markdown 格式，推荐使用 Markdown 表格（GFM 管道符语法）呈现结构化信息；可使用标题、粗体、列表"
 
 # 渲染自检：识别形如 {xxx} 的遗漏占位符（用户自定义模板可能含未知占位符）
 _PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")

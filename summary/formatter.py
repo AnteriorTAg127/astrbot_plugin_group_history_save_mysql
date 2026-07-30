@@ -7,9 +7,14 @@
   ``Comp.Nodes``（aiocqhttp 适配器对链中每个 Node/Nodes 各发一条
   ``send_group_forward_msg``，必须单个 Nodes 包裹才能合成一条合并转发），
   所有节点文本经 ``strip_markdown()`` 剥离 Markdown 标记；
-- ``image``：保留 Markdown。优先 ``Star.text_to_image``（默认 t2i 模板直接
-  支持 Markdown）；失败降级 ``Star.html_render``（只接受 HTML，故先做轻量
-  正则 Markdown→HTML，不引第三方依赖）；再失败回退剥 Markdown 的纯文本链。
+- ``image``：保留 Markdown。三级降级：① 自研报告模板（v0.3.2，
+  ``summary/t2i_render.py`` 的 ``T2IRenderer``：双主题/CDN 容灾/柱状图/
+  表格，两轮 ``html_render`` + 魔数校验；需构造时注入 ``config_mgr``，
+  缺省时跳过此级，签名向后兼容 v0.3.1）；② ``Star.text_to_image``（默认
+  t2i 模板直接支持 Markdown）；③ 剥 Markdown 的纯文本链。
+  ``_markdown_to_html``（轻量正则 Markdown→HTML，v0.3.2 起扩展 GFM 表格）
+  保留，供 ``T2IRenderer`` 生成板块兜底 HTML 复用（原最小化 ``_IMAGE_TMPL``
+  及其 ``html_render`` 调用已被自研模板取代并删除）。
 
 ``render()`` 保证不向上抛异常：任何渲染失败均有兜底消息链。
 
@@ -31,6 +36,7 @@ from __future__ import annotations
 import html
 import re
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -38,6 +44,9 @@ from astrbot.api.event import MessageChain
 from astrbot.api.star import Star
 
 from .models import SummaryResult
+
+if TYPE_CHECKING:
+    from ..db_config import ConfigManager
 
 # Node 署名兜底值：OneBot v11 合并转发要求 user_id 为数字，取不到 bot 自身
 # QQ 时用官方文档合并转发示例同款占位 uin。
@@ -48,15 +57,10 @@ _FALLBACK_NAME = "总结助手"
 # 数据源展示名映射（SummaryResult.sources 的 key → 文案）
 _SOURCE_NAMES = {"mysql": "MySQL", "onebot": "OneBot"}
 
-# image 模式 html_render 兜底模板。html_render 只吃 HTML+Jinja2，content
-# 已由 _markdown_to_html() 转换并转义，故用 |safe 原样注入。
-_IMAGE_TMPL = """
-<div style="width: 760px; padding: 28px 32px; background: #ffffff; color: #1f2329;
-            font-family: 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
-            font-size: 15px; line-height: 1.75;">
-  {{ content | safe }}
-</div>
-"""
+# GFM 表格识别（_markdown_to_html 用）：管道行 = 首尾 | 包裹；分隔符行 =
+# 单元格仅由 -/:/空格/| 组成（--- / :--- / ---: / :---:，冒号对齐可选）
+_RE_TABLE_ROW = re.compile(r"^\s*\|(.+)\|\s*$")
+_RE_TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +166,17 @@ def _fmt_time(dt: datetime | None) -> str:
 
 
 def _markdown_to_html(text: str) -> str:
-    """轻量 Markdown → HTML（仅标题/粗体/斜体/行内代码/列表/引用/代码块）。
+    """轻量 Markdown → HTML（标题/粗体/斜体/行内代码/列表/引用/代码块/GFM 表格）。
 
-    只服务于 image 模式 html_render 的降级渲染路径：html_render 只接受
-    HTML+Jinja2，不引第三方依赖，用行级正则做最小可用转换。输入先经
-    ``html.escape`` 转义，防止内容中的尖括号破坏页面结构。
+    服务于图片模式的兜底渲染路径（v0.3.1 前为 ``html_render`` 降级转换；
+    v0.3.2 起为自研 T2I 模板 CDN 全挂时的预转换 HTML，由
+    ``summary/t2i_render.py`` 复用）。不引第三方依赖，用行级正则做最小可用
+    转换。输入先经 ``html.escape`` 转义，防止内容中的尖括号破坏页面结构。
+
+    GFM 表格（v0.3.2 新增）：当前行为管道行（``| ... |``）且下一行为分隔符
+    行（``---`` / ``:---`` / ``---:`` / ``:---:`` 单元格）时，消费表头 +
+    分隔行 + 后续连续管道行，输出 ``<table>``；冒号对齐不做渲染；单元格内容
+    走行内转换（与标题/列表一致）。非表格输入的行为与 v0.3 完全一致。
     """
 
     def _inline(s: str) -> str:
@@ -174,6 +184,15 @@ def _markdown_to_html(text: str) -> str:
         s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
         s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
         return re.sub(r"\*([^*]+)\*", r"<em>\1</em>", s)
+
+    def _split_row_cells(row: str) -> list[str]:
+        """GFM 表格行 → 单元格列表：去首尾竖线后按 ``|`` 切分并 strip。"""
+        inner = row.strip()
+        if inner.startswith("|"):
+            inner = inner[1:]
+        if inner.endswith("|"):
+            inner = inner[:-1]
+        return [cell.strip() for cell in inner.split("|")]
 
     out: list[str] = []
     in_ul = in_ol = in_code = False
@@ -187,7 +206,11 @@ def _markdown_to_html(text: str) -> str:
             out.append("</ol>")
             in_ol = False
 
-    for raw_line in str(text or "").split("\n"):
+    lines = str(text or "").split("\n")
+    i = 0
+    total = len(lines)
+    while i < total:
+        raw_line = lines[i]
         if re.match(r"^\s*(```|~~~)", raw_line):  # 围栏代码块开关
             if in_code:
                 out.append("</pre>")
@@ -196,9 +219,44 @@ def _markdown_to_html(text: str) -> str:
                 _close_lists()
                 out.append("<pre>")
                 in_code = True
+            i += 1
             continue
         if in_code:
             out.append(html.escape(raw_line))
+            i += 1
+            continue
+
+        # GFM 表格：管道行 + 下一行分隔符 → 表头 + 分隔行消费，后续连续
+        # 管道行作表体，遇非管道行结束。仅在两条件同时满足时进入，
+        # 非表格输入逐行走原有分支，行为不变
+        if (
+            _RE_TABLE_ROW.match(raw_line)
+            and i + 1 < total
+            and _RE_TABLE_SEP.match(lines[i + 1])
+        ):
+            _close_lists()
+            header = _split_row_cells(raw_line)
+            i += 2  # 消费表头行与分隔行（对齐冒号忽略，不做对齐渲染）
+            body: list[list[str]] = []
+            while i < total and lines[i].lstrip().startswith("|"):
+                body.append(_split_row_cells(lines[i]))
+                i += 1
+            out.append("<table>")
+            out.append(
+                "<thead><tr>"
+                + "".join(f"<th>{_inline(cell)}</th>" for cell in header)
+                + "</tr></thead>"
+            )
+            if body:
+                out.append("<tbody>")
+                out.extend(
+                    "<tr>"
+                    + "".join(f"<td>{_inline(cell)}</td>" for cell in row)
+                    + "</tr>"
+                    for row in body
+                )
+                out.append("</tbody>")
+            out.append("</table>")
             continue
 
         m = re.match(r"^(#{1,6})\s+(.*)$", raw_line)
@@ -206,6 +264,7 @@ def _markdown_to_html(text: str) -> str:
             _close_lists()
             level = len(m.group(1))
             out.append(f"<h{level}>{_inline(m.group(2))}</h{level}>")
+            i += 1
             continue
         m = re.match(r"^\s*[-*+]\s+(.*)$", raw_line)
         if m:
@@ -214,6 +273,7 @@ def _markdown_to_html(text: str) -> str:
                 out.append("<ul>")
                 in_ul = True
             out.append(f"<li>{_inline(m.group(1))}</li>")
+            i += 1
             continue
         m = re.match(r"^\s*\d+[.)]\s+(.*)$", raw_line)
         if m:
@@ -222,18 +282,22 @@ def _markdown_to_html(text: str) -> str:
                 out.append("<ol>")
                 in_ol = True
             out.append(f"<li>{_inline(m.group(1))}</li>")
+            i += 1
             continue
         m = re.match(r"^\s*>+\s?(.*)$", raw_line)
         if m:
             _close_lists()
             out.append(f"<blockquote>{_inline(m.group(1))}</blockquote>")
+            i += 1
             continue
         if not raw_line.strip():
             _close_lists()
             out.append("<br>")
+            i += 1
             continue
         _close_lists()
         out.append(f"<p>{_inline(raw_line)}</p>")
+        i += 1
 
     if in_code:
         out.append("</pre>")
@@ -252,10 +316,22 @@ class SummaryFormatter:
     Attributes:
         star: 插件 Star 实例。用于调用 ``text_to_image`` / ``html_render``，
             以及经 ``star.context`` 防御式获取 bot 自身 uin。
+        t2i: v0.3.2 自研模板渲染器（``T2IRenderer``）。仅当构造时注入
+            ``config_mgr`` 时创建；为 None 时 image 模式跳过自研模板级，
+            行为回退 v0.3.1 链路（签名向后兼容）。
     """
 
-    def __init__(self, star: Star) -> None:
+    def __init__(self, star: Star, config_mgr: ConfigManager | None = None) -> None:
         self.star = star
+        # T2IRenderer 经局部导入引入：t2i_render 顶层复用本模块的
+        # _markdown_to_html，顶层互相导入会成环，故延迟到构造期导入。
+        # config_mgr 缺省（v0.3.1 旧调用点）时 t2i 为 None，走旧链路。
+        if config_mgr is not None:
+            from .t2i_render import T2IRenderer
+
+            self.t2i = T2IRenderer(star, config_mgr)
+        else:
+            self.t2i = None
 
     async def render(self, result: SummaryResult, mode: str) -> MessageChain:
         """将总结结果渲染为消息链。
@@ -380,33 +456,29 @@ class SummaryFormatter:
         return "\n".join(lines)
 
     async def _render_image(self, result: SummaryResult) -> MessageChain:
-        """文转图：text_to_image →（失败）html_render →（失败）纯文本兜底。"""
+        """文转图：自研 T2I 模板 →（失败）text_to_image →（失败）纯文本兜底。
+
+        v0.3.2 起首选自研报告模板（``T2IRenderer``：双主题/CDN 容灾/柱状图/
+        表格，两轮 ``html_render`` + 魔数校验），其内部保证不抛异常、失败
+        返回 None；``config_mgr`` 未注入（v0.3.1 旧调用点）时跳过该级。
+        原最小化 ``_IMAGE_TMPL`` + ``html_render`` 降级级已被自研模板取代删除。
+        """
+        # 1) 自研 T2I 报告模板（两轮渲染 + 魔数校验，内部绝不抛异常）
+        if self.t2i is not None:
+            chain = await self.t2i.render(result)
+            if chain is not None:
+                return chain
+
         markdown = self._build_full_markdown(result)
 
-        # 1) Star.text_to_image(text, return_url=True)：默认 t2i 模板直接吃 Markdown
+        # 2) Star.text_to_image(text, return_url=True)：默认 t2i 模板直接吃 Markdown
         try:
             chain = self._image_chain(await self.star.text_to_image(markdown))
             if chain is not None:
                 return chain
         except Exception:
             logger.warning(
-                "[HistorySummary] text_to_image 渲染失败，尝试 html_render",
-                exc_info=True,
-            )
-
-        # 2) Star.html_render(tmpl, data, return_url=True) 只吃 HTML：
-        #    先轻量 Markdown→HTML（行级正则，无第三方依赖）再渲染
-        try:
-            chain = self._image_chain(
-                await self.star.html_render(
-                    _IMAGE_TMPL, {"content": _markdown_to_html(markdown)}
-                )
-            )
-            if chain is not None:
-                return chain
-        except Exception:
-            logger.warning(
-                "[HistorySummary] html_render 渲染失败，回退纯文本消息链",
+                "[HistorySummary] text_to_image 渲染失败，回退纯文本消息链",
                 exc_info=True,
             )
 

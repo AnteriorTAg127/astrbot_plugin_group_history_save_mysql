@@ -121,7 +121,7 @@ class SummaryService:
         # 上游四模块实例（构造签名以各模块实际交付版本为准）
         self._fetcher = HistoryFetcher(mysql_mgr, config_mgr)
         self._summarizer = Summarizer(context, config_mgr)
-        self._formatter = SummaryFormatter(star)
+        self._formatter = SummaryFormatter(star, config_mgr)
         self.storage = SummaryStorage(StarTools.get_data_dir(PLUGIN_NAME) / "summaries")
         self._scheduler = CleanupScheduler(self.storage, config_mgr)
         # 限流时间戳表（monotonic 时钟，仅内存不持久化）：

@@ -22,7 +22,7 @@ class ConfigManager:
 
     # ========== 总结功能配置常量（v0.3） ==========
 
-    # 总结功能 19 项配置的默认值。值一律字符串存储；列表类型 JSON 序列化。
+    # 总结功能 24 项配置的默认值。值一律字符串存储；列表类型 JSON 序列化。
     # 同时作为初始化播种目标与 dashboard「恢复默认」的目标值。
     SUMMARY_DEFAULTS: dict[str, str] = {
         "summary_enabled": "true",
@@ -68,6 +68,17 @@ class ConfigManager:
 3. 语言简洁客观，不编造聊天记录中不存在的内容；
 4. 某板块无对应内容时写「无」；
 5. {format_constraint}""",
+        # ========== v0.3.2 T2I 图片渲染配置 ==========
+        # 主题模式：auto 按时段自动切换 / light 强制浅色 / dark 强制深色
+        "summary_t2i_theme_mode": "auto",
+        # 深色时段起点（HH:MM，24 小时制）
+        "summary_t2i_dark_start": "22:00",
+        # 浅色时段起点（HH:MM，24 小时制）
+        "summary_t2i_light_start": "08:00",
+        # 单轮渲染超时秒数（合法范围 5–300，R2 轮双倍兜底）
+        "summary_t2i_timeout": "30",
+        # CDN 节点尝试顺序（JSON 存储），国内镜像优先，单节点失败自动切换
+        "summary_t2i_cdn_providers": '["bootcdn", "npmmirror", "staticfile", "jsdelivr", "unpkg"]',
     }
 
     # 各配置键的值类型声明，供 get_summary_setting_typed() 类型化读取与
@@ -92,6 +103,12 @@ class ConfigManager:
         "summary_max_prompt_chars": int,
         "summary_retention_days": int,
         "summary_prompt": str,
+        # v0.3.2 T2I 渲染：主题模式/双时段/超时/CDN 节点序
+        "summary_t2i_theme_mode": str,
+        "summary_t2i_dark_start": str,
+        "summary_t2i_light_start": str,
+        "summary_t2i_timeout": int,
+        "summary_t2i_cdn_providers": list,
     }
 
     def __init__(self):
@@ -160,7 +177,7 @@ class ConfigManager:
                 value TEXT DEFAULT ''
             )
         """)
-        # v0.3：总结功能配置表（key/value 形式，19 项配置统一落库）
+        # v0.3：总结功能配置表（key/value 形式，24 项配置统一落库）
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS summary_settings (
                 key TEXT PRIMARY KEY,
@@ -189,7 +206,7 @@ class ConfigManager:
                 "INSERT OR IGNORE INTO plugin_settings (key_name, value) VALUES (?, ?)",
                 (key, value),
             )
-        # v0.3：总结功能 19 项配置播种。INSERT OR IGNORE 仅插入缺失键，
+        # v0.3：总结功能 24 项配置播种。INSERT OR IGNORE 仅插入缺失键，
         # 不覆盖用户已在 dashboard 修改的值（升级/自愈重连时可安全重复执行）
         for key, value in self.SUMMARY_DEFAULTS.items():
             await self.db.execute(
@@ -433,7 +450,7 @@ class ConfigManager:
         default 为 None 时回退 SUMMARY_DEFAULTS.get(key, "")。
 
         Args:
-            key: 配置键（SUMMARY_DEFAULTS 19 项之一）
+            key: 配置键（SUMMARY_DEFAULTS 24 项之一）
             default: 自定义回退值；为 None 时使用 SUMMARY_DEFAULTS 中的默认值
 
         Returns:
@@ -483,7 +500,7 @@ class ConfigManager:
             return False
 
     async def get_all_summary_settings(self) -> dict[str, str]:
-        """获取全部总结功能配置（完整 19 项，缺失以默认值补全）。
+        """获取全部总结功能配置（完整 24 项，缺失以默认值补全）。
 
         Returns:
             dict[str, str]: 按 SUMMARY_DEFAULTS 顺序的完整配置字典，值均为字符串
@@ -495,7 +512,7 @@ class ConfigManager:
             ) as cursor:
                 rows = await cursor.fetchall()
             stored = {row[0]: row[1] for row in rows}
-            # 以 SUMMARY_DEFAULTS 为骨架补全缺失项，保证返回恒为完整 19 项
+            # 以 SUMMARY_DEFAULTS 为骨架补全缺失项，保证返回恒为完整 24 项
             return {
                 key: stored.get(key, value)
                 for key, value in self.SUMMARY_DEFAULTS.items()
@@ -510,7 +527,7 @@ class ConfigManager:
         """将总结功能配置重置为默认值。
 
         Args:
-            keys: 需要重置的键列表；为 None 时重置全部 19 项；未知键跳过并告警
+            keys: 需要重置的键列表；为 None 时重置全部 24 项；未知键跳过并告警
 
         Returns:
             dict[str, str]: 重置后的全量配置（失败时返回空字典）

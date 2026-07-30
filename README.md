@@ -18,6 +18,8 @@
 - 📊 规则统计块 + LLM 四板块摘要，合并转发 / 文转图两种输出形式（Web 可配）
 - 🛡️ 备用模型降级链（v0.3.1 新增）：总结 LLM 按「主选提供商 → 备用列表按序 → 会话模型兜底」调用，任一节点失败自动降级，历史总结记录实际使用的模型
 - 👍 总结触发反馈（v0.3.1 新增）：指令生效后即时确认（默认贴表情回应，协议端不支持时自动降级文字提示，可配文字模式或关闭）
+- 🎨 自研图片报告模板（v0.3.2 新增）：文转图改用与管理面板同款风格的自研模板，支持多路 JS CDN 容灾（国内镜像优先，自动切换）、Markdown 表格渲染、发言人排行柱状图、白天/夜间自动主题（时间可调）、渲染超时可配；移动端字号友好
+- 🔀 备用模型列表弹窗（v0.3.2 新增）：原长复选框改为点击弹窗，降级顺序可拖拽排序、可选模型滚动勾选，点遮罩不关闭
 
 ## 安装
 
@@ -102,13 +104,13 @@ SHOW TABLES;
 - **统计**：最近 7 天每日存储量
 - **查询**：按关键词（内容/昵称）、群号、QQ号、时间组合查询聊天记录
 - **数据维护**：手动清理过期图片；一键清空所有数据（需通过随机加减法验证，题目由后端生成、一次性有效）
-- **总结设置**（v0.3 新增）：总结功能全部 19 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
+- **总结设置**（v0.3 新增）：总结功能全部 24 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储 / 图片渲染）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
 - **忽略管理**（v0.3 新增）：按群增删查忽略发送者，被忽略者的消息不参与总结
 - **历史总结**（v0.3 新增）：按群浏览已保存的总结 JSON，弹层查看总结详情（统计块 + LLM 摘要 + 元数据）
 
 ## 总结功能配置说明（v0.3 新增）
 
-> 总结功能全部 19 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
+> 总结功能全部 24 项配置存入 config.db 新增的 `summary_settings` 表（key/value 形式，列表值 JSON 序列化），
 > **不进入 `_conf_schema.json`**（插件原有配置保持不变）。配置仅在 dashboard「总结设置」tab 修改，
 > 改后即时生效，无需重启插件；默认值由 `ConfigManager` 初始化时自动播种。
 
@@ -133,6 +135,11 @@ SHOW TABLES;
 | summary_fallback_providers | list（JSON 存储） | [] | 备用总结模型列表，主选失败后按序尝试，全部失败回退会话模型 |
 | summary_feedback_mode | string | reaction | 触发反馈模式：reaction 贴表情 / text 文字提示 / none 关闭 |
 | summary_feedback_text | string | 📝 收到！正在总结中，请稍候… | 文字反馈文案（reaction 降级时同用） |
+| summary_t2i_theme_mode | string | auto | 图片报告主题：`auto`=按时段自动 / `light`=强制浅色 / `dark`=强制深色 |
+| summary_t2i_dark_start | string | 22:00 | 深色时段起点（HH:MM，服务器本地时间） |
+| summary_t2i_light_start | string | 08:00 | 浅色时段起点（HH:MM）；默认 08:00–22:00 浅色、22:00–08:00 深色 |
+| summary_t2i_timeout | int | 30 | 图片单轮渲染超时（秒，5–300）；失败自动以双倍超时重试第二轮 |
+| summary_t2i_cdn_providers | list（JSON 存储） | ["bootcdn","npmmirror","staticfile","jsdelivr","unpkg"] | 图片模板加载 Markdown/图表脚本的 CDN 尝试顺序，国内镜像优先，单节点失败自动切换 |
 
 占位符说明：`{stats}` 统计块、`{messages}` 格式化消息列表（每行 `[时间] 昵称: 内容`）、`{time_range}` 时间范围描述、`{group_id}` 群号、`{format_constraint}` 按输出模式注入的格式约束（合并转发=禁用 Markdown / 文转图=可用 Markdown）。
 
@@ -154,7 +161,7 @@ SHOW TABLES;
 - **LLM 四板块摘要**：📢 重要通知与结论 / 💬 讨论要点·争议 / 🎉 有趣片段 / ✅ TODO·待跟进，每个条目含参与者与大致时间
 - **输出形式**（`summary_output_mode`）：
   - `forward` 合并转发：1 个统计节点 + 4 个板块节点，剥离 Markdown 标记（提示词约束 + 发送前程序化剥离双重保障）
-  - `image` 文转图：保留 Markdown，经渲染器渲染成图片发送
+  - `image` 文转图：保留 Markdown（含表格），经自研报告模板渲染成图片发送（多 CDN 容灾、日夜双主题、排行柱状图，详见「图片渲染」配置组）
 
 ### 权限、限流与素材过滤
 
@@ -179,7 +186,9 @@ SHOW TABLES;
 | summary/fetcher.py | 数据获取：混合策略（MySQL 优先 + OneBot 补齐 + 去重合并） |
 | summary/onebot.py | 协议端 `get_group_msg_history` 封装与消息段解析 |
 | summary/summarizer.py | 总结引擎：统计计算 + LLM 调用 + 提示词占位符渲染 |
-| summary/formatter.py | 输出格式化：合并转发节点（剥离 Markdown）/ 文转图 |
+| summary/formatter.py | 输出格式化：合并转发节点（剥离 Markdown）/ 文转图（含 GFM 表格兜底转换） |
+| summary/t2i_render.py | 自研图片渲染核心：模板加载、日夜主题判定、多路 CDN/超时配置解析、两轮渲染 + 魔数校验 |
+| summary/templates/ | 自研 T2I 报告模板（HTML + 内联 CSS/JS，双主题 + CDN 容灾加载器） |
 | summary/storage.py | 总结 JSON 持久化（按群分目录、列表、读取、过期清理） |
 | summary/scheduler.py | 定时清理任务（每天清理过期 JSON） |
 

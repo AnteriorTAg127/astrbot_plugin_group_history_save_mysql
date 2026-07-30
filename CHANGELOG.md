@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.2] - 2026-07-31
+
+### Added
+
+- **自研 T2I 报告模板**：图片总结改用插件自带模板 `summary/templates/summary_report.html`（860px 画布、
+  与管理面板同款双主题设计令牌、移动端友好字号），含报告头、四统计卡、发言人排行、分板块 Markdown 内容与页脚，
+  替代原最小化渲染模板
+- **多路 JS CDN 容灾**：模板内联加载器按 `summary_t2i_cdn_providers` 顺序尝试
+  （默认国内镜像优先 bootcdn/npmmirror/staticfile → jsdelivr/unpkg），单节点 8 秒超时自动切换；
+  加载 `marked`（Markdown + GFM 表格）与 `echarts`（柱状图）；全部失败自动降级为服务端预转换 HTML 与纯 CSS 柱状图，
+  图片仍可产出
+- **发言人排行柱状图**：把活跃排行 Top N 渲染为横向柱状图（ECharts 主题色板 + 纯 CSS 渐变横条双形态互为兜底）
+- **白天/夜间自动主题**：`summary_t2i_theme_mode`（auto/light/dark）+ `summary_t2i_dark_start`/
+  `summary_t2i_light_start`（默认 22:00/08:00，HH:MM 可配），按服务器本地时间判定，22 点后深色、8 点后浅色
+- **渲染超时可配**：`summary_t2i_timeout`（默认 30 秒，5–300），两轮渲染 R1 PNG(T) / R2 JPEG 质量 80(2T)，
+  并对截图结果做文件头魔数校验，防止把渲染服务返回的错误页面当成图片
+- **图片渲染配置组**：dashboard「总结设置」新增「图片渲染」分组，含主题模式 / 深色起点 / 浅色起点 / 渲染超时 /
+  CDN 节点顺序 5 项
+- **备用模型列表交互改版**：原内联长复选框列表改为触发按钮 + 弹窗——弹窗内「降级顺序」区可拖拽排序、
+  「可选模型」区滚动勾选，点击遮罩不关闭（防误触丢失排序），失效模型保留可拖可删
+
+### Changed
+
+- 图片模式格式约束放开并**推荐 Markdown 表格**（GFM 管道符语法），表格在图片中正常渲染
+- 图片渲染兜底链路改为「自研模板 → `text_to_image` → 纯文本」
+- 总结配置项 19 → 24（新增 5 项图片渲染配置）
+- metadata.yaml 版本升至 v0.3.2
+- 完全向后兼容 v0.3.1：新配置由 `ConfigManager` 初始化自动播种默认值，无需迁移，已存配置不受影响
+
 ## [0.3.1] - 2026-07-31
 
 ### Added
