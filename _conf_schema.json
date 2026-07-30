@@ -52,5 +52,11 @@
         "type": "int",
         "default": 30,
         "hint": "等待可用连接的最大时间"
+    },
+    "pool_ping_cooldown": {
+        "description": "Ping 冷却时间（秒）",
+        "type": "int",
+        "default": 5,
+        "hint": "连接在冷却秒数内再次被取出时跳过 ping 检查，降低 CPU 与 MySQL 往返开销"
     }
 }

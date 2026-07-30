@@ -36,6 +36,7 @@ class DynamicPool:
         idle_timeout: int = 120,
         acquire_timeout: int = 30,
         pool_recycle: int = 3600,
+        ping_cooldown: int = 5,
     ):
         self._host = host
         self._port = port
@@ -47,9 +48,10 @@ class DynamicPool:
         self._idle_timeout = idle_timeout
         self._acquire_timeout = acquire_timeout
         self._pool_recycle = pool_recycle
+        self._ping_cooldown = max(1, ping_cooldown)  # 最少 1 秒，防止设为 0 导致永不 ping
 
-        # 连接存储: list of (connection, last_used_timestamp)
-        self._free: list[tuple[aiomysql.Connection, float]] = []
+        # 连接存储: list of (connection, last_used_timestamp, last_pinged_timestamp)
+        self._free: list[tuple[aiomysql.Connection, float, float]] = []
         self._used: set[aiomysql.Connection] = set()
         # 注意：asyncio 同步原语必须在事件循环内创建，延迟到 initialize()
         self._lock: asyncio.Lock | None = None
@@ -80,6 +82,20 @@ class DynamicPool:
     def used_size(self) -> int:
         """使用中连接数。"""
         return len(self._used)
+
+    def _record_destroyed(self, conn: aiomysql.Connection | None = None, count: int = 1):
+        """记录连接销毁（用于统计：created - recycled = free + used）。
+
+        所有连接销毁路径（替换失效连接、pool_recycle 换新、reaper 回收、
+        health check 丢弃、归还时发现已关闭、预探测临时连接关闭等）
+        都须经此方法更新计数器，保证池子行踪可解释。
+        """
+        self._total_recycled += count
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     async def _create_connection(self) -> aiomysql.Connection:
         """创建一个新的数据库连接。
@@ -149,19 +165,13 @@ class DynamicPool:
                 pass
 
         async with self._lock:
-            for conn, _ in self._free:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            for conn, _, _ in self._free:
+                self._record_destroyed(conn)
             self._free.clear()
             # 初始化重试意味着此前数据库不可用：在途连接已无意义，
             # 统一关闭并复位簿记（借用方的 shielded 归还逻辑对已关闭连接是幂等的）
             for conn in self._used:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                self._record_destroyed(conn)
             self._used.clear()
             self._pending = 0
 
@@ -173,12 +183,9 @@ class DynamicPool:
             conn = await asyncio.wait_for(self._create_connection(), timeout=2)
             async with self._lock:
                 if self._closed:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                    self._record_destroyed(conn)
                 else:
-                    self._free.append((conn, time.monotonic()))
+                    self._free.append((conn, time.monotonic(), time.monotonic()))
         except asyncio.TimeoutError:
             logger.warning("[DynamicPool] 预创建连接超时 (2s)，数据库当前可能不可用")
         except Exception as e:
@@ -199,16 +206,29 @@ class DynamicPool:
             return False
 
     async def _ensure_connection(
-        self, conn: aiomysql.Connection
+        self, conn: aiomysql.Connection, conn_pinged: float = 0.0
     ) -> aiomysql.Connection:
-        """确保连接可用，失效则重建。"""
+        """确保连接可用，失效则重建。
+
+        conn_pinged 是连接上次通过 ping 验证的时间戳（monotonic 秒）。
+
+        连接刚刚从 idle 取出（is_alive 已返回 True）时，
+        _ping_cooldown 秒内 skip ping 直接复用；服务端 ssl_timeout
+        默认 10 分钟（8.0.28+），保持连接的 SELECT 1 又会被
+        _is_alive 吞掉 any 异常，所以通过 conn.ping 的 timeout=5s 来
+        兜底半开连接检测，ping 频率由 cooldown 控制。
+        """
         if conn.closed:
+            self._record_destroyed(conn)
             return await self._create_connection()
+        if (
+            conn_pinged
+            and conn_pinged > 0
+            and (time.monotonic() - conn_pinged) < self._ping_cooldown
+        ):
+            return conn
         if not await self._is_alive(conn):
-            try:
-                conn.close()
-            except Exception:
-                pass
+            self._record_destroyed(conn)
             return await self._create_connection()
         return conn
 
@@ -243,10 +263,7 @@ class DynamicPool:
             except Exception as e:
                 logger.error(f"[DynamicPool] 槽位回滚失败: {e}")
             if close_conn is not None:
-                try:
-                    close_conn.close()
-                except Exception:
-                    pass
+                self._record_destroyed(close_conn)
 
         try:
             asyncio.create_task(_rollback())
@@ -254,10 +271,7 @@ class DynamicPool:
             # 事件循环不可用（本插件调用路径下几乎不会发生）：降级为同步修正
             self._pending -= 1
             if close_conn is not None:
-                try:
-                    close_conn.close()
-                except Exception:
-                    pass
+                self._record_destroyed(close_conn)
 
     async def _finish_acquire(self, conn: aiomysql.Connection) -> aiomysql.Connection:
         """校验/创建成功后把连接登记进 _used（取消安全）。"""
@@ -301,12 +315,13 @@ class DynamicPool:
             mode: str | None = None
             conn_to_check: aiomysql.Connection | None = None
             conn_ts = 0.0
+            conn_pinged = 0.0
 
             # ---- 锁内：快速簿记 ----
             async with self._not_empty:
                 if self._free:
-                    # 取一个空闲连接进入“校验中”状态（free-1 / pending+1，size 不变）
-                    conn_to_check, conn_ts = self._free.pop(0)
+                    # 取一个空闲连接进入"校验中"状态（free-1 / pending+1，size 不变）
+                    conn_to_check, conn_ts, conn_pinged = self._free.pop(0)
                     self._pending += 1
                     mode = "check"
                 elif self.size < self._max_size:
@@ -340,13 +355,10 @@ class DynamicPool:
                         self._pool_recycle
                         and (time.monotonic() - conn_ts) > self._pool_recycle
                     ):
-                        try:
-                            conn_to_check.close()
-                        except Exception:
-                            pass
+                        self._record_destroyed(conn_to_check)
                         conn = await self._create_connection()
                     else:
-                        conn = await self._ensure_connection(conn_to_check)
+                        conn = await self._ensure_connection(conn_to_check, conn_pinged)
                 except BaseException:
                     self._schedule_rollback(close_conn=conn_to_check)
                     raise
@@ -366,12 +378,9 @@ class DynamicPool:
         async with self._not_empty:
             self._used.discard(conn)
             if self._closed or conn.closed:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                self._record_destroyed(conn)
             else:
-                self._free.append((conn, time.monotonic()))
+                self._free.append((conn, time.monotonic(), time.monotonic()))
             self._not_empty.notify()
 
     async def _reaper_loop(self):
@@ -397,15 +406,11 @@ class DynamicPool:
                 len(self._free) > self._min_size
                 and (now - self._free[0][1]) > self._idle_timeout
             ):
-                conn, _ = self._free.pop(0)
+                conn, _, _ = self._free.pop(0)
                 to_close.append(conn)
 
         for conn in to_close:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            self._total_recycled += 1
+            self._record_destroyed(conn)
 
         if to_close:
             logger.info(
@@ -416,36 +421,46 @@ class DynamicPool:
     async def _health_check(self):
         """检查空闲连接健康状态，移除失效连接。
 
-        采用“租约”模式：把待检查的连接从 _free 移入 _pending 校验槽，
+        采用"租约"模式：把待检查的连接从 _free 移入 _pending 校验槽，
         acquire 在此期间取不到它，杜绝 reaper 的 ping 与业务查询并发
         使用同一 aiomysql 连接造成的协议错乱；ping 仍在锁外执行，
         巡检不会阻塞 acquire。
+
+        连接在 _ping_cooldown 秒内刚被验证过的直接跳过，减少不必要的
+        MySQL 往返（reaper 30s 一次，cooldown 默认 5s，正常场景下
+        大部分连接不必再 ping）。
         """
         while True:
             # 锁内：租出一个空闲连接（free-1 / pending+1，size 恒定）
             async with self._lock:
                 if not self._free:
                     break
-                conn, ts = self._free.pop(0)
+                conn, ts, last_pinged = self._free.pop(0)
                 self._pending += 1
 
-            # 锁外：ping（取消时经独立任务回滚槽位）
+            # 锁外：ping 冷却内的连接跳过检查直接归还
             try:
-                alive = not conn.closed and await self._is_alive(conn)
+                now = time.monotonic()
+                if (
+                    last_pinged > 0
+                    and (now - last_pinged) < self._ping_cooldown
+                    and not conn.closed
+                ):
+                    # 冷却内且明显未关闭：跳过 ping，直接视为存活
+                    alive = True
+                else:
+                    alive = not conn.closed and await self._is_alive(conn)
             except BaseException:
                 self._schedule_rollback(close_conn=conn)
                 raise
 
-            # 锁内：存活则归还（保留原空闲时间戳），失效则丢弃
+            # 锁内：存活则归还（保留原空闲时间戳，更新 ping 时间戳），失效则丢弃
             async with self._lock:
                 self._pending -= 1
                 if alive and not self._closed:
-                    self._free.append((conn, ts))
+                    self._free.append((conn, ts, time.monotonic()))
                 else:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                    self._record_destroyed(conn)
 
         # 如果低于 min_size，经预留槽位补充连接（严格不超过 max_size）
         while True:
@@ -463,12 +478,9 @@ class DynamicPool:
             async with self._lock:
                 self._pending -= 1
                 if self._closed:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                    self._record_destroyed(conn)
                     break
-                self._free.append((conn, time.monotonic()))
+                self._free.append((conn, time.monotonic(), time.monotonic()))
 
     def get_pool_info(self) -> dict:
         """获取连接池状态信息。"""
@@ -500,20 +512,14 @@ class DynamicPool:
 
         # 如果 initialize() 未执行，_lock 为 None，直接清理即可
         if self._lock is None:
-            for conn, _ in self._free:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            for conn, _, _ in self._free:
+                self._record_destroyed(conn)
             self._free.clear()
             return
 
         async with self._not_empty:
-            for conn, _ in self._free:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            for conn, _, _ in self._free:
+                self._record_destroyed(conn)
             self._free.clear()
             # 唤醒全部等待协程：循环顶部复检 _closed 后会立即抛 RuntimeError
             self._not_empty.notify_all()
@@ -540,6 +546,7 @@ class MySQLManager:
         pool_max_size: int = 10,
         pool_idle_timeout: int = 120,
         pool_timeout: int = 30,
+        pool_ping_cooldown: int = 5,
     ):
         self.host = host
         self.port = port
@@ -556,6 +563,7 @@ class MySQLManager:
             max_size=pool_max_size,
             idle_timeout=pool_idle_timeout,
             acquire_timeout=pool_timeout,
+            ping_cooldown=pool_ping_cooldown,
         )
         # 查询类操作错误日志节流状态：key -> (上次输出时间, 窗口内累计次数)
         self._op_err_state: dict[str, tuple[float, int]] = {}
@@ -603,6 +611,9 @@ class MySQLManager:
     async def _probe_connection(self, timeout: int = 3) -> bool:
         """尝试在指定超时内创建一个临时连接，验证 MySQL 是否可达。
 
+        这个临时连接不在池子的 _free/_used 中，用完即销毁。
+        通过 _record_destroyed 更新计数器，保证 created - recycled = pool size。
+
         Args:
             timeout: 最大等待秒数
 
@@ -617,10 +628,7 @@ class MySQLManager:
                 await conn.ping(reconnect=False)
                 return True
             finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                self.pool._record_destroyed(conn)
         except asyncio.TimeoutError:
             logger.warning(f"[HistorySave] MySQL 连接探测超时 ({timeout}s)")
             return False

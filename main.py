@@ -103,6 +103,7 @@ class GroupHistoryPlugin(Star):
             pool_max_size=config.get("pool_max_size", 10),
             pool_idle_timeout=config.get("pool_idle_timeout", 120),
             pool_timeout=config.get("pool_timeout", 30),
+            pool_ping_cooldown=config.get("pool_ping_cooldown", 5),
         )
 
         # 初始化本地配置管理器
