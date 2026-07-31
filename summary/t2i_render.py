@@ -405,10 +405,23 @@ class T2IRenderer:
     # ------------------------------------------------------------------
 
     async def _render_two_rounds(self, tmpl: str, data: dict) -> MessageChain | None:
-        """两轮渲染：R1 PNG（超时 T）→ 失败 R2 JPEG q80（超时 2T）→ 全败 None。"""
+        """两轮渲染：R1 PNG（超时 T）→ 失败 R2 JPEG q80（超时 2T）→ 全败 None。
+
+        ``device_scale_factor_level="ultra"``（1.8 倍设备像素比）提升输出
+        分辨率——T2I 服务端视口固定 1280px，经放大后输出约 2304px 宽，
+        图片在手机端缩放查看时更清晰（模板字号已按 1230px 画布放大）。
+        """
         timeout_s = await self._resolve_timeout()
         rounds = [
-            (1, {"timeout": timeout_s * 1000, "type": "png", "full_page": True}),
+            (
+                1,
+                {
+                    "timeout": timeout_s * 1000,
+                    "type": "png",
+                    "full_page": True,
+                    "device_scale_factor_level": "ultra",
+                },
+            ),
             (
                 2,
                 {
@@ -416,6 +429,7 @@ class T2IRenderer:
                     "type": "jpeg",
                     "quality": 80,
                     "full_page": True,
+                    "device_scale_factor_level": "ultra",
                 },
             ),
         ]
