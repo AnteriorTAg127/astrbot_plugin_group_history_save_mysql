@@ -95,7 +95,9 @@ _DEFAULT_MAX_HOURS = 168
 # ---------- 触发反馈（指令生效后即时确认，见 SummaryService._send_feedback） ----------
 _DEFAULT_FEEDBACK_TEXT = "📝 收到！正在总结中，请稍候…"
 _REACTION_ACTION = "set_msg_emoji_like"
-_REACTION_EMOJI_CODE = "128077"  # 👍 的 Unicode 码点（十进制字符串）
+# 协议端要求参数名为 emoji_id；值取 👍 的 Unicode 码点（十进制字符串），
+# 非 CQ 小表情 id（NapCat 按 ID 长度区分：>3 位走 type-2 Unicode 表情路径）
+_REACTION_EMOJI_ID = "128077"
 
 
 class SummaryService:
@@ -454,7 +456,7 @@ class SummaryService:
             await client.api.call_action(
                 _REACTION_ACTION,
                 message_id=message_id_int,
-                code=_REACTION_EMOJI_CODE,
+                emoji_id=_REACTION_EMOJI_ID,
             )
         except Exception:
             logger.warning(
