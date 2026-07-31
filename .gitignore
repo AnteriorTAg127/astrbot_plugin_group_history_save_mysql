@@ -208,6 +208,8 @@ __marimo__/
 
 # 开发文件
 开发/
+# CodeGraph 本地索引（含 .codegraph/.gitignore 自保护文件），不入库
+.codegraph/
 /.qoder
 /.claude
 /.trae 
