@@ -482,6 +482,19 @@
         </div>
     </div>
 
+    <!-- 通用二次确认弹窗（iframe sandbox 无 allow-modals，原生 confirm 静默返回 false，
+         故改用模态框替代，供删除/清理等破坏性操作复用） -->
+    <div class="modal-mask" id="confirmModal" style="display:none;">
+        <div class="modal-card confirm-modal">
+            <div class="modal-title" id="confirmModalTitle">⚠️ 确认操作</div>
+            <div class="modal-desc" id="confirmModalMessage"></div>
+            <div class="modal-actions">
+                <button id="confirmCancelBtn" class="btn btn-ghost">取消</button>
+                <button id="confirmOkBtn" class="btn btn-danger">确认</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast -->
     <div id="toast" class="toast"></div>
 

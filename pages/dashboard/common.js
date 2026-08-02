@@ -18,4 +18,42 @@ function el(tag, className, text) {
     return node;
 }
 
-export { bridge, showToast, el };
+// 二次确认弹窗（Promise<boolean>）。
+// 插件页 iframe 的 sandbox 未含 allow-modals，原生 confirm() 会被静默禁用并恒返回 false，
+// 故破坏性操作一律改用本模态框确认（复用 #confirmModal 结构，文本走 textContent 防 XSS）。
+function confirmDialog(message, { title = "⚠️ 确认操作", okText = "确认", danger = true } = {}) {
+    return new Promise((resolve) => {
+        const mask = document.getElementById("confirmModal");
+        if (!mask) {
+            resolve(window.confirm(message));
+            return;
+        }
+        const titleEl = document.getElementById("confirmModalTitle");
+        const msgEl = document.getElementById("confirmModalMessage");
+        const okBtn = document.getElementById("confirmOkBtn");
+        const cancelBtn = document.getElementById("confirmCancelBtn");
+        titleEl.textContent = title;
+        msgEl.textContent = message;
+        okBtn.textContent = okText;
+        okBtn.className = danger ? "btn btn-danger" : "btn btn-primary";
+        mask.style.display = "flex";
+
+        const done = (result) => {
+            mask.style.display = "none";
+            okBtn.removeEventListener("click", onOk);
+            cancelBtn.removeEventListener("click", onCancel);
+            mask.removeEventListener("click", onMask);
+            resolve(result);
+        };
+        const onOk = () => done(true);
+        const onCancel = () => done(false);
+        const onMask = (e) => {
+            if (e.target === mask) done(false);
+        };
+        okBtn.addEventListener("click", onOk);
+        cancelBtn.addEventListener("click", onCancel);
+        mask.addEventListener("click", onMask);
+    });
+}
+
+export { bridge, showToast, el, confirmDialog };

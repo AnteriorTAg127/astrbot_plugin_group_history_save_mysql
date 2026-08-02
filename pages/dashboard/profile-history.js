@@ -4,7 +4,7 @@
 // 含活动图表 + 板块 Markdown + 免责声明，与 summary-detail 渲染范式一致）
 // 删除走 PRD §3.8 的 profile/history 端点（二次确认）；桥接仅暴露 apiGet/apiPost，
 // 无 apiDelete，故优先尝试 apiDelete（向前兼容），回退 apiPost 同路径
-import { bridge, showToast, el } from "./common.js";
+import { bridge, showToast, el, confirmDialog } from "./common.js";
 import { renderProfileResult, disposeCharts } from "./profile-launch.js";
 
 const PROFILE_HISTORY_PAGE_SIZE = 15;
@@ -125,7 +125,11 @@ async function deleteProfileItem(filename, item) {
         return;
     }
     const who = item?.target_name || item?.sender_id || "该";
-    if (!confirm(`确定删除「${who}」的这条人物分析记录吗？\n删除后不可恢复。`)) return;
+    const ok = await confirmDialog(
+        `确定删除「${who}」的这条人物分析记录吗？\n删除后不可恢复。`,
+        { title: "🗑️ 删除分析记录", okText: "删除" },
+    );
+    if (!ok) return;
     try {
         await apiDeleteProfileHistory(filename);
         showToast("已删除该分析记录", "success");

@@ -1,5 +1,5 @@
 // 存储库分区：状态 / 群管理 / 设置 / 每日统计 / 查询 / 清空（加减法验证）
-import { bridge, showToast, el } from "./common.js";
+import { bridge, showToast, el, confirmDialog } from "./common.js";
 
 let currentPage = 1;
 const pageSize = 50;
@@ -91,7 +91,8 @@ window.toggleGroup = async function (groupId) {
 };
 
 window.removeGroup = async function (groupId) {
-    if (!confirm(`确定要移除群 ${groupId} 吗？`)) return;
+    const ok = await confirmDialog(`确定要移除群 ${groupId} 吗？移除后将停止记录该群的消息。`);
+    if (!ok) return;
     try {
         await bridge.apiPost("groups/remove", { group_id: groupId });
         showToast(`已移除群 ${groupId}`, "success");
@@ -358,7 +359,8 @@ function bindStorageEvents() {
     });
 
     document.getElementById("cleanBtn").addEventListener("click", async () => {
-        if (!confirm("确定要清理过期图片记录吗？此操作不可撤销。")) return;
+        const ok = await confirmDialog("确定要清理过期图片记录吗？此操作不可撤销。");
+        if (!ok) return;
         try {
             const data = await bridge.apiPost("clean", {});
             showToast(`已清理 ${data.deleted} 条图片记录`, "success");
