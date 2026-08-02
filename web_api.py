@@ -431,10 +431,11 @@ class WebAPI:
     async def api_query(self):
         """查询聊天记录（支持多条件过滤和分页）。
 
-        每条记录附带 ``at_messages`` / ``reply_message`` 关联信息：
-        - at_messages: 本条 @ 的每个 QQ 的最近一条消息（{"sender_id", "sender_name", "content"}）
-        - reply_message: 本条回复目标消息（{"sender_id", "sender_name", "content"}，取不到为 None）
-        关联信息用于前端展示 @/回复的上下文，取不到时对应字段为空，不阻断查询。
+        每条记录附带 ``reply_message`` 关联信息：本条回复目标消息
+        （{"sender_id", "sender_name", "content"}，取不到为 None）。
+        说明：at_list（被 @ 的 QQ）仅作记录存储，@ ID 无法可靠反查
+        对应消息（@ 了某人不代表其某条消息与本次互动相关），故不作为
+        关联上下文展示（见 v0.4.0 PRD 备注）。
         """
         group_id = request.query.get("group_id")
         sender_id = request.query.get("sender_id")
@@ -474,34 +475,24 @@ class WebAPI:
             page=page,
             page_size=page_size,
         )
-        await self._enrich_query_relations(result)
+        await self._enrich_query_reply(result)
         return json_response(result)
 
-    async def _enrich_query_relations(self, result: dict) -> None:
-        """为查询结果批量补充 @ 对象与回复目标的消息内容。
+    async def _enrich_query_reply(self, result: dict) -> None:
+        """为查询结果批量补充回复目标消息内容。
 
-        按 message_id 反查（get_messages_by_ids 全参数化），一次批量查询避免 N+1；
+        仅按 reply_id（消息 ID）反查——reply_id 是唯一可靠的反查锚点；
         任一关联缺失或异常仅跳过该条，不阻断整体结果。
         """
         records = result.get("records") or []
         if not records:
             return
 
-        # 收集本页所有需要的 message_id（回复目标）+ 被 @ 用户（取每个用户最近一条）
-        reply_ids: list[str] = []
-        at_sender_ids: set[str] = set()
-        for rec in records:
-            rid = (rec.get("reply_id") or "").strip()
-            if rid:
-                reply_ids.append(rid)
-            ats = (rec.get("at_list") or "").strip()
-            if ats:
-                for uid in ats.split(","):
-                    uid = uid.strip()
-                    if uid:
-                        at_sender_ids.add(uid)
+        reply_ids = [
+            (rec.get("reply_id") or "").strip() for rec in records
+        ]
+        reply_ids = [rid for rid in reply_ids if rid]
 
-        # 批量反查回复目标消息
         reply_map: dict[str, dict] = {}
         if reply_ids:
             for row in await self.mysql_mgr.get_messages_by_ids(reply_ids):
@@ -509,35 +500,9 @@ class WebAPI:
                 if mid and mid not in reply_map:
                     reply_map[mid] = row
 
-        # 被 @ 用户：查其最近一条消息作为上下文（限定在已入库记录内）
-        at_map: dict[str, dict] = {}
-        if at_sender_ids:
-            for uid in at_sender_ids:
-                try:
-                    rows = await self.mysql_mgr.query_messages(
-                        sender_id=uid, page=1, page_size=1
-                    )
-                except Exception:
-                    rows = {}
-                items = rows.get("records") if isinstance(rows, dict) else None
-                if items:
-                    at_map[uid] = items[0]
-
         for rec in records:
             rid = (rec.get("reply_id") or "").strip()
             rec["reply_message"] = reply_map.get(rid)
-            ats = []
-            for uid in (rec.get("at_list") or "").split(","):
-                uid = uid.strip()
-                if uid and uid in at_map:
-                    ats.append(
-                        {
-                            "sender_id": uid,
-                            "sender_name": at_map[uid].get("sender_name") or "",
-                            "content": at_map[uid].get("content") or "",
-                        }
-                    )
-            rec["at_messages"] = ats
 
     async def api_purge_challenge(self):
         """生成随机加减法验证题，用于清空所有数据前的二次确认。"""

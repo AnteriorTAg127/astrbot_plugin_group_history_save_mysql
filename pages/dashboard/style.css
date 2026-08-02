@@ -491,7 +491,6 @@ body {
 }
 .rel-item:hover { opacity: 0.75; }
 .rel-reply { background: var(--primary-light); color: var(--primary); }
-.rel-at { background: var(--surface-hover); color: var(--text-2); }
 .rel-none { color: var(--text-3); font-size: 0.75rem; }
 
 .related-modal { max-width: 460px; }

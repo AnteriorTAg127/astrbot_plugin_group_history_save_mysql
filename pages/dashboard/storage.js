@@ -222,34 +222,28 @@ function escapeAttr(text) {
     return text.replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
-// ========== @ / 回复关联展示（v0.4.0） ==========
-// 渲染本条消息的 @ 对象与回复目标（点击查看被引用消息内容弹层）
-// 数据来自后端 api_query 的 at_messages / reply_message 关联字段
+// ========== 回复关联展示（v0.4.1） ==========
+// 渲染本条消息的回复目标（点击查看被引用消息内容弹层）
+// 数据来自后端 api_query 的 reply_message 关联字段；
+// at_list（被 @ 的 QQ）仅存储、不反查展示（@ ID 无法可靠反查消息）
 function renderRelations(r) {
-    const parts = [];
     const reply = r.reply_message;
     if (reply && reply.sender_id) {
-        parts.push(
-            `<span class="rel-item rel-reply" data-kind="回复" data-sender="${escapeAttr(reply.sender_id)}" data-name="${escapeAttr(reply.sender_name || "")}" data-content="${escapeAttr(reply.content || "")}" title="查看被回复的消息">↩️ ${escapeHtml(reply.sender_name || reply.sender_id)}</span>`
+        return (
+            `<span class="rel-item rel-reply" data-kind="回复" data-sender="${escapeAttr(reply.sender_id)}" data-name="${escapeAttr(reply.sender_name || "")}" data-content="${escapeAttr(reply.content || "")}" title="查看被回复的消息">↩️ 回复了 ${escapeHtml(reply.sender_name || reply.sender_id)}</span>`
         );
     }
-    for (const at of r.at_messages || []) {
-        if (!at || !at.sender_id) continue;
-        parts.push(
-            `<span class="rel-item rel-at" data-kind="@${at.sender_id}" data-sender="${escapeAttr(at.sender_id)}" data-name="${escapeAttr(at.sender_name || "")}" data-content="${escapeAttr(at.content || "")}" title="查看 ${escapeAttr(at.sender_name || at.sender_id)} 的最近消息">@ ${escapeHtml(at.sender_name || at.sender_id)}</span>`
-        );
-    }
-    return parts.length ? parts.join(" ") : '<span class="rel-none">-</span>';
+    return '<span class="rel-none">-</span>';
 }
 
-// 点击关联项 → 弹层展示被引用消息内容（纯 textContent 防 XSS）
+// 点击回复关联 → 弹层展示被引用消息内容（纯 textContent 防 XSS）
 function showRelatedMessage(d) {
     const mask = document.getElementById("relatedModal");
     const title = document.getElementById("relatedModalTitle");
     const body = document.getElementById("relatedModalBody");
     if (!mask || !body) return;
     const who = d.name || d.sender || "未知用户";
-    title.textContent = d.kind === "回复" ? `↩️ 回复了 ${who}` : `@ 了 ${who}`;
+    title.textContent = `↩️ 回复了 ${who}`;
     body.innerHTML = "";
     body.appendChild(el("div", "rel-modal-meta", `发送者: ${d.sender}${d.name ? " · " + d.name : ""}`));
     body.appendChild(el("div", "rel-modal-content", d.content || "(无文本内容)"));
