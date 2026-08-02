@@ -663,7 +663,8 @@ class MySQLManager:
                         reply_id VARCHAR(64) DEFAULT '',
                         INDEX idx_group_time (group_id, timestamp),
                         INDEX idx_sender_time (sender_id, timestamp),
-                        INDEX idx_group_sender_time (group_id, sender_id, timestamp)
+                        INDEX idx_group_sender_time (group_id, sender_id, timestamp),
+                        INDEX idx_message_id (message_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
                 # 图片记录表
@@ -776,6 +777,31 @@ class MySQLManager:
                             logger.warning(
                                 f"[HistorySave] 表结构迁移 chat_history.{column} 失败: {e}"
                             )
+
+                    # v0.4.1：chat_history.message_id 补索引（查询/人物分析按 message_id
+                    # 批量反查被回复消息，表增大后无索引会退化为全表扫描）。
+                    # ADD INDEX 无 IF NOT EXISTS 语法，先查 INFORMATION_SCHEMA.STATISTICS
+                    # 判定索引存在与否再 ALTER，幂等可重入；MySQL 8.0 ADD INDEX 为
+                    # 在线 DDL（INPLACE），几百万行也不阻塞持续写入。
+                    try:
+                        await cur.execute(
+                            "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS"
+                            " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s"
+                            " LIMIT 1",
+                            ("chat_history", "idx_message_id"),
+                        )
+                        row = await cur.fetchone()
+                        if not row:
+                            await cur.execute(
+                                "ALTER TABLE chat_history ADD INDEX idx_message_id (message_id)"
+                            )
+                            logger.info(
+                                "[HistorySave] 表结构迁移: chat_history 已新增 idx_message_id 索引"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[HistorySave] 表结构迁移 chat_history.idx_message_id 失败: {e}"
+                        )
         except Exception as e:
             logger.error(f"[HistorySave] 表结构迁移失败（无法获取连接）: {e}")
 
