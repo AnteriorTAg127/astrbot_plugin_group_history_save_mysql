@@ -1006,7 +1006,53 @@ body {
     word-break: break-word;
 }
 
-/* 可折叠的 LLM 原始输出 */
+/* Markdown 总结内容：保留标题、列表、表格等结构并适配深色主题 */
+.detail-section-content.markdown-body {
+    white-space: normal;
+    line-height: 1.7;
+}
+
+.markdown-body :first-child { margin-top: 0; }
+.markdown-body :last-child { margin-bottom: 0; }
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body pre,
+.markdown-body table { margin: 0.55em 0; }
+.markdown-body ul,
+.markdown-body ol { padding-left: 1.5em; }
+.markdown-body blockquote {
+    padding-left: 0.8em;
+    border-left: 3px solid var(--primary);
+    color: var(--text-3);
+}
+.markdown-body code {
+    padding: 0.12em 0.35em;
+    border-radius: 4px;
+    background: var(--bg);
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.markdown-body pre {
+    padding: 10px 12px;
+    overflow: auto;
+    border-radius: 6px;
+    background: var(--bg);
+}
+.markdown-body pre code { padding: 0; background: none; }
+.markdown-body table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+}
+.markdown-body th,
+.markdown-body td {
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    text-align: left;
+}
+.markdown-body th { background: var(--surface-2); color: var(--text-1); }
+
 .detail-raw {
     margin-top: 14px;
     border: 1px dashed var(--border);

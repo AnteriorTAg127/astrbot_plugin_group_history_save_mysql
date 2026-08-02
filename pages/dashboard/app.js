@@ -1,3 +1,5 @@
+import { bindSummaryDetailEvents, openSummaryDetail } from "./summary-detail.js";
+
 const bridge = window.AstrBotPluginPage;
 await bridge.ready();
 
@@ -1221,105 +1223,6 @@ async function loadSummaryHistory(page = 1) {
     }
 }
 
-function openSummaryDetail(groupId, filename) {
-    const mask = document.getElementById("historyDetailModal");
-    const body = document.getElementById("historyDetailBody");
-    document.getElementById("historyDetailTitle").textContent = `📄 总结详情 · 群 ${groupId}`;
-    mask.style.display = "flex";
-    body.innerHTML = "";
-    body.appendChild(el("div", "loading", "加载中..."));
-    bridge
-        .apiGet("summary/history/detail", { group_id: groupId, filename })
-        .then((data) => renderSummaryDetail(body, data.detail || {}))
-        .catch((e) => {
-            // 404 → 后端消息「总结记录不存在」；记录可能已被定时清理
-            closeSummaryDetail();
-            showToast(e.message || "总结记录不存在或已被清理", "error");
-        });
-}
-
-function closeSummaryDetail() {
-    document.getElementById("historyDetailModal").style.display = "none";
-}
-
-// 详情渲染：全部文本经 el()/textContent/pre.textContent 纯文本插入，防 XSS
-function renderSummaryDetail(container, detail) {
-    container.innerHTML = "";
-
-    // 元信息行：生成时间 / 范围 / provider
-    const metaLine = el("div", "detail-meta");
-    metaLine.appendChild(el("span", null, `🕐 ${detail.generated_at || "-"}`));
-    metaLine.appendChild(el("span", null, `📐 ${detail.scope_desc || "-"}`));
-    metaLine.appendChild(el("span", null, `🤖 ${detail.provider_id || "会话回退"}`));
-    container.appendChild(metaLine);
-
-    // 统计块
-    const stats = detail.stats || {};
-    const statsGrid = el("div", "detail-stats");
-    statsGrid.appendChild(detailStatTile(String(stats.total ?? 0), "消息总数"));
-    statsGrid.appendChild(detailStatTile(String(stats.participant_count ?? 0), "参与者"));
-    statsGrid.appendChild(detailStatTile(formatTimeRange(stats.time_start, stats.time_end), "时间跨度"));
-    statsGrid.appendChild(detailStatTile(formatSources(detail.sources), "数据源构成"));
-    statsGrid.appendChild(detailStatTile(String(detail.messages_used ?? 0), "送入 LLM"));
-    container.appendChild(statsGrid);
-
-    // 截断标记
-    if (stats.truncated) {
-        container.appendChild(el("div", "detail-truncated", "⚠️ 消息过多已被截断，统计基于截断前全量"));
-    }
-
-    // 活跃排行 Top N（[sender_id, sender_name, count]）
-    const topSenders = Array.isArray(stats.top_senders) ? stats.top_senders : [];
-    if (topSenders.length > 0) {
-        const rankWrap = el("div", "detail-rank");
-        rankWrap.appendChild(el("div", "detail-subtitle", "🏆 活跃排行"));
-        const ol = el("ol", "rank-list");
-        for (const row of topSenders) {
-            const sid = row?.[0] ?? "";
-            const sname = row?.[1] ?? "";
-            const count = row?.[2] ?? 0;
-            const li = el("li", "rank-item");
-            li.appendChild(el("span", "rank-name", String(sname || sid || "未知用户")));
-            if (sname && sid) li.appendChild(el("span", "rank-id", String(sid)));
-            li.appendChild(el("span", "rank-count", `${count} 条`));
-            ol.appendChild(li);
-        }
-        rankWrap.appendChild(ol);
-        container.appendChild(rankWrap);
-    }
-
-    // 各板块（[标题, 内容]，内容按换行渲染：white-space: pre-wrap + textContent）
-    const sections = Array.isArray(detail.sections) ? detail.sections : [];
-    if (sections.length > 0) {
-        const secs = el("div", "detail-sections");
-        for (const sec of sections) {
-            const block = el("div", "detail-section");
-            block.appendChild(el("div", "detail-section-title", String(sec?.[0] ?? "")));
-            block.appendChild(el("div", "detail-section-content", String(sec?.[1] ?? "")));
-            secs.appendChild(block);
-        }
-        container.appendChild(secs);
-    }
-
-    // 可折叠的 LLM 原始输出（textContent 赋值，绝不 innerHTML）
-    if (detail.raw_llm_text) {
-        const fold = document.createElement("details");
-        fold.className = "detail-raw";
-        fold.appendChild(el("summary", null, "查看 LLM 原始输出"));
-        const pre = el("pre", "detail-raw-text");
-        pre.textContent = String(detail.raw_llm_text);
-        fold.appendChild(pre);
-        container.appendChild(fold);
-    }
-}
-
-function detailStatTile(value, label) {
-    const tile = el("div", "detail-stat-tile");
-    tile.appendChild(el("div", "detail-stat-value", value));
-    tile.appendChild(el("div", "detail-stat-label", label));
-    return tile;
-}
-
 // ========== v0.3 事件绑定 ==========
 function bindSummaryEvents() {
     // 总结设置
@@ -1348,12 +1251,7 @@ function bindSummaryEvents() {
     });
     document.getElementById("historyNextBtn").addEventListener("click", () => loadSummaryHistory(historyPage + 1));
 
-    // 详情弹窗：点击遮罩或「关闭」按钮关闭
-    const detailMask = document.getElementById("historyDetailModal");
-    detailMask.addEventListener("click", (e) => {
-        if (e.target === detailMask) closeSummaryDetail();
-    });
-    document.getElementById("historyDetailCloseBtn").addEventListener("click", closeSummaryDetail);
+    bindSummaryDetailEvents();
 
     // 备用模型多选弹窗：仅按钮关闭，点遮罩/卡片内部均不关闭（防误触丢失排序）
     const pmMask = document.getElementById("providerMultiModal");
