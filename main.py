@@ -90,22 +90,25 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config
 
         # 初始化 MySQL 管理器（动态连接池）
+        # config 可能为 None（框架在 _conf_schema.json 缺失时以 config=None 实例化插件），
+        # 统一用空 dict 兜底，保证默认值生效
+        cfg = config or {}
         self.mysql_mgr = MySQLManager(
-            host=config.get("mysql_host", "127.0.0.1"),
-            port=config.get("mysql_port", 3306),
-            user=config.get("mysql_user", "root"),
-            password=config.get("mysql_password", ""),
-            database=config.get("mysql_database", "astrbot_history"),
-            pool_min_size=config.get("pool_min_size", 1),
-            pool_max_size=config.get("pool_max_size", 10),
-            pool_idle_timeout=config.get("pool_idle_timeout", 120),
-            pool_timeout=config.get("pool_timeout", 30),
-            pool_ping_cooldown=config.get("pool_ping_cooldown", 5),
+            host=cfg.get("mysql_host", "127.0.0.1"),
+            port=cfg.get("mysql_port", 3306),
+            user=cfg.get("mysql_user", "root"),
+            password=cfg.get("mysql_password", ""),
+            database=cfg.get("mysql_database", "astrbot_history"),
+            pool_min_size=cfg.get("pool_min_size", 1),
+            pool_max_size=cfg.get("pool_max_size", 10),
+            pool_idle_timeout=cfg.get("pool_idle_timeout", 120),
+            pool_timeout=cfg.get("pool_timeout", 30),
+            pool_ping_cooldown=cfg.get("pool_ping_cooldown", 5),
         )
 
         # 初始化本地配置管理器
