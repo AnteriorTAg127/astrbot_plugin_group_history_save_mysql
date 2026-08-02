@@ -1,6 +1,6 @@
 # astrbot_plugin_group_history_save_mysql
 
-将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）。
+将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）。
 
 ## 功能
 
@@ -20,6 +20,10 @@
 - 👍 总结触发反馈（v0.3.1 新增）：指令生效后即时确认（默认贴表情回应，协议端不支持时自动降级文字提示，可配文字模式或关闭）
 - 🎨 自研图片报告模板（v0.3.2 新增）：文转图改用与管理面板同款风格的自研模板，支持多路 JS CDN 容灾（国内镜像优先，自动切换）、Markdown 表格渲染、发言人排行柱状图、白天/夜间自动主题（时间可调）、渲染超时可配；移动端字号友好
 - 🔀 备用模型列表弹窗（v0.3.2 新增）：原长复选框改为点击弹窗，降级顺序可拖拽排序、可选模型滚动勾选，点遮罩不关闭
+- 👤 人物分析（v0.4.0 新增）：聊天指令 `/人物分析 [@成员 或 QQ号]`（别名 `/人物画像`、`/分析TA`），分析群成员发言习惯、活动时间、性格、爱好与人物关系
+- 🌐 跨群分析（v0.4.0 新增）：仅 Web 后台「人物分析」分区提供（按全体已保存群分析），聊天指令仅分析当前群
+- 🧩 分析触发（v0.4.0 新增）：支持 @ 成员或直接输入 QQ 号触发；默认仅管理员可用（可配置）；分析报告含「本报告基于公开群聊记录由 AI 生成，仅为推测，仅供参考」免责声明
+- 💾 存储扩展（v0.4.0 新增）：`chat_history` 表新增 `at_list` / `reply_id` 列（自动迁移），记录 @ 对象与回复目标，供人物关系分析使用
 
 ## 安装
 
@@ -94,6 +98,18 @@ SHOW TABLES;
 - 功能总开关关闭（`summary_enabled=false`）：回复「功能未启用」
 - 用户/群冷却中再次触发：回复剩余等待秒数
 
+### 人物分析指令（v0.4.0 新增）
+
+| 指令 | 别名 | 参数 | 说明 |
+|------|------|------|------|
+| /人物分析 | /人物画像、/分析TA | `[@成员 或 QQ号]` | 分析群成员发言习惯与人物画像（AI 推测，仅供参考） |
+
+- 触发方式：@ 群成员（自动剔除 `all` 与 bot 自身）或直接输入纯数字 QQ 号；两者皆无时回复用法提示
+- 权限：默认仅管理员可用（`profile_permission=admin`，可配为 `all` 全员可用）
+- 范围：仅分析当前群；跨群（全部已保存群）分析请在 Web 后台「人物分析 → 发起分析」tab 发起
+- 输出形式：`profile_output_mode` 支持合并转发 / 图片 / 纯文本三种模式（默认合并转发）
+- 报告含免责声明「本报告基于公开群聊记录由 AI 生成，仅为推测，仅供参考」
+
 ## Web 管理后台
 
 安装插件后，在 AstrBot WebUI 的插件详情页可以打开管理面板：
@@ -107,6 +123,10 @@ SHOW TABLES;
 - **总结设置**（v0.3 新增）：总结功能全部 24 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储 / 图片渲染）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
 - **忽略管理**（v0.3 新增）：按群增删查忽略发送者，被忽略者的消息不参与总结
 - **历史总结**（v0.3 新增）：按群浏览已保存的总结 JSON，弹层查看总结详情（统计块 + LLM 摘要 + 元数据）
+- **人物分析**（v0.4.0 新增）：后台第三分区，三个 tab——
+  - **分析设置**：人物分析全部 19 项配置的分组表单（总开关/权限/输出模式/LLM/参数上限/维度开关/冷却/反馈/保留天数）、分析专用 LLM 提供商下拉、备用模型列表
+  - **发起分析**：选择分析范围（单群或全部群）与目标成员，跨群分析仅此处提供，可浏览群列表；@/QQ 目标选择
+  - **历史分析**：按范围浏览已保存的分析结果 JSON，查看详情与删除
 
 ## 总结功能配置说明（v0.3 新增）
 
@@ -142,6 +162,37 @@ SHOW TABLES;
 | summary_t2i_cdn_providers | list（JSON 存储） | ["bootcdn","npmmirror","staticfile","jsdelivr","unpkg"] | 图片模板加载 Markdown/图表脚本的 CDN 尝试顺序，国内镜像优先，单节点失败自动切换 |
 
 占位符说明：`{stats}` 统计块、`{messages}` 格式化消息列表（每行 `[时间] 昵称: 内容`）、`{time_range}` 时间范围描述、`{group_id}` 群号、`{format_constraint}` 按输出模式注入的格式约束（合并转发=禁用 Markdown / 文转图=可用 Markdown）。
+
+## 人物分析配置说明（v0.4.0 新增）
+
+> 人物分析全部 19 项配置存入 config.db 新增的 `profile_settings` 表（key/value 形式，列表值 JSON 序列化），
+> **不进入 `_conf_schema.json`**（插件原有配置保持不变）。配置仅在 dashboard「人物分析 → 分析设置」tab 修改，
+> 改后即时生效，无需重启插件；默认值由 `ConfigManager` 初始化时自动播种。
+
+| 配置键 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| profile_enabled | bool | true | 功能总开关 |
+| profile_permission | string | admin | 指令权限：`admin`=仅管理员 / `all`=所有人 |
+| profile_output_mode | string | forward | 输出形式：`forward`=合并转发 / `image`=图片（自研模板渲染）/ `text`=纯文本 |
+| profile_provider | string（页内下拉） | "" | 分析专用 LLM 提供商（主选）；未配置时使用当前会话模型 |
+| profile_fallback_providers | list（JSON 存储） | [] | 备用分析模型列表，主选失败后按序尝试，全部失败回退会话模型 |
+| profile_max_count | int | 2000 | 单次分析最大消息条数 |
+| profile_max_prompt_chars | int | 60000 | 素材长度预算（送入 LLM 的完整提示词字符上限），超出从最旧消息开始截断，统计仍基于全量 |
+| profile_relation_context | bool | true | 关系上下文开关：开启后双向识别目标↔他人的 @/回复互动对象 |
+| profile_relation_max_partners | int | 10 | 互动对象上下文最大人数（Top N） |
+| profile_dim_habits | bool | true | 分析维度开关：发言习惯 |
+| profile_dim_activity | bool | true | 分析维度开关：活动时间（24h / 星期分布图表） |
+| profile_dim_personality | bool | true | 分析维度开关：性格（AI 推测） |
+| profile_dim_hobbies | bool | true | 分析维度开关：兴趣爱好（AI 推测） |
+| profile_dim_relations | bool | true | 分析维度开关：人物关系（AI 推测） |
+| profile_user_cooldown | int | 60 | 同一用户两次触发的最小间隔（秒） |
+| profile_group_cooldown | int | 30 | 同一群两次分析的最小间隔（秒） |
+| profile_feedback_mode | string | reaction | 触发反馈模式：reaction 贴表情 / text 文字提示 / none 关闭 |
+| profile_feedback_text | string | 正在生成人物画像，请稍候… | 文字反馈文案（reaction 降级时同用） |
+| profile_keep_days | int | 30 | 分析结果 JSON 保留天数，定时任务每日清理过期文件 |
+
+> 图片渲染复用总结功能的 `summary_t2i_*` 共享配置（主题 auto/light/dark、时段、超时、CDN 节点顺序），不新增 profile 专用渲染键。
+> 关闭的分析维度不进提示词、不渲染；关闭「人物关系」后不再拉取关系上下文，只基于目标自身消息分析。
 
 ## 总结工作原理（v0.3 新增）
 
@@ -192,6 +243,20 @@ SHOW TABLES;
 | summary/storage.py | 总结 JSON 持久化（按群分目录、列表、读取、过期清理） |
 | summary/scheduler.py | 定时清理任务（每天清理过期 JSON） |
 
+### 人物分析模块（v0.4.0 新增）
+
+| 模块 | 职责 |
+|------|------|
+| profile/service.py | 编排层：指令与 Web 共用入口、权限/限流校验、流程串联、目标解析 |
+| profile/fetcher.py | 数据获取：单群 MySQL 分页 + OneBot 补齐 / 跨群全局拉取 + 关系上下文双向识别 |
+| profile/stats.py | 确定性统计引擎：24h/星期分布、发言长度、emoji 率、互动排行等 |
+| profile/analyzer.py | AI 分析：独立 provider 降级链、长度预算截断、五维度开关 prompt、四板块宽松切分 |
+| profile/formatter.py | 输出格式化：合并转发 / 图片 / 纯文本三模式 |
+| profile/t2i_render.py | 人物报告图片渲染核心（复用 summary_t2i_* 渲染配置） |
+| profile/templates/profile_report.html | 自研人物报告模板（双主题 + 活动分布图表 + CDN 容灾加载器 + 免责声明页脚） |
+| profile/storage.py | 分析结果 JSON 持久化（按范围分目录、确定性文件名、列表/读取/删除/过期清理） |
+| profile/scheduler.py | 定时清理任务（每天清理过期分析文件） |
+
 ## 数据库表结构
 
 > 群号与 QQ 号均以文本（`VARCHAR(32)`）存储。从 v0.1 升级时插件会自动检测旧表并执行
@@ -209,6 +274,8 @@ SHOW TABLES;
 | message_type | VARCHAR(16) | 类型（text/mixed） |
 | content | TEXT | 文本内容 |
 | message_id | VARCHAR(64) | 消息 ID |
+| at_list | TEXT（JSON） | @ 对象列表（v0.4.0 新增，旧表自动 ALTER 迁移） |
+| reply_id | VARCHAR(64) | 回复目标消息 ID（v0.4.0 新增，旧表自动 ALTER 迁移，可空） |
 
 **索引**：
 - `idx_group_time` (group_id, timestamp)
@@ -234,10 +301,18 @@ SHOW TABLES;
 
 | 表名 | 说明 |
 |------|------|
-| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），19 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
+| summary_settings | 总结功能配置（key TEXT PRIMARY KEY, value TEXT），24 项总结配置均存于此，仅 dashboard「总结设置」tab 修改 |
 | group_ignore_senders | 每群忽略发送者（group_id, sender_id, created_at，group_id + sender_id 联合唯一约束） |
 
-> 总结结果不入库，以 JSON 文件持久化，路径与清理策略见上文「总结工作原理 → 结果持久化」。
+### config.db 新增表（v0.4.0 新增）
+
+| 表名 | 说明 |
+|------|------|
+| profile_settings | 人物分析配置（key TEXT PRIMARY KEY, value TEXT），19 项分析配置均存于此，仅 dashboard「人物分析 → 分析设置」tab 修改 |
+
+> 分析结果不入库，以 JSON 文件持久化：`data/plugin_data/astrbot_plugin_group_history_save_mysql/profiles/<scope目录>/<文件名>.json`，
+> 按范围分子目录（`group_<群号>` / `all`），文件名含生成时间与目标 QQ 号，保留天数 `profile_keep_days`（默认 30 天），
+> 定时任务每日清理过期文件。
 
 ## 支持平台
 

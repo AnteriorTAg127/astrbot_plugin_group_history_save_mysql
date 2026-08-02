@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.3.3">
+    <link rel="stylesheet" href="./style.css?v=0.4.0">
 </head>
 <body>
     <div class="app">
@@ -19,7 +19,7 @@
             </div>
         </header>
 
-        <!-- 顶层功能分区：存储库 / 消息总结（滑动高光分段控件） -->
+        <!-- 顶层功能分区：存储库 / 消息总结 / 人物分析（滑动高光分段控件） -->
         <div class="scope-switch" role="tablist" aria-label="功能分区">
             <button class="scope-btn active" data-scope="storage" role="tab" aria-selected="true">
                 <span class="scope-ico" aria-hidden="true">🗄️</span>
@@ -28,6 +28,10 @@
             <button class="scope-btn" data-scope="summary" role="tab" aria-selected="false">
                 <span class="scope-ico" aria-hidden="true">🧠</span>
                 <span class="scope-label">消息总结</span>
+            </button>
+            <button class="scope-btn" data-scope="profile" role="tab" aria-selected="false">
+                <span class="scope-ico" aria-hidden="true">👤</span>
+                <span class="scope-label">人物分析</span>
             </button>
             <span class="scope-glow" aria-hidden="true"></span>
         </div>
@@ -45,6 +49,13 @@
             <button class="tab" data-tab="summary-settings">总结设置</button>
             <button class="tab" data-tab="ignore">忽略管理</button>
             <button class="tab" data-tab="summary-history">历史总结</button>
+        </nav>
+
+        <!-- 人物分析子 Tab（v0.4.0 三 tab 归入此分区） -->
+        <nav class="tabs tabs-profile hidden">
+            <button class="tab" data-tab="profile-settings">分析设置</button>
+            <button class="tab" data-tab="profile-launch">发起分析</button>
+            <button class="tab" data-tab="profile-history">历史分析</button>
         </nav>
 
         <!-- 概览页 -->
@@ -331,6 +342,76 @@
                 </div>
             </div>
         </section>
+
+        <!-- 人物分析设置页（v0.4.0）：19 项配置由 profile-settings.js 按分组动态渲染 -->
+        <section class="page" id="page-profile-settings">
+            <div class="section-card">
+                <div class="section-title"><span>👤 人物分析设置</span></div>
+                <div id="profileSettingsForm">
+                    <div class="loading">加载中...</div>
+                </div>
+                <div class="summary-actions">
+                    <button id="saveProfileBtn" class="btn btn-primary">保存全部</button>
+                    <button id="resetProfileAllBtn" class="btn btn-ghost">恢复全部默认</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 发起分析页（v0.4.0）：QQ号 + 范围下拉 + 触发，结果内联渲染（含活动图表） -->
+        <section class="page" id="page-profile-launch">
+            <div class="section-card">
+                <div class="section-title"><span>🚀 发起人物分析</span></div>
+                <div class="setting-desc profile-launch-hint">
+                    对指定 QQ 号在所选范围内的发言进行人物画像分析（发言习惯 / 活动时间 / 性格 / 爱好 / 人物关系）。
+                    包含 LLM 调用，耗时可能数十秒；全局范围仅基于已保存的群聊数据。分析完成后结果自动保存到「历史分析」。
+                </div>
+                <div class="profile-launch-bar">
+                    <input type="text" id="profileSenderId" placeholder="输入目标 QQ 号（纯数字）" class="input" inputmode="numeric" autocomplete="off">
+                    <select id="profileGroupSelect" class="input input-select profile-scope-select">
+                        <option value="all">全局（所有已保存的群）</option>
+                    </select>
+                    <button id="profileLaunchBtn" class="btn btn-primary">开始分析</button>
+                </div>
+                <div id="profileLaunchResult"></div>
+            </div>
+        </section>
+
+        <!-- 历史分析页（v0.4.0）：分页列表 + 详情弹层（复用结果渲染器）+ 删除 -->
+        <section class="page" id="page-profile-history">
+            <div class="section-card">
+                <div class="section-title">
+                    <span>🗂️ 历史分析</span>
+                    <button id="profileHistoryRefreshBtn" class="btn btn-ghost btn-sm">↻ 刷新</button>
+                </div>
+                <div class="query-meta">
+                    <span id="profileHistoryInfo"></span>
+                </div>
+                <div class="table-wrap">
+                    <table id="profileHistoryTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>目标昵称</th>
+                                <th>QQ</th>
+                                <th>范围</th>
+                                <th>时间</th>
+                                <th>Provider</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="profileHistoryTableBody"></tbody>
+                    </table>
+                    <div id="profileHistoryEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>暂无人物分析记录，去「发起分析」生成第一份人物画像吧</p>
+                    </div>
+                </div>
+                <div class="pagination" id="profileHistoryPagination" style="display:none;">
+                    <button id="profileHistoryPrevBtn" class="btn btn-ghost">← 上一页</button>
+                    <span id="profileHistoryPageInfo" class="page-info">1 / 1</span>
+                    <button id="profileHistoryNextBtn" class="btn btn-ghost">下一页 →</button>
+                </div>
+            </div>
+        </section>
     </div>
 
     <!-- 清空验证弹窗 -->
@@ -358,10 +439,21 @@
         </div>
     </div>
 
-    <!-- 备用模型多选弹窗（v0.3.2）：滚动勾选 + 拖拽排序；点遮罩不关闭 -->
+    <!-- 人物分析详情弹窗（v0.4.0）：复用发起分析的结果渲染器（统计卡 + 活动图表 + 板块 Markdown + 免责声明） -->
+    <div class="modal-mask" id="profileDetailModal" style="display:none;">
+        <div class="modal-card modal-lg">
+            <div class="modal-title" id="profileDetailTitle">👤 人物分析详情</div>
+            <div id="profileDetailBody" class="detail-body"></div>
+            <div class="modal-actions">
+                <button id="profileDetailCloseBtn" class="btn btn-ghost">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 备用模型多选弹窗（v0.3.2，v0.4.0 起总结/人物分析共用）：滚动勾选 + 拖拽排序；点遮罩不关闭 -->
     <div class="modal-mask" id="providerMultiModal" style="display:none;">
         <div class="modal-card modal-lg">
-            <div class="modal-title">🔀 备用总结模型 · 降级顺序</div>
+            <div class="modal-title" id="providerMultiModalTitle">🔀 备用总结模型 · 降级顺序</div>
             <div class="modal-desc">勾选模型加入备用列表，<strong>拖动 ⠿ 手柄</strong>调整降级顺序（从上到下逐个尝试，全部失败回退会话模型）。点击弹窗外部不会关闭，请用下方按钮。</div>
             <div class="pm-selected">
                 <div class="pm-zone-title">降级顺序 <span class="pm-badge" id="pmSelectedCount">0</span></div>
@@ -383,6 +475,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="./app.js?v=0.3.3"></script>
+    <script type="module" src="./app.js?v=0.4.0"></script>
 </body>
 </html>

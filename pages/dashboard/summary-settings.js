@@ -171,7 +171,7 @@ function buildSummaryItem(meta, rawValue) {
             const trigger = el("button", "btn btn-ghost provider-multi-trigger");
             trigger.type = "button";
             control.appendChild(trigger);
-            refreshProviderMultiTrigger(trigger, selected);
+            refreshProviderMultiTrigger(trigger, selected, summaryProviders);
             trigger.addEventListener("click", () => openProviderMultiModal(meta.key, trigger));
             break;
         }
@@ -274,22 +274,37 @@ function csvToArray(text) {
 //   上「降级顺序」= 已选模型，可拖拽排序（顺序即后端降级调用顺序）；
 //   下「可选模型」= 全量 provider 滚动勾选，勾选加入顺序区、取消则移除。
 // 弹窗不可点遮罩关闭（仅 取消/完成 按钮），避免误触丢失排序。
+// v0.4.0：组件泛化为总结/人物分析共用 —— 调用方经 openProviderMultiModalEx
+// 传入各自上下文（表单选择器/providers/弹窗标题），弹窗状态全部挂 mask。
+
+// 弹窗当前上下文的 providers（渲染弹窗内行时使用；未打开时回退总结 providers）
+function activePmProviders() {
+    const mask = document.getElementById("providerMultiModal");
+    if (mask && Array.isArray(mask._pmProviders)) return mask._pmProviders;
+    return summaryProviders || [];
+}
 
 // id → 展示名（providers 拉取后构建；失效 id 回退原值）
 function providerNameOf(id) {
-    const p = (summaryProviders || []).find((x) => x.id === id);
+    const p = activePmProviders().find((x) => x.id === id);
     return p ? p.name || p.id : id;
 }
 
 // 刷新触发按钮摘要文案（已选数量 + 前两个名称，或「未配置」提示）
-function refreshProviderMultiTrigger(trigger, ids) {
+// providers 显式传入（fill/collect 场景弹窗未打开，不能依赖 mask 上下文）
+function refreshProviderMultiTrigger(trigger, ids, providers) {
     if (!trigger) return;
+    const provs = Array.isArray(providers) ? providers : summaryProviders || [];
+    const nameOf = (id) => {
+        const p = provs.find((x) => x.id === id);
+        return p ? p.name || p.id : id;
+    };
     const arr = Array.isArray(ids) ? ids : [];
     if (arr.length === 0) {
         trigger.innerHTML = '<span class="pm-trigger-empty">未配置（回退会话模型）</span><span class="pm-trigger-edit">编辑 ›</span>';
         return;
     }
-    const head = arr.slice(0, 2).map(providerNameOf).join("、");
+    const head = arr.slice(0, 2).map(nameOf).join("、");
     const more = arr.length > 2 ? ` 等 ${arr.length} 个` : "";
     trigger.innerHTML =
         `<span class="pm-trigger-count">${arr.length}</span>` +
@@ -297,17 +312,34 @@ function refreshProviderMultiTrigger(trigger, ids) {
         `<span class="pm-trigger-edit">编辑 ›</span>`;
 }
 
-// 打开弹窗：以隐藏 input 当前值为工作副本渲染两区
-function openProviderMultiModal(key, trigger) {
+// 泛化入口（v0.4.0）：ctx = { formSelector, key, trigger, providers, title }
+// 表单选择器决定「完成」时写回哪个隐藏 input，providers 决定两区行内容
+function openProviderMultiModalEx(ctx) {
     const mask = document.getElementById("providerMultiModal");
-    if (!mask) return;
-    const hidden = document.querySelector(`#summarySettingsForm [data-key="${key}"]`);
+    if (!mask || !ctx) return;
+    const formSelector = ctx.formSelector || "#summarySettingsForm";
+    const hidden = document.querySelector(`${formSelector} [data-key="${ctx.key}"]`);
     const selected = hidden ? parseProviderMultiValue(hidden.value) : [];
-    mask.dataset.key = key;
-    mask._pmTrigger = trigger;
+    mask.dataset.key = ctx.key;
+    mask._pmFormSelector = formSelector;
+    mask._pmProviders = Array.isArray(ctx.providers) ? ctx.providers : [];
+    mask._pmTrigger = ctx.trigger || null;
     mask._pmSelected = selected.slice();
+    const title = document.getElementById("providerMultiModalTitle");
+    if (title) title.textContent = ctx.title || "🔀 备用总结模型 · 降级顺序";
     renderProviderMultiModal();
     mask.style.display = "flex";
+}
+
+// 打开弹窗：以隐藏 input 当前值为工作副本渲染两区（总结分区专用入口，保持原签名）
+function openProviderMultiModal(key, trigger) {
+    openProviderMultiModalEx({
+        formSelector: "#summarySettingsForm",
+        key,
+        trigger,
+        providers: summaryProviders,
+        title: "🔀 备用总结模型 · 降级顺序",
+    });
 }
 
 function closeProviderMultiModal() {
@@ -315,15 +347,16 @@ function closeProviderMultiModal() {
     if (mask) mask.style.display = "none";
 }
 
-// 完成：写回隐藏 input + 刷新触发摘要
+// 完成：写回隐藏 input + 刷新触发摘要（写回目标表单由 mask._pmFormSelector 决定）
 function confirmProviderMultiModal() {
     const mask = document.getElementById("providerMultiModal");
     if (!mask) return;
     const key = mask.dataset.key;
     const order = mask._pmSelected || [];
-    const hidden = document.querySelector(`#summarySettingsForm [data-key="${key}"]`);
+    const formSelector = mask._pmFormSelector || "#summarySettingsForm";
+    const hidden = document.querySelector(`${formSelector} [data-key="${key}"]`);
     if (hidden) hidden.value = JSON.stringify(order);
-    refreshProviderMultiTrigger(mask._pmTrigger, order);
+    refreshProviderMultiTrigger(mask._pmTrigger, order, mask._pmProviders);
     closeProviderMultiModal();
 }
 
@@ -347,8 +380,9 @@ function renderProviderMultiModal() {
     if (countEl) countEl.textContent = String(selected.length);
 
     // 可选区：未选 provider + 已失效项（在 selected 但不在 providers 中者已在顺序区显示，此处不重复）
-    const known = new Set((summaryProviders || []).map((p) => p.id));
-    const avail = (summaryProviders || []).filter((p) => !selSet.has(p.id));
+    const providers = activePmProviders();
+    const known = new Set(providers.map((p) => p.id));
+    const avail = providers.filter((p) => !selSet.has(p.id));
     if (avail.length === 0) {
         availableZone.appendChild(el("div", "pm-zone-empty", selected.length ? "其余模型均已加入顺序" : "暂无可用提供商"));
     } else {
@@ -360,7 +394,7 @@ function renderProviderMultiModal() {
 
 // 构造一行：selected=true → 拖拽手柄 + 序号 + 名称 + 移除(×)；false → 复选框 + 名称
 function buildPmRow(id, selected, idx, total) {
-    const stale = !(summaryProviders || []).some((p) => p.id === id);
+    const stale = !activePmProviders().some((p) => p.id === id);
     const row = el("div", "pm-row" + (selected ? " pm-row-selected" : "") + (stale ? " pm-row-stale" : ""));
     row.dataset.id = id;
     if (selected) {
@@ -454,7 +488,7 @@ function fillSummaryForm(settings) {
             const ids = parseProviderMultiValue(raw);
             ctrl.value = JSON.stringify(ids);
             const trig = ctrl.parentElement?.querySelector(".provider-multi-trigger");
-            if (trig) refreshProviderMultiTrigger(trig, ids);
+            if (trig) refreshProviderMultiTrigger(trig, ids, summaryProviders);
         }
         else ctrl.value = String(raw ?? "");
     }
@@ -598,4 +632,11 @@ function bindSummarySettingsEvents() {
     }
 }
 
-export { loadSummarySettings, bindSummarySettingsEvents };
+export {
+    loadSummarySettings,
+    bindSummarySettingsEvents,
+    // v0.4.0：备用模型弹窗组件供人物分析设置复用（总结/人物分析共用同一弹窗 DOM）
+    openProviderMultiModalEx,
+    refreshProviderMultiTrigger,
+    parseProviderMultiValue,
+};

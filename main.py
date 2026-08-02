@@ -15,6 +15,8 @@ from astrbot.api.star import Context, Star, register
 from .cleaner import ImageCleaner
 from .db_config import ConfigManager
 from .db_mysql import MySQLManager
+from .profile.capture import extract_at_targets, extract_reply_id
+from .profile.service import ProfileService
 from .summary import SummaryService
 from .web_api import WebAPI
 
@@ -82,8 +84,8 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
-    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）",
-    "0.3.3",
+    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）",
+    "0.4.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -117,13 +119,20 @@ class GroupHistoryPlugin(Star):
             context, self.config_mgr, self.mysql_mgr, self
         )
 
-        # 初始化 Web API（注入总结存储实例供总结历史端点使用）
+        # 初始化人物分析服务（v0.4，须在 WebAPI 之前构造，以便注入服务与其存储实例）
+        self.profile_service = ProfileService(
+            context, self.config_mgr, self.mysql_mgr, self
+        )
+
+        # 初始化 Web API（注入总结存储实例供总结历史端点使用，注入人物分析服务与存储实例）
         self.web_api = WebAPI(
             context,
             self.mysql_mgr,
             self.config_mgr,
             self.cleaner,
             summary_storage=self.summary_service.storage,
+            profile_service=self.profile_service,
+            profile_storage=self.profile_service.storage,
         )
 
         self._initialized = False
@@ -173,6 +182,11 @@ class GroupHistoryPlugin(Star):
                         await self.summary_service.start()
                     except Exception as e:
                         logger.error(f"[HistorySummary] 启动总结服务失败: {e}")
+                    # 启动人物分析清理调度器（失败仅记日志，不阻断插件启动）
+                    try:
+                        await self.profile_service.start()
+                    except Exception as e:
+                        logger.error(f"[Profile] 启动人物分析服务失败: {e}")
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )
@@ -256,6 +270,11 @@ class GroupHistoryPlugin(Star):
             if image_count > 0 and not image_urls:
                 logger.warning("[HistorySave] 图片消息未能提取到原始链接,已跳过入库")
 
+            # 提取 @ 对象与回复目标（v0.4 人物分析关系数据基础；防御式纯函数，失败为空不阻断）
+            at_targets = extract_at_targets(message_chain)
+            at_list_str = ",".join(at_targets)
+            reply_id = extract_reply_id(event)
+
             if not text_parts and not image_urls:
                 return
 
@@ -268,6 +287,8 @@ class GroupHistoryPlugin(Star):
                     text_parts,
                     image_urls,
                     message_id,
+                    at_list=at_list_str,
+                    reply_id=reply_id,
                 )
                 return
 
@@ -278,6 +299,8 @@ class GroupHistoryPlugin(Star):
                 text_parts,
                 image_urls,
                 message_id,
+                at_list=at_list_str,
+                reply_id=reply_id,
             )
 
         except Exception as e:
@@ -291,6 +314,8 @@ class GroupHistoryPlugin(Star):
         text_parts: list[str],
         image_urls: list[str],
         message_id: str,
+        at_list: str = "",
+        reply_id: str = "",
     ):
         """MySQL 初始化窗口内缓冲消息，待初始化成功后补录。
 
@@ -312,6 +337,8 @@ class GroupHistoryPlugin(Star):
                 "text_parts": text_parts,
                 "image_urls": image_urls,
                 "message_id": message_id,
+                "at_list": at_list,
+                "reply_id": reply_id,
             }
         )
 
@@ -323,6 +350,8 @@ class GroupHistoryPlugin(Star):
         text_parts: list[str],
         image_urls: list[str],
         message_id: str,
+        at_list: str = "",
+        reply_id: str = "",
     ):
         """将一条已解析的消息写入 MySQL（文本记录 + 图片记录）。"""
         # 保存文本消息
@@ -336,6 +365,8 @@ class GroupHistoryPlugin(Star):
                 message_type=msg_type,
                 content=content,
                 message_id=message_id,
+                at_list=at_list,
+                reply_id=reply_id,
             )
 
         # 保存图片记录
@@ -366,6 +397,8 @@ class GroupHistoryPlugin(Star):
                     record["text_parts"],
                     record["image_urls"],
                     record["message_id"],
+                    at_list=record.get("at_list", ""),
+                    reply_id=record.get("reply_id", ""),
                 )
                 ok += 1
             except Exception as e:
@@ -503,6 +536,11 @@ class GroupHistoryPlugin(Star):
         """按时间范围总结群聊记录。用法: /消息总结时间 <时长>，如 /消息总结时间 24h 或 1d"""
         await self.summary_service.handle_window_command(event, arg)
 
+    @filter.command("人物分析", alias={"人物画像", "分析TA"})
+    async def profile_analyze(self, event: AstrMessageEvent, arg: str = ""):
+        """分析群成员发言习惯与人物画像。用法: /人物分析 [@成员 或 QQ号]"""
+        await self.profile_service.handle_command(event, arg)
+
     def _resolve_group_id(
         self, event: AstrMessageEvent, group_id_str: str
     ) -> int | None:
@@ -533,6 +571,11 @@ class GroupHistoryPlugin(Star):
         # 停止总结清理调度器（与 cleaner 停止并列，吞 CancelledError 不阻塞后续清理）
         try:
             await self.summary_service.stop()
+        except asyncio.CancelledError:
+            pass
+        # 停止人物分析清理调度器（与总结停止并列，吞 CancelledError 不阻塞后续清理）
+        try:
+            await self.profile_service.stop()
         except asyncio.CancelledError:
             pass
         await self.cleaner.stop()

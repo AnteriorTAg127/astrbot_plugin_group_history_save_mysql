@@ -218,3 +218,6 @@ CLAUDE.md
 # OS files
 .DS_Store
 Thumbs.db
+
+# 运行时数据（配置缓存/模板产物），不入库
+/data/

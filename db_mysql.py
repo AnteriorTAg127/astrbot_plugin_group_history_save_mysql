@@ -659,6 +659,8 @@ class MySQLManager:
                         message_type VARCHAR(16) DEFAULT 'text',
                         content TEXT,
                         message_id VARCHAR(64) DEFAULT '',
+                        at_list VARCHAR(512) DEFAULT '',
+                        reply_id VARCHAR(64) DEFAULT '',
                         INDEX idx_group_time (group_id, timestamp),
                         INDEX idx_sender_time (sender_id, timestamp),
                         INDEX idx_group_sender_time (group_id, sender_id, timestamp)
@@ -679,15 +681,18 @@ class MySQLManager:
                 """)
 
     async def _migrate_schema(self):
-        """将 v0.1 旧表结构迁移到 v0.2 新结构。
+        """将旧表结构迁移到当前版本。
 
         检测并迁移内容：
-        - chat_history / image_records 的 group_id、sender_id 列若不是字符串类型
+        - v0.2：chat_history / image_records 的 group_id、sender_id 列若不是字符串类型
           （varchar/char/text），MODIFY 为 VARCHAR(32) NOT NULL
           （MySQL 会自动把已有数字值转为字符串，不丢数据，列上索引自动重建）
-        - image_records 缺少 sender_name 列时自动 ADD COLUMN
+        - v0.2：image_records 缺少 sender_name 列时自动 ADD COLUMN
+        - v0.4.0：chat_history 缺少 at_list / reply_id 列时自动 ADD COLUMN
+          （人物分析所需 @ 对象 / 回复目标标记；MySQL 无 ADD COLUMN IF NOT EXISTS
+          语法，先查 INFORMATION_SCHEMA.COLUMNS 判定缺列再 ALTER，重复执行幂等）
 
-        每一步独立 try/except 包裹，失败仅记录 error 日志，
+        每一步独立 try/except 包裹，失败仅记录日志（warning/error），
         绝不向上抛异常、不阻断插件启动。
         """
         try:
@@ -743,6 +748,34 @@ class MySQLManager:
                         logger.error(
                             f"[HistorySave] 表结构迁移 image_records.sender_name 失败: {e}"
                         )
+
+                    # v0.4.0：chat_history 新增 at_list / reply_id 两列（人物分析
+                    # 关系上下文数据源）。ADD COLUMN 无 IF NOT EXISTS 语法，
+                    # 先查 INFORMATION_SCHEMA.COLUMNS 判定缺列再 ALTER，幂等可重入。
+                    # 存量行该两列为 NULL，下游按 .get 兜底，summary 消费 content 不受影响。
+                    new_columns = [
+                        ("at_list", "VARCHAR(512) DEFAULT ''"),
+                        ("reply_id", "VARCHAR(64) DEFAULT ''"),
+                    ]
+                    for column, column_def in new_columns:
+                        try:
+                            await cur.execute(
+                                "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS"
+                                " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                                ("chat_history", column),
+                            )
+                            row = await cur.fetchone()
+                            if not row:
+                                await cur.execute(
+                                    f"ALTER TABLE chat_history ADD COLUMN {column} {column_def}"
+                                )
+                                logger.info(
+                                    f"[HistorySave] 表结构迁移: chat_history 已新增 {column} 列"
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"[HistorySave] 表结构迁移 chat_history.{column} 失败: {e}"
+                            )
         except Exception as e:
             logger.error(f"[HistorySave] 表结构迁移失败（无法获取连接）: {e}")
 
@@ -754,6 +787,8 @@ class MySQLManager:
         message_type: str,
         content: str,
         message_id: str,
+        at_list: str = "",
+        reply_id: str = "",
     ) -> bool:
         """插入一条聊天记录。
 
@@ -764,6 +799,8 @@ class MySQLManager:
             message_type: 消息类型（text/mixed，纯图片消息不入文本表）
             content: 文本内容
             message_id: 消息 ID
+            at_list: 本条消息 @ 的 QQ 号列表，英文逗号分隔（如 "123,456"）；无则空串
+            reply_id: 本条消息回复的目标消息 message_id；无则空串
 
         Returns:
             bool: 是否插入成功
@@ -780,8 +817,8 @@ class MySQLManager:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """INSERT INTO chat_history
-                           (timestamp, group_id, sender_id, sender_name, message_type, content, message_id)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                           (timestamp, group_id, sender_id, sender_name, message_type, content, message_id, at_list, reply_id)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         (
                             datetime.now(),
                             group_id,
@@ -790,6 +827,8 @@ class MySQLManager:
                             message_type,
                             content,
                             message_id,
+                            at_list,
+                            reply_id,
                         ),
                     )
             return True
@@ -1145,9 +1184,11 @@ class MySQLManager:
                     result["total"] = row["total"] if row else 0
 
                     # 查询数据
+                    # at_list/reply_id 为 v0.4.0 新增列，迁移前的存量行可能为 NULL，
+                    # 保持原样返回，下游按 .get 兜底
                     await cur.execute(
                         f"""SELECT id, timestamp, group_id, sender_id, sender_name,
-                                   message_type, content, message_id
+                                   message_type, content, message_id, at_list, reply_id
                             FROM chat_history WHERE {where_clause}
                             ORDER BY timestamp DESC
                             LIMIT %s OFFSET %s""",
@@ -1160,6 +1201,42 @@ class MySQLManager:
         except Exception as e:
             self._log_op_error("query_messages", "查询聊天记录", e)
         return result
+
+    async def get_messages_by_ids(self, message_ids: list[str]) -> list[dict]:
+        """按 message_id 批量精确查询 chat_history（关系分析反查被回复者用）。
+
+        空入参或全为空串 → 直接返回 []；入参中的空串先过滤，
+        IN 占位符按过滤后的列表动态生成（全参数化，无拼接注入风险）。
+
+        Args:
+            message_ids: 待查询的 message_id 列表
+
+        Returns:
+            list[dict]: 命中记录列表，每条含 timestamp(str)/group_id/sender_id/
+                sender_name/message_type/content/message_id/at_list/reply_id；
+                空入参或查询异常时返回 []
+        """
+        ids = [mid for mid in (message_ids or []) if mid]
+        if not ids:
+            return []
+        try:
+            placeholders = ",".join(["%s"] * len(ids))
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        f"""SELECT timestamp, group_id, sender_id, sender_name,
+                                   message_type, content, message_id, at_list, reply_id
+                            FROM chat_history
+                            WHERE message_id IN ({placeholders})""",
+                        ids,
+                    )
+                    rows = await cur.fetchall()
+                    for row in rows:
+                        row["timestamp"] = str(row["timestamp"])
+                    return rows
+        except Exception as e:
+            self._log_op_error("get_messages_by_ids", "按ID批量查询聊天记录", e)
+            return []
 
     async def ping(self) -> dict:
         """检测数据库连接状态。

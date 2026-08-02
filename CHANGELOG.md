@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.4.0] - 2026-08-03
+
+### Added
+
+- **人物分析（新功能）**：新增群指令 `/人物分析 [@成员 或 QQ号]`（别名 `/人物画像`、`/分析TA`），
+  基于历史发言分析成员人物画像——发言习惯、活动时间（24 小时 / 星期分布图表）、性格、兴趣爱好、
+  人物关系五大维度；聊天指令仅分析当前群
+- **跨群分析**：按全部已保存群分析仅 Web 后台提供（「人物分析」分区「发起分析」tab），
+  聊天指令不提供 all 范围；跨群走 MySQL 全量拉取、不做 OneBot 补齐
+- **目标触发**：支持 @ 群成员（自动剔除 `all` 与 bot 自身）或直接输入纯数字 QQ 号触发；
+  两者皆无时回复用法提示
+- **权限与限流**：`profile_permission` 配置（默认 `admin` 仅管理员，可配 `all` 全员可用）+
+  用户/群双冷却（`profile_user_cooldown` 默认 60s / `profile_group_cooldown` 默认 30s）；
+  触发即时反馈（`profile_feedback_mode`：reaction 贴 👍 / text / none，reaction 失败自动降级文字）
+- **数据获取**：单群分析 MySQL 分页拉取（DESC→升序），不足时经 OneBot 原始消息筛目标补齐；
+  关系上下文双向识别（`profile_relation_context` 默认开，`profile_relation_max_partners` Top N）——
+  聚合目标↔他人的 @ 互动、经 `reply_id` 反查回复对象、同群扫描池与 OneBot 实时补强；
+  全程容错降级，数据源/是否完整写入结果元数据
+- **确定性统计引擎**：`profile/stats.py` 无 AI 计算发言统计（24h/星期分布、峰值时段、发言长度、
+  emoji 率、问号率、活跃天数、群分布、互动排行），统计不随 LLM 波动
+- **AI 分析**：独立 provider 降级链（`profile_provider` → `profile_fallback_providers` 按序 →
+  会话模型兜底，全失败返回「分析失败」兜底绝不抛异常）+ 长度预算截断
+  （`profile_max_prompt_chars` 默认 60000）+ 五维度开关（关闭维度不进 prompt、不渲染）+
+  四板块宽松切分；输出含免责声明「本报告基于公开群聊记录由 AI 生成，仅为推测，仅供参考」
+- **输出形式**（`profile_output_mode`）：合并转发 `forward` / 图片 `image`（自研人物报告模板渲染）/
+  纯文本 `text` 三模式，互斥可选
+- **自研人物报告模板**：`profile/templates/profile_report.html`（860px 双主题，与总结/管理面板同款
+  设计令牌）——报告头 + 四统计卡 + 小时/星期活动分布图表（ECharts 峰值高亮 + 纯 CSS 竖柱兜底）+ 
+  互动排行横向条形图（ECharts + CSS 兜底）+ 板块 Markdown（marked GFM 客户端渲染 + Python 预转换
+  兜底 HTML 含表格）+ 五节点 CDN 容灾加载器 + 免责声明页脚；渲染复用总结的 `summary_t2i_*` 共享配置
+  （主题/时段/超时/CDN 节点顺序，不新增 profile 专用渲染键）
+- **存储层增强**：`chat_history` 表新增 `at_list` / `reply_id` 两列（幂等 ALTER 自动迁移旧表），
+  入库记录 @ 对象与回复目标；`db_mysql` 新增 `get_messages_by_ids`（关系上下文反查用）
+- **配置管理**：全部 19 项新配置存入 config.db **新增 `profile_settings` 表**（key/value，列表值
+  JSON 序列化），由 `ConfigManager` 统一建表、播种默认值与 CRUD；**不进入 `_conf_schema.json`**，
+  仅在 dashboard「人物分析 → 分析设置」tab 修改，改后即时生效无需重启插件
+- **Web 管理后台第三分区**：「人物分析」分区三个 tab——分析设置（19 项配置分组表单 + provider 下拉 +
+  备用模型列表）/ 发起分析（范围选择 + 目标成员 + 群列表，跨群分析入口）/ 历史分析（按范围浏览
+  已保存分析 JSON，详情与删除）；新增 9 个 profile Web API 端点（settings/providers/groups/analyze/history）
+- **结果持久化**：分析结果以 JSON 保存到 `data/plugin_data/astrbot_plugin_group_history_save_mysql/profiles/<scope目录>/<文件名>.json`
+  （scope 目录 `group_<群号>` 或 `all`，文件名含生成时间与目标 QQ 号），保留天数可配
+  （`profile_keep_days` 默认 30 天），定时任务每日清理过期文件
+- **架构**：新功能代码全部位于 `profile/` 子包（service 编排 / fetcher 获取 / stats 统计 / analyzer
+  AI 分析 / formatter 输出 / t2i_render 渲染 / templates 模板 / storage 持久化 / scheduler 清理），
+  指令在 `main.py` 注册并薄封装异步委托子包；日志统一 `[Profile]` 前缀；无新增 pip 依赖
+
+### Changed
+
+- metadata.yaml 版本升至 v0.4.0，desc 更新为「…人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）」
+- 完全向后兼容 v0.3.2 数据与配置：`chat_history` 新增列自动幂等迁移、存量数据不受影响；
+  新配置由 `ConfigManager` 初始化自动播种默认值
+
 ## [0.3.2] - 2026-07-31
 
 ### Added
