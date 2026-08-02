@@ -1,5 +1,5 @@
 // 存储库分区：状态 / 群管理 / 设置 / 每日统计 / 查询 / 清空（加减法验证）
-import { bridge, showToast } from "./common.js";
+import { bridge, showToast, el } from "./common.js";
 
 let currentPage = 1;
 const pageSize = 50;
@@ -192,9 +192,14 @@ async function doQuery(page = 1) {
                 <td>${r.sender_name || "-"}</td>
                 <td><span class="type-badge">${r.message_type}</span></td>
                 <td class="content-cell" title="${escapeAttr(r.content || "")}">${escapeHtml(r.content || "")}</td>
+                <td class="rel-cell">${renderRelations(r)}</td>
             </tr>`
             )
             .join("");
+        // 给每条关联记录绑定点击反查弹层（事件委托，避免重复绑定）
+        tbody.querySelectorAll(".rel-item").forEach((el) => {
+            el.addEventListener("click", () => showRelatedMessage(el.dataset));
+        });
 
         const totalPages = Math.ceil(total / pageSize);
         const pagination = document.getElementById("pagination");
@@ -215,6 +220,45 @@ function escapeHtml(text) {
 
 function escapeAttr(text) {
     return text.replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+// ========== @ / 回复关联展示（v0.4.0） ==========
+// 渲染本条消息的 @ 对象与回复目标（点击查看被引用消息内容弹层）
+// 数据来自后端 api_query 的 at_messages / reply_message 关联字段
+function renderRelations(r) {
+    const parts = [];
+    const reply = r.reply_message;
+    if (reply && reply.sender_id) {
+        parts.push(
+            `<span class="rel-item rel-reply" data-kind="回复" data-sender="${escapeAttr(reply.sender_id)}" data-name="${escapeAttr(reply.sender_name || "")}" data-content="${escapeAttr(reply.content || "")}" title="查看被回复的消息">↩️ ${escapeHtml(reply.sender_name || reply.sender_id)}</span>`
+        );
+    }
+    for (const at of r.at_messages || []) {
+        if (!at || !at.sender_id) continue;
+        parts.push(
+            `<span class="rel-item rel-at" data-kind="@${at.sender_id}" data-sender="${escapeAttr(at.sender_id)}" data-name="${escapeAttr(at.sender_name || "")}" data-content="${escapeAttr(at.content || "")}" title="查看 ${escapeAttr(at.sender_name || at.sender_id)} 的最近消息">@ ${escapeHtml(at.sender_name || at.sender_id)}</span>`
+        );
+    }
+    return parts.length ? parts.join(" ") : '<span class="rel-none">-</span>';
+}
+
+// 点击关联项 → 弹层展示被引用消息内容（纯 textContent 防 XSS）
+function showRelatedMessage(d) {
+    const mask = document.getElementById("relatedModal");
+    const title = document.getElementById("relatedModalTitle");
+    const body = document.getElementById("relatedModalBody");
+    if (!mask || !body) return;
+    const who = d.name || d.sender || "未知用户";
+    title.textContent = d.kind === "回复" ? `↩️ 回复了 ${who}` : `@ 了 ${who}`;
+    body.innerHTML = "";
+    body.appendChild(el("div", "rel-modal-meta", `发送者: ${d.sender}${d.name ? " · " + d.name : ""}`));
+    body.appendChild(el("div", "rel-modal-content", d.content || "(无文本内容)"));
+    mask.style.display = "flex";
+}
+
+function closeRelatedModal() {
+    const mask = document.getElementById("relatedModal");
+    if (mask) mask.style.display = "none";
 }
 
 // ========== 清空所有数据（加减法验证） ==========
@@ -344,6 +388,15 @@ function bindStorageEvents() {
         if (currentPage > 1) doQuery(currentPage - 1);
     });
     document.getElementById("nextPage").addEventListener("click", () => doQuery(currentPage + 1));
+
+    // @ / 回复关联弹层关闭（关闭按钮 + 点击遮罩）
+    const relatedMask = document.getElementById("relatedModal");
+    if (relatedMask) {
+        document.getElementById("relatedCloseBtn").addEventListener("click", closeRelatedModal);
+        relatedMask.addEventListener("click", (e) => {
+            if (e.target === relatedMask) closeRelatedModal();
+        });
+    }
 }
 
 export {

@@ -476,6 +476,38 @@ body {
     color: var(--primary);
 }
 
+/* ===== 查询：@ / 回复关联 ===== */
+.rel-cell { max-width: 240px; }
+.rel-item {
+    display: inline-block;
+    margin: 1px 3px 1px 0;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+}
+.rel-item:hover { opacity: 0.75; }
+.rel-reply { background: var(--primary-light); color: var(--primary); }
+.rel-at { background: var(--surface-hover); color: var(--text-2); }
+.rel-none { color: var(--text-3); font-size: 0.75rem; }
+
+.related-modal { max-width: 460px; }
+.rel-modal-meta { font-size: 0.75rem; color: var(--text-3); margin-bottom: 8px; }
+.rel-modal-content {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--surface-hover);
+    color: var(--text-1);
+    font-size: 0.85rem;
+    line-height: 1.6;
+    word-break: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
 .empty-state {
     text-align: center;
     padding: 40px 20px;

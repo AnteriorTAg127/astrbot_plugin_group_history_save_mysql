@@ -194,6 +194,7 @@
                                 <th>昵称</th>
                                 <th>类型</th>
                                 <th>内容</th>
+                                <th>@ / 回复</th>
                             </tr>
                         </thead>
                         <tbody id="queryTableBody"></tbody>
@@ -210,6 +211,17 @@
                 </div>
             </div>
         </section>
+
+        <!-- @ / 回复关联弹层（点击查询结果中的关联项打开） -->
+        <div class="modal-mask" id="relatedModal" style="display:none;">
+            <div class="modal-card related-modal">
+                <div class="modal-title" id="relatedModalTitle">↩️ 回复了</div>
+                <div class="modal-body" id="relatedModalBody"></div>
+                <div class="modal-actions">
+                    <button id="relatedCloseBtn" class="btn btn-ghost">关闭</button>
+                </div>
+            </div>
+        </div>
 
         <!-- 设置页 -->
         <section class="page" id="page-settings">
