@@ -173,7 +173,9 @@ def _fmt_time(dt: datetime | None) -> str:
             return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
         except ValueError:
             try:
-                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime(
+                    "%Y-%m-%d %H:%M"
+                )
             except ValueError:
                 return "未知"
     try:

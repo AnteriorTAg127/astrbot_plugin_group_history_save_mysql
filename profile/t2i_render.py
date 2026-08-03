@@ -112,9 +112,7 @@ def _to_attr_obj(value):
     不做本转换时 getattr(dict, ...) 恒 None，全部字段落入默认值兜底。
     """
     if isinstance(value, dict):
-        return SimpleNamespace(
-            **{k: _to_attr_obj(v) for k, v in value.items()}
-        )
+        return SimpleNamespace(**{k: _to_attr_obj(v) for k, v in value.items()})
     if isinstance(value, list):
         return [_to_attr_obj(item) for item in value]
     return value
@@ -183,7 +181,9 @@ def _fmt_time(dt: datetime | None) -> str:
             return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
         except ValueError:
             try:
-                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime(
+                    "%Y-%m-%d %H:%M"
+                )
             except ValueError:
                 return "未知"
     try:
@@ -810,10 +810,25 @@ class ProfileT2IRenderer:
         """
         timeout_s = await self._resolve_timeout()
         rounds = [
-            (1, {"timeout": timeout_s * 1000, "type": "png", "full_page": True,
-                 "device_scale_factor_level": "ultra"}),
-            (2, {"timeout": 2 * timeout_s * 1000, "type": "jpeg", "quality": 80,
-                 "full_page": True, "device_scale_factor_level": "ultra"}),
+            (
+                1,
+                {
+                    "timeout": timeout_s * 1000,
+                    "type": "png",
+                    "full_page": True,
+                    "device_scale_factor_level": "ultra",
+                },
+            ),
+            (
+                2,
+                {
+                    "timeout": 2 * timeout_s * 1000,
+                    "type": "jpeg",
+                    "quality": 80,
+                    "full_page": True,
+                    "device_scale_factor_level": "ultra",
+                },
+            ),
         ]
         for round_no, options in rounds:
             start = time.monotonic()
@@ -833,11 +848,11 @@ class ProfileT2IRenderer:
                 continue
             cost = time.monotonic() - start
             if self._validate_image(ret):
-                logger.info(f"[Profile] T2I 导出第 {round_no} 轮渲染成功，耗时 {cost:.1f}s")
+                logger.info(
+                    f"[Profile] T2I 导出第 {round_no} 轮渲染成功，耗时 {cost:.1f}s"
+                )
                 try:
-                    img_bytes = await asyncio.to_thread(
-                        self._ret_to_bytes, ret
-                    )
+                    img_bytes = await asyncio.to_thread(self._ret_to_bytes, ret)
                 except Exception as e:
                     logger.warning(
                         f"[Profile] T2I 导出第 {round_no} 轮产物转字节失败: {e}"
@@ -858,7 +873,9 @@ class ProfileT2IRenderer:
             return bytes(ret)
         value = str(ret).strip()
         if value.startswith(("http://", "https://")):
-            logger.warning(f"[Profile] T2I 渲染返回 URL 而非本地文件，无法导出: {value}")
+            logger.warning(
+                f"[Profile] T2I 渲染返回 URL 而非本地文件，无法导出: {value}"
+            )
             return None
         with open(value, "rb") as f:
             return f.read()

@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import fields, is_dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -511,9 +512,7 @@ class WebAPI:
         if not records:
             return
 
-        reply_ids = [
-            (rec.get("reply_id") or "").strip() for rec in records
-        ]
+        reply_ids = [(rec.get("reply_id") or "").strip() for rec in records]
         reply_ids = [rid for rid in reply_ids if rid]
 
         reply_map: dict[str, dict] = {}
@@ -837,7 +836,9 @@ class WebAPI:
         except Exception:
             logger.error("[HistorySummary] 导出图片落盘失败", exc_info=True)
             return error_response("导出图片落盘失败", status_code=500)
-        return file_response(path, filename=f"{filename}.png")
+        # filename 可能带目录前缀（如 group_123/xxx.json），用 stem 取纯文件名再拼
+        # .png，避免下载名含路径分隔符与 .json.png 双后缀
+        return file_response(path, filename=f"{Path(filename).stem}.png")
 
     # ========== 人物分析端点（v0.4.0） ==========
 
@@ -865,8 +866,9 @@ class WebAPI:
 
         先校验后写入：所有传入键值全部通过 PROFILE_TYPES 声明类型校验后才
         交由 ``save_profile_settings`` 写入，任一非法整体 400、不写入任何项
-        （沿用 api_summary_settings_save 范式）。值归一化：bool→"true"/"false"；
-        list/dict→JSON 序列化；其余→str()。
+        （沿用 api_summary_settings_save 范式）；``save_profile_settings``
+        返回 False（校验未通过或数据库写入异常）→ 500。
+        值归一化：bool→"true"/"false"；list/dict→JSON 序列化；其余→str()。
         """
         payload = await request.json(default={})
         incoming = payload.get("settings")
@@ -898,7 +900,9 @@ class WebAPI:
 
         # ④ 全部校验通过后写入
         try:
-            await self.config_mgr.save_profile_settings(normalized)
+            ok = await self.config_mgr.save_profile_settings(normalized)
+            if not ok:
+                return error_response("保存设置失败（数据库写入异常）", status_code=500)
             settings = await self.config_mgr.get_all_profile_settings()
         except Exception:
             logger.error("[Profile] 保存人物分析配置失败", exc_info=True)
@@ -1086,7 +1090,9 @@ class WebAPI:
         except Exception:
             logger.error("[Profile] 导出图片落盘失败", exc_info=True)
             return error_response("导出图片落盘失败", status_code=500)
-        return file_response(path, filename=f"{filename}.png")
+        # filename 为 <scope目录>/<文件名> 相对名，用 stem 取纯文件名再拼 .png，
+        # 避免下载名含路径分隔符与 .json.png 双后缀
+        return file_response(path, filename=f"{Path(filename).stem}.png")
 
     async def api_profile_history_delete(self):
         """删除单条历史人物分析记录。

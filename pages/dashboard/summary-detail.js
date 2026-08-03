@@ -96,12 +96,14 @@ function renderSummaryDetail(container, detail) {
             block.appendChild(el("div", "detail-section-title", String(sec?.[0] ?? "")));
             const content = el("div", "detail-section-content markdown-body");
             const markdown = String(sec?.[1] ?? "");
-            const html = window.marked
-                ? window.marked.parse(markdown, { breaks: true, gfm: true })
-                : el("span", null, markdown).outerHTML;
-            content.innerHTML = window.DOMPurify
-                ? window.DOMPurify.sanitize(html)
-                : html;
+            if (window.marked && window.DOMPurify) {
+                // LLM 原文绝不直接拼 innerHTML：先 marked 再 DOMPurify 消毒
+                const html = window.marked.parse(markdown, { breaks: true, gfm: true });
+                content.innerHTML = window.DOMPurify.sanitize(html);
+            } else {
+                // CDN 缺库 → textContent 纯文本展示，杜绝注入
+                content.textContent = markdown;
+            }
             block.appendChild(content);
             secs.appendChild(block);
         }

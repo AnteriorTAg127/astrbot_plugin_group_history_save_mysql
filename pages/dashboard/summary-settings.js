@@ -1,5 +1,5 @@
 // 总结设置分区：24 项配置分组表单 / 备用模型多选弹窗 / 白名单与 CSV 互转
-import { bridge, showToast, el } from "./common.js";
+import { bridge, showToast, el, confirmDialog } from "./common.js";
 
 // ========== v0.3 Tab 1：总结设置（24 项配置分组表单） ==========
 
@@ -567,7 +567,9 @@ async function saveSummarySettings() {
 }
 
 async function resetSummaryAll() {
-    if (!confirm("确定将全部 24 项总结设置恢复为默认值吗？此操作不可撤销。")) return;
+    // iframe sandbox 无 allow-modals，原生 confirm() 恒 false，改用自定义确认弹窗（common.js）
+    const ok = await confirmDialog("确定将全部 24 项总结设置恢复为默认值吗？此操作不可撤销。");
+    if (!ok) return;
     try {
         // 省略 keys = 全部重置（后端约定）
         const data = await bridge.apiPost("summary/settings/reset", {});

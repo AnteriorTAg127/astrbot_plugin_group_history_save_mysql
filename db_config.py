@@ -783,7 +783,7 @@ class ConfigManager:
             logger.error(f"[Profile] 获取所有人物分析配置失败: {e}")
             return {}
 
-    async def save_profile_settings(self, settings: dict[str, Any]) -> None:
+    async def save_profile_settings(self, settings: dict[str, Any]) -> bool:
         """批量保存人物分析配置。
 
         先全量校验后写入：所有传入键值全部通过 PROFILE_TYPES 声明类型校验后才
@@ -793,6 +793,9 @@ class ConfigManager:
 
         Args:
             settings: 配置键 → 值（任意可归一化类型）的字典
+
+        Returns:
+            bool: 是否保存成功（校验未通过或数据库写入异常时返回 False）
         """
         # ① 未知键检查 + ② 值归一化为存储字符串
         normalized: dict[str, str] = {}
@@ -816,7 +819,7 @@ class ConfigManager:
                 logger.warning(
                     f"[Profile] 配置项 {key} 的值 {str_value!r} 非法，本次整体不写入: {e}"
                 )
-                return
+                return False
 
         # ④ 全部校验通过后批量写入
         try:
@@ -827,8 +830,10 @@ class ConfigManager:
                     (key, str_value),
                 )
             await self.db.commit()
+            return True
         except Exception as e:
             logger.error(f"[Profile] 保存人物分析配置失败: {e}")
+            return False
 
     async def reset_profile_settings(self) -> None:
         """将人物分析功能全部 19 项配置重置为 PROFILE_DEFAULTS 默认值。"""

@@ -2,7 +2,7 @@
 // 字段与 PRD §5 一一对应；备用模型复用 v0.3.2 拖拽排序弹窗组件（summary-settings.js 导出）；
 // 「图片渲染」分组仅说明文字 —— 与消息总结共用 summary_t2i_* 配置，不重复表单
 // 端点契约（PRD §3.8）：GET/POST profile/settings、POST profile/settings/reset、GET profile/providers
-import { bridge, showToast, el } from "./common.js";
+import { bridge, showToast, el, confirmDialog } from "./common.js";
 import {
     openProviderMultiModalEx,
     refreshProviderMultiTrigger,
@@ -283,7 +283,9 @@ async function saveProfileSettings() {
 }
 
 async function resetProfileAll() {
-    if (!confirm(`确定将全部 ${PROFILE_FIELD_META.length} 项人物分析设置恢复为默认值吗？此操作不可撤销。`)) return;
+    // iframe sandbox 无 allow-modals，原生 confirm() 恒 false，改用自定义确认弹窗（common.js）
+    const ok = await confirmDialog(`确定将全部 ${PROFILE_FIELD_META.length} 项人物分析设置恢复为默认值吗？此操作不可撤销。`);
+    if (!ok) return;
     try {
         const data = await bridge.apiPost("profile/settings/reset", {});
         fillProfileForm(data.settings || {});

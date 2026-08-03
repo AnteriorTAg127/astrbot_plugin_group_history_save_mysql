@@ -228,9 +228,7 @@ class T2IRenderer:
         try:
             tmpl_data = self._build_template_data(ns, theme, providers)
         except Exception as e:
-            logger.warning(
-                f"[HistorySummary] 导出模板数据组装失败: {e}", exc_info=True
-            )
+            logger.warning(f"[HistorySummary] 导出模板数据组装失败: {e}", exc_info=True)
             raise ValueError("模板数据组装失败") from e
         ret = await self._render_two_rounds_bytes(tmpl, tmpl_data)
         if ret is None:

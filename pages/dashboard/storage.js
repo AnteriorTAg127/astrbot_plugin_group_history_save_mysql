@@ -190,7 +190,7 @@ async function doQuery(page = 1) {
                 <td>${r.timestamp}</td>
                 <td>${r.group_id}</td>
                 <td>${r.sender_id}</td>
-                <td>${r.sender_name || "-"}</td>
+                <td>${escapeHtml(r.sender_name || "-")}</td>
                 <td><span class="type-badge">${r.message_type}</span></td>
                 <td class="content-cell" title="${escapeAttr(r.content || "")}">${escapeHtml(r.content || "")}</td>
                 <td class="rel-cell">${renderRelations(r)}</td>

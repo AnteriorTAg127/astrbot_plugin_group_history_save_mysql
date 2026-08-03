@@ -18,8 +18,12 @@
   - scope=="all"：``query_messages(group_id=None, sender_id=...)`` 跨所有已保存
     群，分页拉至上限，**不做 OneBot 补齐**（无法遍历所有群；Web 全局触发
     event=None）。
-  - 去重：``message_id`` 主键 + ``(秒级时间戳, sender_id, content[:32])`` 退化键
-    （沿用 summary fetcher 策略，含 sender_id 避免关系扫描池跨发送者误杀）；
+  - 去重（v0.4.5 F12，沿用 summary fetcher 策略）：有合法 message_id 的消息
+    只按 message_id 主键去重；退化键 ``(秒级时间戳, sender_id, content[:32])``
+    仅对 message_id 为空的消息登记与检查（含 sender_id 避免关系扫描池跨发送者
+    误杀），覆盖「两源同一消息但 message_id 为空」的交叉重复。设计取舍：
+    宁可两侧各留一份重复（一侧有 id 一侧无 id 的同一消息可能双存），也不可
+    借退化键误删合法消息（同一用户 1 秒内复读相同短消息否则会被误杀）；
     最终时间升序，超上限保留最近的。
 - **OneBot 拉取**：本模块自持原始消息拉取 :func:`_fetch_raw_group_history`
   （多轮 ``message_seq`` 翻页 / 超时 / 超量请求 / 短页终止的范式与参数口径同
@@ -279,11 +283,17 @@ def _message_key(msg: ProfileMessage) -> tuple:
 
 
 def _dedup_and_sort(msgs: list[ProfileMessage]) -> list[ProfileMessage]:
-    """去重 + 时间升序（沿用 summary fetcher 策略）。
+    """去重 + 时间升序（沿用 summary fetcher 策略，v0.4.5 F12）。
 
-    主键 message_id（空串不参与该键）；所有消息同时登记退化键
-    ``(秒级时间戳, sender_id, content[:32])``，覆盖一侧 message_id 为空的交叉
-    重复。入参顺序即冲突保留优先级（MySQL 在前 → 同键保留主数据源一方）。
+    - 有合法 message_id 的消息：只按 message_id 主键去重，不登记也不检查
+      退化键——否则同一用户 1 秒内连发相同短消息（复读）时，第二条合法
+      消息会因退化键撞车被误杀；
+    - message_id 为空的消息：只按退化键 ``(秒级时间戳, sender_id,
+      content[:32])`` 登记与检查，覆盖「两源同一消息但 message_id 为空」
+      的交叉重复。
+    设计取舍：宁可两侧各留一份重复（同一消息一侧有 id、一侧无 id 时两键
+    互不命中，会双份保留），也不可借退化键误删合法消息。
+    入参顺序即冲突保留优先级（MySQL 在前 → 同键保留主数据源一方）。
     """
     seen_ids: set[str] = set()
     seen_fallback: set[tuple[int, str, str]] = set()
@@ -293,10 +303,15 @@ def _dedup_and_sort(msgs: list[ProfileMessage]) -> list[ProfileMessage]:
             if msg.message_id in seen_ids:
                 continue
             seen_ids.add(msg.message_id)
-        fallback_key = (int(msg.timestamp.timestamp()), msg.sender_id, msg.content[:32])
-        if fallback_key in seen_fallback:
-            continue
-        seen_fallback.add(fallback_key)
+        else:
+            fallback_key = (
+                int(msg.timestamp.timestamp()),
+                msg.sender_id,
+                msg.content[:32],
+            )
+            if fallback_key in seen_fallback:
+                continue
+            seen_fallback.add(fallback_key)
         kept.append(msg)
     kept.sort(key=lambda m: m.timestamp)
     return kept

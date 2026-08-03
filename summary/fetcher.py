@@ -23,9 +23,12 @@
   message_type ∈ {text, mixed} 于行级完成；OneBot 侧 parse 时已过滤）、
   bot 自身消息剔除（``event.get_self_id()``，取不到则跳过并只告警一次）、
   忽略名单剔除（``config_mgr.get_ignore_senders``）。
-- **去重**：优先 ``message_id``（空串不参与该键去重）；无论 message_id 是否为空
-  都同时登记退化键 ``(秒级时间戳, sender_id, content[:32])``，以覆盖
-  「两源同一消息但一侧 message_id 为空」的交叉场景。
+- **去重**：有合法 ``message_id`` 的消息只按 message_id 主键去重；退化键
+  ``(秒级时间戳, sender_id, content[:32])`` 仅对 message_id 为空的消息登记与
+  检查，覆盖「两源同一消息但 message_id 为空」的交叉场景。设计取舍：宁可
+  两侧各留一份重复（一侧有 id 一侧无 id 的同一消息可能双存），也不可借
+  退化键误删合法消息——否则同一用户 1 秒内连发相同短消息（复读）时，
+  第二条会因退化键撞车被误杀（v0.4.5 F12）。
 - **容错**：MySQL 查询异常记 warning(exc_info=True) 后视为空结果继续；
   OneBot 失败捕获 ``OneBotHistoryError`` 记 warning 并写入 ``onebot_error``，
   两个公开方法不向上抛数据源异常。
@@ -258,9 +261,16 @@ class HistoryFetcher:
     ) -> tuple[list[ChatMessage], dict[str, int]]:
         """合并两源：过滤（bot 自身 / 忽略名单）→ 去重 → 升序 → 数据源计数。
 
-        去重键：优先 message_id（空串不参与该键）；所有消息同时登记退化键
-        (秒级时间戳, sender_id, content[:32])，覆盖一侧 message_id 为空的
-        交叉重复。sources 以去重 + 过滤后实际保留的条数统计。
+        去重键（v0.4.5 F12）：
+        - 有合法 message_id 的消息：只按 message_id 主键去重，不登记也不检查
+          退化键——否则同一用户 1 秒内连发相同短消息（复读）时，第二条合法
+          消息会因退化键撞车被误杀；
+        - message_id 为空的消息：只按退化键 (秒级时间戳, sender_id,
+          content[:32]) 登记与检查，覆盖「两源同一消息但 message_id 为空」
+          的交叉重复。
+        设计取舍：宁可两侧各留一份重复（同一消息一侧有 id、一侧无 id 时
+        两键互不命中，会双份保留），也不可借退化键误删合法消息。
+        sources 以去重 + 过滤后实际保留的条数统计。
         """
         # --- bot 自身 ID（取不到则跳过该过滤，只告警一次） ---
         bot_self_id = self._resolve_bot_self_id(event)
@@ -286,17 +296,21 @@ class HistoryFetcher:
             if msg.sender_id in ignore_ids:
                 continue
             if msg.message_id:
+                # 有合法 message_id：仅按主键去重（不登记/不检查退化键，
+                # 避免复读消息被误杀，见 docstring）
                 if msg.message_id in seen_msg_ids:
                     continue
                 seen_msg_ids.add(msg.message_id)
-            fallback_key = (
-                int(msg.timestamp.timestamp()),
-                msg.sender_id,
-                msg.content[:32],
-            )
-            if fallback_key in seen_fallback:
-                continue
-            seen_fallback.add(fallback_key)
+            else:
+                # message_id 为空：仅按退化键登记与检查
+                fallback_key = (
+                    int(msg.timestamp.timestamp()),
+                    msg.sender_id,
+                    msg.content[:32],
+                )
+                if fallback_key in seen_fallback:
+                    continue
+                seen_fallback.add(fallback_key)
             kept.append(msg)
 
         kept.sort(key=lambda msg: msg.timestamp)
