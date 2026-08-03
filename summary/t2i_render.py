@@ -24,7 +24,10 @@
 
 ``render()`` 契约：**绝不向上抛异常**——任何异常（含配置读取、模板缺失、
 两轮渲染全失败）均返回 None，由 ``SummaryFormatter._render_image`` 继续
-text_to_image / 纯文本两级兜底。日志统一 ``[HistorySummary]`` 前缀。
+text_to_image / 纯文本两级兜底。``render_from_dict()``（v0.4.2 Web 后台
+导出）按同流程消费存储 JSON，返回图片字节或文件路径，失败抛
+``ValueError`` 由 WebAPI 端点转 502 明确报错。日志统一 ``[HistorySummary]``
+前缀。
 
 循环导入说明：本模块顶层 ``from .formatter import _markdown_to_html`` 复用
 兜底转换器；formatter 反向引用 ``T2IRenderer`` 时改用 ``__init__`` 内局部
@@ -33,12 +36,14 @@ text_to_image / 纯文本两级兜底。日志统一 ``[HistorySummary]`` 前缀
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import re
 import tempfile
 import time
 from datetime import datetime
+from types import SimpleNamespace
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -174,6 +179,45 @@ class T2IRenderer:
                 exc_info=True,
             )
             return None
+
+    async def render_from_dict(self, data: dict) -> bytes:
+        """按存储 JSON（``SummaryStorage.read`` 产出）渲染报告图片。
+
+        v0.4.2 Web 后台「导出图片」用：存储 JSON 与 :class:`SummaryResult`
+        字段同名（stats / sections / sources / …），经 ``SimpleNamespace``
+        直接喂给 ``_build_template_data``；时间戳为 ``YYYY-MM-DD HH:MM:SS``
+        字符串（同 :meth:`_fmt_time` 输出语义），datetime 原生对象同样兼容。
+
+        Args:
+            data: 存储 JSON 字典（字段缺损以 0/空兜底，不抛异常）。
+
+        Returns:
+            bytes: 渲染产物字节（PNG 或 JPEG，按魔数）。
+
+        Raises:
+            ValueError: 模板缺失 / 两轮渲染全败 / 未预期异常，由 WebAPI
+                端点转 502 明确报错（区别于 ``render`` 的返回 None 契约）。
+        """
+        tmpl = self._load_template()
+        if not tmpl:
+            raise ValueError("T2I 报告模板缺失")
+        theme = await self._resolve_theme()
+        providers = await self._resolve_cdn_providers()
+        logger.info(
+            f"[HistorySummary] T2I 导出主题判定={theme}，CDN 节点序={providers}"
+        )
+        ns = SimpleNamespace(**data)
+        try:
+            tmpl_data = self._build_template_data(ns, theme, providers)
+        except Exception as e:
+            logger.warning(
+                f"[HistorySummary] 导出模板数据组装失败: {e}", exc_info=True
+            )
+            raise ValueError("模板数据组装失败") from e
+        ret = await self._render_two_rounds_bytes(tmpl, tmpl_data)
+        if ret is None:
+            raise ValueError("T2I 两轮渲染均失败")
+        return ret
 
     # ------------------------------------------------------------------
     # 配置解析（读取异常一律兜底默认值，不阻断渲染）
@@ -467,6 +511,87 @@ class T2IRenderer:
             )
         logger.warning("[HistorySummary] T2I 两轮渲染均失败，交上层兜底链路")
         return None
+
+    async def _render_two_rounds_bytes(self, tmpl: str, data: dict) -> bytes | None:
+        """两轮渲染并返回图片**字节**（Web 导出用，不构造消息链）。
+
+        渲染选项与 ``_render_two_rounds`` 完全一致（PNG → JPEG q80 兜底、
+        full_page + device_scale_factor_level="ultra"）；产物为 bytes 直接
+        返回，本地文件路径读取后返回（http URL 无法转字节，返回 None）。
+        """
+        timeout_s = await self._resolve_timeout()
+        rounds = [
+            (
+                1,
+                {
+                    "timeout": timeout_s * 1000,
+                    "type": "png",
+                    "full_page": True,
+                    "device_scale_factor_level": "ultra",
+                },
+            ),
+            (
+                2,
+                {
+                    "timeout": 2 * timeout_s * 1000,
+                    "type": "jpeg",
+                    "quality": 80,
+                    "full_page": True,
+                    "device_scale_factor_level": "ultra",
+                },
+            ),
+        ]
+        for round_no, options in rounds:
+            start = time.monotonic()
+            logger.info(
+                f"[HistorySummary] T2I 导出第 {round_no} 轮渲染开始"
+                f"（{options['type']}，超时 {options['timeout']}ms）"
+            )
+            try:
+                ret = await self.star.html_render(
+                    tmpl, data, return_url=False, options=options
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[HistorySummary] T2I 导出第 {round_no} 轮渲染异常"
+                    f"（耗时 {time.monotonic() - start:.1f}s）: {e}"
+                )
+                continue
+            cost = time.monotonic() - start
+            if self._validate_image(ret):
+                logger.info(
+                    f"[HistorySummary] T2I 导出第 {round_no} 轮渲染成功，"
+                    f"耗时 {cost:.1f}s"
+                )
+                try:
+                    img_bytes = await asyncio.to_thread(self._ret_to_bytes, ret)
+                except Exception as e:
+                    logger.warning(
+                        f"[HistorySummary] T2I 导出第 {round_no} 轮产物转字节失败: {e}"
+                    )
+                    continue
+                if img_bytes:
+                    return img_bytes
+            logger.warning(
+                f"[HistorySummary] T2I 导出第 {round_no} 轮渲染结果校验失败，"
+                f"耗时 {cost:.1f}s"
+            )
+        logger.warning("[HistorySummary] T2I 导出两轮渲染均失败")
+        return None
+
+    @staticmethod
+    def _ret_to_bytes(ret: object) -> bytes | None:
+        """渲染产物 → bytes：bytes 直出；本地文件路径读文件；http URL 返回 None。"""
+        if isinstance(ret, (bytes, bytearray)):
+            return bytes(ret)
+        value = str(ret).strip()
+        if value.startswith(("http://", "https://")):
+            logger.warning(
+                f"[HistorySummary] T2I 渲染返回 URL 而非本地文件，无法导出: {value}"
+            )
+            return None
+        with open(value, "rb") as f:
+            return f.read()
 
     @staticmethod
     def _validate_image(ret: object) -> bool:

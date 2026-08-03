@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 from astrbot.api.star import Context
-from astrbot.api.web import error_response, json_response, request
+from astrbot.api.web import error_response, file_response, json_response, request
+from astrbot.core.utils.io import save_temp_img
 
 from .cleaner import ImageCleaner
 from .db_config import ConfigManager
@@ -23,7 +24,9 @@ from .db_mysql import MySQLManager
 if TYPE_CHECKING:
     from .profile.service import ProfileService
     from .profile.storage import ProfileStorage
+    from .profile.t2i_render import ProfileT2IRenderer
     from .summary.storage import SummaryStorage
+    from .summary.t2i_render import T2IRenderer
 
 PLUGIN_NAME = "astrbot_plugin_group_history_save_mysql"
 
@@ -101,8 +104,10 @@ class WebAPI:
         config_mgr: ConfigManager,
         cleaner: ImageCleaner,
         summary_storage: "SummaryStorage | None" = None,
+        summary_renderer: "T2IRenderer | None" = None,
         profile_service: "ProfileService | None" = None,
         profile_storage: "ProfileStorage | None" = None,
+        profile_renderer: "ProfileT2IRenderer | None" = None,
     ):
         self.context = context
         self.mysql_mgr = mysql_mgr
@@ -111,10 +116,16 @@ class WebAPI:
         # v0.3 总结功能存储层，由 main.py 注入（模块 K）；
         # 未注入时总结历史相关端点返回 503
         self.summary_storage = summary_storage
+        # v0.4.2 总结导出图片用 T2I 渲染器，由 main.py 注入（复用
+        # SummaryService.renderer）；未注入时导出端点返回 503
+        self.summary_renderer = summary_renderer
         # v0.4.0 人物分析编排层与存储层，由 main.py 注入（模块 K）；
         # 未注入时 analyze / history 相关端点返回 503
         self.profile_service = profile_service
         self.profile_storage = profile_storage
+        # v0.4.2 人物分析导出图片用 T2I 渲染器，由 main.py 注入（复用
+        # ProfileService.renderer）；未注入时导出端点返回 503
+        self.profile_renderer = profile_renderer
         self._purge_challenges: dict[str, tuple[int, float]] = {}
         self._register_routes()
 
@@ -214,6 +225,12 @@ class WebAPI:
                 ["GET"],
                 "历史总结详情",
             ),
+            (
+                f"/{PLUGIN_NAME}/summary/history/export",
+                self.api_summary_history_export,
+                ["GET"],
+                "历史总结导出图片",
+            ),
             # ---- 人物分析功能（v0.4.0） ----
             (
                 f"/{PLUGIN_NAME}/profile/settings",
@@ -262,6 +279,12 @@ class WebAPI:
                 self.api_profile_history_detail,
                 ["GET"],
                 "历史人物分析详情",
+            ),
+            (
+                f"/{PLUGIN_NAME}/profile/history/export",
+                self.api_profile_history_export,
+                ["GET"],
+                "历史人物分析导出图片",
             ),
             (
                 f"/{PLUGIN_NAME}/profile/history",
@@ -775,6 +798,47 @@ class WebAPI:
             return error_response("总结记录不存在", status_code=404)
         return json_response({"detail": detail})
 
+    async def api_summary_history_export(self):
+        """导出历史总结为图片（后端 T2I 流水线渲染，与聊天端图片同模板同配置）。
+
+        T2I 渲染耗时可能达数十秒，由前端 bridge.download 触发浏览器下载；
+        渲染失败（模板缺失 / 两轮渲染全败等）统一 502，前端 toast 明确报错。
+        """
+        if self.summary_storage is None:
+            return error_response("总结模块尚未初始化", status_code=503)
+
+        group_id = (request.query.get("group_id") or "").strip()
+        filename = (request.query.get("filename") or "").strip()
+        if not group_id or not filename:
+            return error_response("缺少 group_id 或 filename 参数", status_code=400)
+
+        try:
+            detail = await self.summary_storage.read(group_id, filename)
+        except Exception:
+            logger.error("[HistorySummary] 导出前读取总结详情失败", exc_info=True)
+            return error_response("读取总结详情失败", status_code=500)
+        if detail is None:
+            return error_response("总结记录不存在", status_code=404)
+
+        renderer = self.summary_renderer
+        if renderer is None:
+            return error_response("总结模块尚未初始化", status_code=503)
+        try:
+            img_bytes = await renderer.render_from_dict(detail)
+        except ValueError as e:
+            logger.warning(f"[HistorySummary] 导出图片渲染失败: {e}")
+            return error_response("渲染失败，请稍后重试", status_code=502)
+        except Exception:
+            logger.error("[HistorySummary] 导出图片渲染异常", exc_info=True)
+            return error_response("渲染失败，请稍后重试", status_code=502)
+
+        try:
+            path = await asyncio.to_thread(save_temp_img, img_bytes)
+        except Exception:
+            logger.error("[HistorySummary] 导出图片落盘失败", exc_info=True)
+            return error_response("导出图片落盘失败", status_code=500)
+        return file_response(path, filename=f"{filename}.png")
+
     # ========== 人物分析端点（v0.4.0） ==========
 
     async def api_profile_settings(self):
@@ -983,6 +1047,46 @@ class WebAPI:
         if detail is None:
             return error_response("分析记录不存在", status_code=404)
         return json_response({"detail": detail})
+
+    async def api_profile_history_export(self):
+        """导出历史人物分析为图片（后端 T2I 流水线渲染，与聊天端图片同模板同配置）。
+
+        filename 为 list_profiles 返回的相对名（``<scope目录>/<文件名>``）；
+        渲染失败（模板缺失 / 两轮渲染全败等）统一 502，前端 toast 明确报错。
+        """
+        if self.profile_storage is None:
+            return error_response("人物分析模块尚未初始化", status_code=503)
+
+        filename = (request.query.get("filename") or "").strip()
+        if not filename:
+            return error_response("缺少 filename 参数", status_code=400)
+
+        try:
+            detail = await self.profile_storage.read(filename)
+        except Exception:
+            logger.error("[Profile] 导出前读取分析详情失败", exc_info=True)
+            return error_response("读取分析详情失败", status_code=500)
+        if detail is None:
+            return error_response("分析记录不存在", status_code=404)
+
+        renderer = self.profile_renderer
+        if renderer is None:
+            return error_response("人物分析模块尚未初始化", status_code=503)
+        try:
+            img_bytes = await renderer.render_from_dict(detail)
+        except ValueError as e:
+            logger.warning(f"[Profile] 导出图片渲染失败: {e}")
+            return error_response("渲染失败，请稍后重试", status_code=502)
+        except Exception:
+            logger.error("[Profile] 导出图片渲染异常", exc_info=True)
+            return error_response("渲染失败，请稍后重试", status_code=502)
+
+        try:
+            path = await asyncio.to_thread(save_temp_img, img_bytes)
+        except Exception:
+            logger.error("[Profile] 导出图片落盘失败", exc_info=True)
+            return error_response("导出图片落盘失败", status_code=500)
+        return file_response(path, filename=f"{filename}.png")
 
     async def api_profile_history_delete(self):
         """删除单条历史人物分析记录。

@@ -125,6 +125,7 @@ class ProfileService:
         self._stats_builder = ProfileStatsBuilder()
         self._analyzer = ProfileAnalyzer(context, config_mgr)
         renderer = ProfileT2IRenderer(star, config_mgr)
+        self.renderer = renderer
         self._formatter = ProfileFormatter(star, config_mgr, renderer)
         self.storage = ProfileStorage(StarTools.get_data_dir(PLUGIN_NAME) / "profiles")
         self._scheduler = ProfileCleanupScheduler(self.storage, config_mgr)

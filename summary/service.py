@@ -124,6 +124,11 @@ class SummaryService:
         self._fetcher = HistoryFetcher(mysql_mgr, config_mgr)
         self._summarizer = Summarizer(context, config_mgr)
         self._formatter = SummaryFormatter(star, config_mgr)
+        # Web 导出图片用的 T2I 渲染器（与 formatter 内部同一构造参数；局部导入
+        # 避免与 formatter 的循环导入——formatter 模块内部同样局部导入本类）
+        from .t2i_render import T2IRenderer
+
+        self.renderer = T2IRenderer(star, config_mgr)
         self.storage = SummaryStorage(StarTools.get_data_dir(PLUGIN_NAME) / "summaries")
         self._scheduler = CleanupScheduler(self.storage, config_mgr)
         # 限流时间戳表（monotonic 时钟，仅内存不持久化）：

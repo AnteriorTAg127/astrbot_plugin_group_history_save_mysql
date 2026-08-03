@@ -6,7 +6,6 @@
 // 无 apiDelete，故优先尝试 apiDelete（向前兼容），回退 apiPost 同路径
 import { bridge, showToast, el, confirmDialog } from "./common.js";
 import { renderProfileResult, disposeCharts } from "./profile-launch.js";
-import { exportSectionAsPng } from "./capture.js";
 
 const PROFILE_HISTORY_PAGE_SIZE = 15;
 let profileHistoryPage = 1;
@@ -82,7 +81,7 @@ function openProfileDetail(filename) {
     const mask = document.getElementById("profileDetailModal");
     const body = document.getElementById("profileDetailBody");
     document.getElementById("profileDetailTitle").textContent = "👤 人物分析详情";
-    // 导出文件名：记录文件名（如 profile_20260730_1230_12345）
+    // 导出参数：记录文件名（如 profile_20260730_1230_12345.json，含 scope 目录前缀）
     document.getElementById("profileDetailExportBtn").dataset.filename = filename;
     mask.style.display = "flex";
     disposeCharts(body);
@@ -154,11 +153,25 @@ function bindProfileHistoryEvents() {
 
     const closeBtn = document.getElementById("profileDetailCloseBtn");
     closeBtn.addEventListener("click", closeProfileDetail);
-    // 导出图片：把详情正文（不含按钮行）渲染为 PNG 并触发下载
+    // 导出图片：后端 T2I 流水线渲染（与聊天端图片同模板同配置），bridge.download 触发浏览器下载。
+    // T2I 渲染耗时可能达数十秒，期间以 toast 提示；失败（如渲染服务不可用）明确报错
     document.getElementById("profileDetailExportBtn").addEventListener("click", async () => {
-        const filename = document.getElementById("profileDetailExportBtn").dataset.filename || "";
-        const safe = String(filename || "").replace(/[^\w.-]+/g, "_") || `人物分析_${Date.now()}`;
-        await exportSectionAsPng(document.getElementById("profileDetailBody"), safe);
+        const btn = document.getElementById("profileDetailExportBtn");
+        const filename = btn.dataset.filename || "";
+        if (!filename) {
+            showToast("缺少导出参数", "error");
+            return;
+        }
+        btn.disabled = true;
+        showToast("正在渲染图片，请稍候…（约 10~60 秒）");
+        try {
+            await bridge.download("profile/history/export", { filename }, `${filename}.png`);
+            showToast("导出完成，已开始下载", "success");
+        } catch (e) {
+            showToast(e.message || "导出失败，请稍后重试", "error");
+        } finally {
+            btn.disabled = false;
+        }
     });
     // 详情弹窗仅「关闭」按钮关闭（与总结详情范式一致），点击遮罩不执行任何操作
     document.getElementById("profileDetailModal").addEventListener("click", (event) => {

@@ -134,8 +134,10 @@ class GroupHistoryPlugin(Star):
             self.config_mgr,
             self.cleaner,
             summary_storage=self.summary_service.storage,
+            summary_renderer=self.summary_service.renderer,
             profile_service=self.profile_service,
             profile_storage=self.profile_service.storage,
+            profile_renderer=self.profile_service.renderer,
         )
 
         self._initialized = False

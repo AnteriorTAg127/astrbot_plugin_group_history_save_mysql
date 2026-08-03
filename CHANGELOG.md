@@ -1,17 +1,31 @@
 # Changelog
 
-## [0.4.1] - 2026-08-03
+## [0.4.2] - 2026-08-03
+
+### Changed
+
+- **导出图片改为后端 T2I 流水线渲染**：v0.4.1 的前端截图方案（SVG foreignObject 逐元素内联样式）
+  在复杂排版下错位失真，本版废弃并删除 `pages/dashboard/capture.js`，改为复用 AstrBot 原生
+  `html_render` 文转图流水线——与聊天端发送的图片总结/人物报告**同模板、同主题、同超时配置**，
+  排版 100% 一致
+- **新增两个导出 Web API 端点**：`GET summary/history/export?group_id=&filename=` 与
+  `GET profile/history/export?filename=`——读取已保存的存储 JSON，经 T2I 渲染器按存储数据结构
+  直接重建报告（`render_from_dict`：SimpleNamespace 适配既有模板数据组装，时间戳字符串语义与
+  聊天端 `_fmt_time` 输出一致），渲染产物字节经 `save_temp_img` 落盘后由 `file_response` 返回下载；
+  渲染失败（模板缺失 / 两轮渲染全败 / T2I 服务不可用）统一返回 502，前端 toast 明确报错，不降级
+- **导出交互改版**：前端「🖼️ 导出图片」按钮改为 `bridge.download` 触发浏览器下载，渲染期间按钮
+  禁用并提示「正在渲染图片，请稍候…（约 10~60 秒）」，完成/失败均有 toast 反馈
 
 ### Added
 
-- **历史记录前端导出图片**：「历史总结」与「历史分析」详情弹窗新增「🖼️ 导出图片」按钮，
-  一键将详情内容（统计卡 / 活动图表 / 排行 / 板块 Markdown）渲染为 PNG 下载
-- **零依赖前端截图方案**：插件页 iframe 为 opaque origin（无 allow-same-origin / allow-modals），
-  无法读取样式表或使用 html2canvas / 浏览器打印，故自研 SVG foreignObject 截图器
-  （`pages/dashboard/capture.js`）——逐元素内联 `getComputedStyle` 计算样式、CSS 变量随根节点注入、
-  ECharts canvas 以 `toDataURL` 转为 `<img>` 捕获、`:before/:after` 伪元素物化为真实元素、
-  滚动容器展开完整内容、背景渐变/透明度/内阴影保留并裁剪不支持项，导出图跟随页面亮/暗主题；
-  大图自动限制边长，最高 2x 缩放
+- 渲染器新增字典数据源入口：`summary/t2i_render.py` 与 `profile/t2i_render.py` 各新增
+  `render_from_dict(data) -> bytes`（失败抛 ValueError 由端点转 502），与 `_render_two_rounds_bytes`
+  图片字节输出、`_ret_to_bytes` 产物归一化；渲染器实例经 `SummaryService.renderer` /
+  `ProfileService.renderer` 公开并注入 `WebAPI`
+
+### Removed
+
+- 删除 `pages/dashboard/capture.js`（v0.4.1 前端截图方案，排版错位已废弃）
 
 ## [0.4.0] - 2026-08-03
 

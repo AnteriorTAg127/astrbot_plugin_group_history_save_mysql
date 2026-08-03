@@ -1,5 +1,4 @@
 const bridge = window.AstrBotPluginPage;
-import { exportSectionAsPng } from "./capture.js";
 
 function showToast(msg, type = "") {
     const toast = document.getElementById("toast");
@@ -30,8 +29,9 @@ export function openSummaryDetail(groupId, filename) {
     const mask = document.getElementById("historyDetailModal");
     const body = document.getElementById("historyDetailBody");
     document.getElementById("historyDetailTitle").textContent = `📄 总结详情 · 群 ${groupId}`;
-    // 导出文件名：群号 + 总结文件名中的时间戳（如 v0.3.3_20260730_1200_群123）
+    // 导出参数：群号 + 总结文件名（如 1751234567_a1b2c3.json）
     document.getElementById("historyDetailExportBtn").dataset.filename = filename;
+    document.getElementById("historyDetailExportBtn").dataset.groupId = groupId;
     mask.style.display = "flex";
     body.innerHTML = "";
     body.appendChild(el("div", "loading", "加载中..."));
@@ -128,11 +128,26 @@ function detailStatTile(value, label) {
 
 export function bindSummaryDetailEvents() {
     document.getElementById("historyDetailCloseBtn").addEventListener("click", closeSummaryDetail);
-    // 导出图片：把详情正文（不含按钮行）渲染为 PNG 并触发下载
+    // 导出图片：后端 T2I 流水线渲染（与聊天端图片同模板同配置），bridge.download 触发浏览器下载。
+    // T2I 渲染耗时可能达数十秒，期间以 toast 提示；失败（如渲染服务不可用）明确报错
     document.getElementById("historyDetailExportBtn").addEventListener("click", async () => {
-        const filename = document.getElementById("historyDetailExportBtn").dataset.filename || "";
-        const safe = String(filename || "").replace(/[^\w.-]+/g, "_") || `群聊总结_${Date.now()}`;
-        await exportSectionAsPng(document.getElementById("historyDetailBody"), safe);
+        const btn = document.getElementById("historyDetailExportBtn");
+        const filename = btn.dataset.filename || "";
+        const groupId = btn.dataset.groupId || "";
+        if (!filename) {
+            showToast("缺少导出参数", "error");
+            return;
+        }
+        btn.disabled = true;
+        showToast("正在渲染图片，请稍候…（约 10~60 秒）");
+        try {
+            await bridge.download("summary/history/export", { group_id: groupId, filename }, `${groupId}_summary.png`);
+            showToast("导出完成，已开始下载", "success");
+        } catch (e) {
+            showToast(e.message || "导出失败，请稍后重试", "error");
+        } finally {
+            btn.disabled = false;
+        }
     });
     // 详情弹窗只能通过「关闭」按钮关闭，点击遮罩不执行任何操作。
     document.getElementById("historyDetailModal").addEventListener("click", (event) => {
