@@ -10,9 +10,10 @@
   排版 100% 一致
 - **新增两个导出 Web API 端点**：`GET summary/history/export?group_id=&filename=` 与
   `GET profile/history/export?filename=`——读取已保存的存储 JSON，经 T2I 渲染器按存储数据结构
-  直接重建报告（`render_from_dict`：SimpleNamespace 适配既有模板数据组装，时间戳字符串语义与
-  聊天端 `_fmt_time` 输出一致），渲染产物字节经 `save_temp_img` 落盘后由 `file_response` 返回下载；
-  渲染失败（模板缺失 / 两轮渲染全败 / T2I 服务不可用）统一返回 502，前端 toast 明确报错，不降级
+  直接重建报告（`render_from_dict`：`_to_attr_obj` 递归把存储 dict 转为属性对象适配既有模板数据组装，
+  时间戳字符串与 `_fmt_time` 兼容解析），渲染产物字节经 `save_temp_img` 落盘后由 `file_response`
+  返回下载；渲染失败（模板缺失 / 两轮渲染全败 / T2I 服务不可用）统一返回 502，前端 toast 明确报错，
+  不降级
 - **导出交互改版**：前端「🖼️ 导出图片」按钮改为 `bridge.download` 触发浏览器下载，渲染期间按钮
   禁用并提示「正在渲染图片，请稍候…（约 10~60 秒）」，完成/失败均有 toast 反馈
 
@@ -22,6 +23,9 @@
   `render_from_dict(data) -> bytes`（失败抛 ValueError 由端点转 502），与 `_render_two_rounds_bytes`
   图片字节输出、`_ret_to_bytes` 产物归一化；渲染器实例经 `SummaryService.renderer` /
   `ProfileService.renderer` 公开并注入 `WebAPI`
+- 存储 JSON 适配：`_to_attr_obj` 递归 dict→属性对象（嵌套 `target`/`stats` 字段经 `getattr`
+  命中），`sources` 键值字典经 `vars()` 还原取回，`_fmt_time` 兼容 `YYYY-MM-DD HH:MM:SS`
+  字符串时间戳（导出图不再出现「未知用户 / 活动时间无发现 / 群数 0」）
 
 ### Removed
 

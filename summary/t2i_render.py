@@ -91,6 +91,21 @@ _TIMEOUT_MAX = 300
 _RE_HTML_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
+def _to_attr_obj(value):
+    """dict → SimpleNamespace（键名即属性名），list/dict 递归转换，其余原样。
+
+    ``render_from_dict`` 消费存储 JSON 用：存储结构里 ``stats`` 等嵌套 dict
+    经本函数转为 SimpleNamespace 后，``_build_template_data`` 的 ``getattr``
+    防御式取值（``getattr(stats, "total", 0)``）才能命中；不做本转换时
+    getattr(dict, ...) 恒 None，全部字段落入默认值兜底。
+    """
+    if isinstance(value, dict):
+        return SimpleNamespace(**{k: _to_attr_obj(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_to_attr_obj(item) for item in value]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # 纯函数工具（可离线单测）
 # ---------------------------------------------------------------------------
@@ -184,9 +199,10 @@ class T2IRenderer:
         """按存储 JSON（``SummaryStorage.read`` 产出）渲染报告图片。
 
         v0.4.2 Web 后台「导出图片」用：存储 JSON 与 :class:`SummaryResult`
-        字段同名（stats / sections / sources / …），经 ``SimpleNamespace``
-        直接喂给 ``_build_template_data``；时间戳为 ``YYYY-MM-DD HH:MM:SS``
-        字符串（同 :meth:`_fmt_time` 输出语义），datetime 原生对象同样兼容。
+        字段同名（stats / sections / sources / …），经 :func:`_to_attr_obj`
+        递归转为 SimpleNamespace 后喂给 ``_build_template_data``（嵌套 dict
+        必须一并转换，否则 getattr 防御式取值全部落到默认值）；
+        时间戳为 ``YYYY-MM-DD HH:MM:SS`` 字符串，``_fmt_time`` 兼容解析。
 
         Args:
             data: 存储 JSON 字典（字段缺损以 0/空兜底，不抛异常）。
@@ -206,7 +222,9 @@ class T2IRenderer:
         logger.info(
             f"[HistorySummary] T2I 导出主题判定={theme}，CDN 节点序={providers}"
         )
-        ns = SimpleNamespace(**data)
+        ns = _to_attr_obj(data)
+        if not isinstance(ns, SimpleNamespace):
+            raise ValueError("导出数据不是 JSON 对象")
         try:
             tmpl_data = self._build_template_data(ns, theme, providers)
         except Exception as e:
@@ -383,6 +401,10 @@ class T2IRenderer:
             truncated = False
 
         sources = getattr(result, "sources", None) or {}
+        # 存储 JSON 的 sources 为 dict（{数据源键: 条数}）；render_from_dict 经
+        # _to_attr_obj 会转成 SimpleNamespace，用 vars() 取回键值对兜底
+        if isinstance(sources, SimpleNamespace):
+            sources = vars(sources)
         try:
             source_items = [
                 {"name": _SOURCE_NAMES.get(str(k), str(k)), "count": v}

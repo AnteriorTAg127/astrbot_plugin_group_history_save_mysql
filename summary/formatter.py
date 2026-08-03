@@ -156,9 +156,26 @@ def strip_markdown(text: str) -> str:
 
 
 def _fmt_time(dt: datetime | None) -> str:
-    """datetime → ``YYYY-MM-DD HH:MM``；None 或异常 → ``未知``。"""
+    """datetime / ``YYYY-MM-DD HH:MM:SS`` 字符串 → ``YYYY-MM-DD HH:MM``。
+
+    存储 JSON 的 time_start/time_end 为字符串（v0.4.2 Web 导出走存储 JSON
+    渲染，需兼容解析）；None 或不可解析 → ``未知``。
+    """
     if dt is None:
         return "未知"
+    if isinstance(dt, str):
+        dt = dt.strip()
+        if not dt:
+            return "未知"
+        if dt.endswith("T"):
+            dt = dt[:-1]
+        try:
+            return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                return "未知"
     try:
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:

@@ -103,6 +103,23 @@ _RE_TABLE_ROW = re.compile(r"^\s*\|(.+)\|\s*$")
 _RE_TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
 
+def _to_attr_obj(value):
+    """dict → SimpleNamespace（键名即属性名），list/dict 递归转换，其余原样。
+
+    ``render_from_dict`` 消费存储 JSON 用：存储结构里 ``target`` / ``stats``
+    等嵌套 dict 经本函数转为 SimpleNamespace 后，``_build_template_data``
+    的 ``getattr`` 防御式取值（``getattr(stats, "total", 0)``）才能命中；
+    不做本转换时 getattr(dict, ...) 恒 None，全部字段落入默认值兜底。
+    """
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{k: _to_attr_obj(v) for k, v in value.items()}
+        )
+    if isinstance(value, list):
+        return [_to_attr_obj(item) for item in value]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # 纯函数工具（可离线单测）
 # ---------------------------------------------------------------------------
@@ -149,12 +166,26 @@ def _extract_html_title(head: bytes) -> str:
 
 
 def _fmt_time(dt: datetime | None) -> str:
-    """datetime → ``YYYY-MM-DD HH:MM``；None 或异常 → ``未知``。
+    """datetime / ``YYYY-MM-DD HH:MM:SS`` 字符串 → ``YYYY-MM-DD HH:MM``。
 
-    与 ``summary.formatter._fmt_time`` 等价的自实现（避免跨包耦合）。
+    存储 JSON 的 time_start/time_end 为字符串（v0.4.2 Web 导出走存储 JSON
+    渲染，需兼容解析）；None 或不可解析 → ``未知``。
     """
     if dt is None:
         return "未知"
+    if isinstance(dt, str):
+        dt = dt.strip()
+        if not dt:
+            return "未知"
+        if dt.endswith("T"):
+            dt = dt[:-1]
+        try:
+            return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                return datetime.strptime(dt, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                return "未知"
     try:
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -395,9 +426,10 @@ class ProfileT2IRenderer:
         """按存储 JSON（``ProfileStorage.read`` 产出）渲染报告图片。
 
         v0.4.2 Web 后台「导出图片」用：存储 JSON 与 :class:`ProfileResult`
-        字段同名（target / stats / sections / …），经 ``SimpleNamespace``
-        直接喂给 ``_build_template_data``；时间戳为 ``YYYY-MM-DD HH:MM:SS``
-        字符串（同 :meth:`_fmt_time` 输出语义），datetime 原生对象同样兼容。
+        字段同名（target / stats / sections / …），经 :func:`_to_attr_obj`
+        递归转为 SimpleNamespace 后喂给 ``_build_template_data``（嵌套 dict
+        必须一并转换，否则 getattr 防御式取值全部落到默认值）；
+        时间戳为 ``YYYY-MM-DD HH:MM:SS`` 字符串，``_fmt_time`` 兼容解析。
 
         Args:
             data: 存储 JSON 字典（字段缺损以 0/空兜底，不抛异常）。
@@ -415,7 +447,9 @@ class ProfileT2IRenderer:
         theme = await self._resolve_theme()
         providers = await self._resolve_cdn_providers()
         logger.info(f"[Profile] T2I 导出主题判定={theme}，CDN 节点序={providers}")
-        ns = SimpleNamespace(**data)
+        ns = _to_attr_obj(data)
+        if not isinstance(ns, SimpleNamespace):
+            raise ValueError("导出数据不是 JSON 对象")
         try:
             tmpl_data = self._build_template_data(ns, theme, providers)
         except Exception as e:
