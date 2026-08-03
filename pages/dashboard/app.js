@@ -1,7 +1,8 @@
 // 入口 bootstrap：加载各功能模块 + 分区/Tab 切换 + 首屏初始化
 // 业务代码按功能拆分：storage.js（存储库）/ summary-settings.js（总结设置）/
 // summary-ignore.js（忽略管理）/ summary-history.js（历史总结）/
-// profile-settings.js / profile-launch.js / profile-history.js（v0.4.0 人物分析）
+// profile-settings.js / profile-launch.js / profile-history.js（v0.4.0 人物分析）/
+// data-analysis.js（v0.5.0 数据分析）
 import { loadStatus, loadGroups, loadSettings, loadDailyStats, bindStorageEvents } from "./storage.js";
 import { loadSummarySettings, bindSummarySettingsEvents } from "./summary-settings.js";
 import { loadIgnoreGroups, bindIgnoreEvents } from "./summary-ignore.js";
@@ -9,6 +10,7 @@ import { loadSummaryHistory, bindHistoryEvents } from "./summary-history.js";
 import { loadProfileSettings, bindProfileSettingsEvents } from "./profile-settings.js";
 import { loadProfileGroups, bindProfileLaunchEvents } from "./profile-launch.js";
 import { loadProfileHistory, bindProfileHistoryEvents } from "./profile-history.js";
+import { loadDataAnalysis, bindDataAnalysisEvents, enterDataAnalysis } from "./data-analysis.js";
 
 const bridge = window.AstrBotPluginPage;
 await bridge.ready();
@@ -20,6 +22,14 @@ const TAB_LAZY_LOAD = {
     // v0.4.0：人物分析两 tab 惰性加载（群列表/历史列表仅在进入对应 tab 时请求）
     "profile-launch": () => loadProfileGroups(),
     "profile-history": () => loadProfileHistory(1),
+    // v0.5.0：数据分析 tab 惰性加载（进入才首次请求 stats/data 与推送设置）
+    "data-analysis": () => loadDataAnalysis(),
+};
+
+// v0.5.0：每次进入 tab 都会触发的钩子（区别于上方仅首次的惰性加载）；
+// 数据分析图表实例切 tab 不销毁只隐藏，重新可见时需 resize 对齐容器尺寸
+const TAB_ENTER_HOOKS = {
+    "data-analysis": () => enterDataAnalysis(),
 };
 
 // 统一激活某个子 tab：切换高亮、显示对应页面、首次进入触发惰性加载
@@ -34,6 +44,7 @@ function activateTab(name) {
         lazyLoadedTabs.add(name);
         TAB_LAZY_LOAD[name]();
     }
+    if (TAB_ENTER_HOOKS[name]) TAB_ENTER_HOOKS[name]();
 }
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -111,6 +122,7 @@ async function init() {
     bindProfileSettingsEvents(); // v0.4.0 人物分析设置（复用备用模型弹窗组件）
     bindProfileLaunchEvents(); // v0.4.0 发起分析
     bindProfileHistoryEvents(); // v0.4.0 历史分析 + 详情弹窗
+    bindDataAnalysisEvents(); // v0.5.0 数据分析（过滤栏 / 排行交互 / 推送设置表单）
     // 默认进入存储库分区并点亮高光；总结/人物分析数据延迟到进入对应分区时加载
     switchScope("storage");
     await Promise.all([loadStatus(), loadGroups(), loadSettings(), loadDailyStats()]);

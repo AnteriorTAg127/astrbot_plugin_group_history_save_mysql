@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.4.6">
+    <link rel="stylesheet" href="./style.css?v=0.5.0">
 </head>
 <body>
     <div class="app">
@@ -41,6 +41,7 @@
             <button class="tab active" data-tab="overview">概览</button>
             <button class="tab" data-tab="groups">群管理</button>
             <button class="tab" data-tab="query">查询</button>
+            <button class="tab" data-tab="data-analysis">数据分析</button>
             <button class="tab" data-tab="settings">设置</button>
         </nav>
 
@@ -222,6 +223,272 @@
                 </div>
             </div>
         </div>
+
+        <!-- 数据分析页（v0.5.0）：实时 SQL 聚合统计。过滤栏 → 统计卡片 / 每日趋势 /
+             活跃分布 / 发言人排行 / 群排行 / 个人交叉视图 + 推送设置区；
+             全部动态内容由 data-analysis.js 以 textContent/createElement 渲染（防 XSS） -->
+        <section class="page" id="page-data-analysis">
+            <!-- 过滤栏：群选择（含全部群）/ 时间预设 / 自定义起止日期 / 刷新 -->
+            <div class="section-card da-filter-card">
+                <div class="da-filter-row">
+                    <div class="filter-group">
+                        <label for="daGroupSelect">群</label>
+                        <select id="daGroupSelect" class="input input-select da-group-select">
+                            <option value="">全部群</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label>时间范围</label>
+                        <div class="da-presets" id="daPresets">
+                            <button type="button" class="da-preset" data-range="today">今日</button>
+                            <button type="button" class="da-preset" data-range="yesterday">昨日</button>
+                            <button type="button" class="da-preset active" data-range="7d">近7天</button>
+                            <button type="button" class="da-preset" data-range="30d">近30天</button>
+                            <button type="button" class="da-preset" data-range="all">全部</button>
+                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <label for="daCustomStart">自定义开始</label>
+                        <input type="date" id="daCustomStart" class="input da-date-input">
+                    </div>
+                    <div class="filter-group">
+                        <label for="daCustomEnd">自定义结束</label>
+                        <input type="date" id="daCustomEnd" class="input da-date-input">
+                    </div>
+                    <div class="filter-group filter-action">
+                        <button id="daRefreshBtn" class="btn btn-primary">↻ 刷新</button>
+                    </div>
+                </div>
+                <!-- 个人视图提示条（进入个人视图时显示，「返回群视图」清除 sender_id） -->
+                <div class="da-member-bar" id="daMemberBar" style="display:none;">
+                    <span class="da-member-bar-text" id="daMemberBarText"></span>
+                    <button id="daBackToGroupBtn" class="btn btn-ghost btn-sm" type="button">← 返回群视图</button>
+                </div>
+                <div class="query-meta"><span id="daMeta"></span></div>
+            </div>
+
+            <!-- 个人交叉视图（v0.5.0 F1）：member 消息数/占比/名次/活跃天数/日均，仅个人视图显示 -->
+            <div class="section-card" id="daMemberCard" style="display:none;">
+                <div class="section-title"><span>👤 个人交叉视图</span></div>
+                <div id="daMemberInfo"></div>
+            </div>
+
+            <!-- 统计卡片：总消息 / 图片 / 活跃成员 / 峰值时段 -->
+            <div class="stats-grid">
+                <div class="stat-card stat-blue">
+                    <div class="stat-icon">📨</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="daTotalMessages">-</div>
+                        <div class="stat-label">总消息数</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-purple">
+                    <div class="stat-icon">🖼️</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="daTotalImages">-</div>
+                        <div class="stat-label">图片数</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-green">
+                    <div class="stat-icon">👥</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="daActiveSenders">-</div>
+                        <div class="stat-label">活跃成员</div>
+                    </div>
+                </div>
+                <div class="stat-card stat-orange">
+                    <div class="stat-icon">⏰</div>
+                    <div class="stat-body">
+                        <div class="stat-value" id="daPeakHour">-</div>
+                        <div class="stat-label">峰值时段</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 每日趋势：ECharts 柱状图（CDN 锁 5.5.1），加载失败降级为数据表格 -->
+            <div class="section-card">
+                <div class="section-title"><span>📈 每日趋势</span></div>
+                <div id="daTrendBox" class="da-chart-box">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+
+            <!-- 活跃规律分布：24 小时 + 星期（周一~周日）；个人视图下展示该成员分布 -->
+            <div class="section-card">
+                <div class="section-title"><span id="daDistTitle">🕐 活跃规律分布</span></div>
+                <div class="da-dist-grid">
+                    <div class="da-dist-item">
+                        <div class="da-dist-subtitle">24 小时分布</div>
+                        <div id="daHourBox" class="da-chart-box"></div>
+                    </div>
+                    <div class="da-dist-item">
+                        <div class="da-dist-subtitle">星期分布（周一~周日）</div>
+                        <div id="daWeekdayBox" class="da-chart-box"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 发言人排行：点击行 → 追加 sender_id 重查进入个人视图 -->
+            <div class="section-card">
+                <div class="section-title">
+                    <span>🏆 发言人排行</span>
+                    <span class="da-note">点击成员查看个人交叉数据</span>
+                </div>
+                <div class="table-wrap">
+                    <table id="daSenderTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>名次</th>
+                                <th>昵称</th>
+                                <th>消息数</th>
+                                <th>图片数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="daSenderTableBody"></tbody>
+                    </table>
+                    <div id="daSenderEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>该时间范围内暂无发言数据</p>
+                    </div>
+                </div>
+                <div class="da-footnote">图片数为小时级快照口径（每小时每群仅记录 Top K 成员，K 外成员显示快照可查部分）。</div>
+            </div>
+
+            <!-- 群排行：仅「全部群」汇总视图展示 -->
+            <div class="section-card" id="daGroupRankCard" style="display:none;">
+                <div class="section-title"><span>🏅 群排行</span></div>
+                <div class="table-wrap">
+                    <table id="daGroupTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>名次</th>
+                                <th>群号</th>
+                                <th>消息数</th>
+                                <th>活跃成员</th>
+                                <th>图片数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="daGroupTableBody"></tbody>
+                    </table>
+                    <div id="daGroupEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>该时间范围内暂无群数据</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 推送设置区（v0.5.0 F3）：群级开关列表 + 全局 8 项 stats settings -->
+            <div class="section-card">
+                <div class="section-title"><span>📮 定时推送设置</span></div>
+                <div class="setting-desc da-setting-desc">
+                    日报 / 周报以图片报告卡形式推送：需全局开关与群级开关同时开启才会推送对应群；群级开关默认关闭。
+                </div>
+                <div class="summary-group">
+                    <div class="summary-group-title">群级推送开关</div>
+                    <div id="daPushGroupList">
+                        <div class="loading">加载中...</div>
+                    </div>
+                </div>
+                <div class="summary-group">
+                    <div class="summary-group-title">全局设置</div>
+                    <div class="settings-form">
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">排行条数</div>
+                                <div class="setting-desc">/群统计 与 Web 排行的 Top N 条数（1–50）</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="number" id="daTopN" min="1" max="50" step="1" class="input input-sm">
+                                <span class="unit">条</span>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">指令冷却</div>
+                                <div class="setting-desc">/群统计 每群两次触发的最小间隔（0–600 秒）</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="number" id="daCooldown" min="0" max="600" step="1" class="input input-sm">
+                                <span class="unit">秒</span>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">快照 Top K</div>
+                                <div class="setting-desc">图片快照每小时每群记录的个人数上限（1–100）</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="number" id="daImageTopK" min="1" max="100" step="1" class="input input-sm">
+                                <span class="unit">人</span>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">日报开关</div>
+                                <div class="setting-desc">全局总开关，需与群级开关同时开启才会推送该群</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="all-mode-switch">
+                                    <input type="checkbox" id="daDailyEnabled">
+                                    <span class="switch-track"><span class="switch-thumb"></span></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">日报推送时间</div>
+                                <div class="setting-desc">每日推送时刻（HH:MM，24 小时制）</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="time" id="daDailyTime" class="input da-time-input">
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">周报开关</div>
+                                <div class="setting-desc">可选功能，推送上一整周（周一~周日）的群数据卡</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="all-mode-switch">
+                                    <input type="checkbox" id="daWeeklyEnabled">
+                                    <span class="switch-track"><span class="switch-thumb"></span></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">周报推送星期</div>
+                                <div class="setting-desc">每周几推送周报（1=周一 … 7=周日）</div>
+                            </div>
+                            <div class="setting-control">
+                                <select id="daWeeklyWeekday" class="input input-select da-weekday-select">
+                                    <option value="1">周一</option>
+                                    <option value="2">周二</option>
+                                    <option value="3">周三</option>
+                                    <option value="4">周四</option>
+                                    <option value="5">周五</option>
+                                    <option value="6">周六</option>
+                                    <option value="7">周日</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <div class="setting-name">周报推送时间</div>
+                                <div class="setting-desc">周报推送时刻（HH:MM，24 小时制）</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="time" id="daWeeklyTime" class="input da-time-input">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="summary-actions">
+                        <button id="daSaveSettingsBtn" class="btn btn-primary">保存设置</button>
+                        <button id="daResetSettingsBtn" class="btn btn-ghost">恢复默认</button>
+                    </div>
+                </div>
+            </div>
+        </section>
 
         <!-- 设置页 -->
         <section class="page" id="page-settings">
@@ -503,6 +770,9 @@
     <!-- marked 锁定主版本 @15（对齐 echarts@5 写法；v16 起包内不再提供根目录 marked.min.js） -->
     <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="./app.js?v=0.4.6"></script>
+    <script type="module" src="./app.js?v=0.5.0"></script>
+    <!-- v0.5.0 数据分析 tab 模块（type=module 默认 defer，加载顺序与既有脚本一致；
+         实际接线由 app.js import 驱动，重复引用按 ES Module 同 URL 去重、仅执行一次） -->
+    <script type="module" src="./data-analysis.js?v=0.5.0"></script>
 </body>
 </html>

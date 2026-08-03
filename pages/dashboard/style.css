@@ -1715,3 +1715,144 @@ body {
 
 .profile-del-btn { margin-left: 6px; }
 .profile-del-btn:hover { color: var(--danger); border-color: var(--danger); background: var(--danger-light); }
+
+/* =====================================================================
+   v0.5.0 数据分析 tab（存储库分区；统一 da-* 前缀）
+   ===================================================================== */
+
+/* --- 过滤栏：群 / 时间预设 / 自定义日期 / 刷新（flex 自适应换行） --- */
+.da-filter-card { padding-bottom: 14px; }
+
+.da-filter-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 14px;
+    align-items: flex-end;
+}
+
+.da-filter-row .filter-group { min-width: 140px; }
+
+.da-group-select { min-width: 190px; }
+
+/* 时间预设按钮组（胶囊 chip 风格，激活态取主色） */
+.da-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.da-preset {
+    padding: 6px 14px;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.da-preset:hover:not(:disabled) {
+    border-color: var(--primary);
+    color: var(--primary);
+    transform: translateY(-1px);
+}
+
+.da-preset.active {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+}
+
+.da-preset:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+.da-date-input { width: 160px; }
+
+/* 个人视图提示条 */
+.da-member-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+    padding: 9px 14px;
+    border-radius: var(--radius-sm);
+    background: var(--primary-light);
+    color: var(--primary);
+    font-size: 0.82rem;
+    font-weight: 500;
+    animation: fadeIn 0.25s ease;
+}
+
+.da-member-bar-text { flex: 1; min-width: 0; word-break: break-all; }
+
+/* --- 图表容器 --- */
+.da-chart-box { width: 100%; min-height: 40px; }
+
+.da-echart { width: 100%; }
+
+.da-echart-trend { height: 260px; }
+
+.da-echart-dist { height: 190px; }
+
+/* 24h / 星期分布双栏（窄屏单列） */
+.da-dist-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 18px;
+}
+
+@media (min-width: 900px) {
+    .da-dist-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.da-dist-item { min-width: 0; } /* grid 子项：防止图表画布撑破轨道 */
+
+.da-dist-subtitle {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-3);
+    margin-bottom: 8px;
+}
+
+/* 趋势降级表格（ECharts 加载失败）：限高可滚动 */
+.da-trend-fallback { max-height: 340px; overflow: auto; }
+
+.da-trend-fallback .da-note { margin-bottom: 8px; }
+
+/* --- 排行表交互 --- */
+.da-clickable-row td { cursor: pointer; }
+
+.da-row-selected td { background: var(--primary-light); }
+
+/* 名次徽标（榜首金色高亮，语义与 rank-item/pr-rank-top 一致） */
+.da-rank-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--primary-light);
+    color: var(--primary);
+    font-size: 0.72rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.da-rank-top { background: #fff3d6; color: #b8860b; }
+
+[data-theme="dark"] .da-rank-top { background: #33290f; color: #f7c948; }
+
+/* --- 辅助文本 --- */
+.da-note { font-size: 0.72rem; font-weight: 400; color: var(--text-3); }
+
+.da-footnote {
+    margin-top: 10px;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--text-3);
+}
+
+/* --- 推送设置区 --- */
+.da-setting-desc { margin-bottom: 14px; line-height: 1.6; }
+
+.da-time-input { width: 120px; font-variant-numeric: tabular-nums; }
+
+.da-weekday-select { min-width: 110px; }

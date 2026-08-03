@@ -12,12 +12,16 @@ import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
 
 from .cleaner import ImageCleaner
 from .db_config import ConfigManager
 from .db_mysql import MySQLManager
 from .profile.capture import extract_at_targets, extract_reply_id
 from .profile.service import ProfileService
+from .stats import StatsBuildError, StatsService
+from .stats.models import StatsQuery
+from .stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args
 from .summary import SummaryService
 from .web_api import WebAPI
 
@@ -82,11 +86,34 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
     return urls
 
 
+def stats_fallback_text(data, label: str) -> str:
+    """T2I 渲染失败时的降级纯文本摘要（单行）。
+
+    内容：时间范围 label + 总消息数 + 活跃成员数 + Top3 发言人（「昵称: N条」，
+    昵称缺失时回退 QQ 号）。供 ``/群统计`` 指令渲染失败兜底使用。
+
+    Args:
+        data: ``StatsData``（或其鸭子同构对象），需含 total_messages /
+            active_senders / sender_ranking（取前三条）。
+        label: 时间范围展示文案（如「今日」/「近7天」）。
+    """
+    tops = []
+    for item in (getattr(data, "sender_ranking", None) or [])[:3]:
+        name = getattr(item, "sender_name", "") or getattr(item, "sender_id", "")
+        tops.append(f"{name}: {getattr(item, 'count', 0)}条")
+    top_text = "、".join(tops) if tops else "暂无发言数据"
+    return (
+        f"【{label}】总消息数：{getattr(data, 'total_messages', 0)}，"
+        f"活跃成员：{getattr(data, 'active_senders', 0)}，"
+        f"Top3 发言人：{top_text}"
+    )
+
+
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
-    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）",
-    "0.4.6",
+    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 图片小时级快照统计）",
+    "0.5.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -128,6 +155,10 @@ class GroupHistoryPlugin(Star):
             context, self.config_mgr, self.mysql_mgr, self
         )
 
+        # 初始化数据分析服务（v0.5.0，须在 WebAPI 之前构造，以便注入服务实例；
+        # 构造仅组装上游模块引用无 I/O，调度器在 MySQL 初始化成功后才 start）
+        self.stats_service = StatsService(context, self.mysql_mgr, self.config_mgr)
+
         # 初始化 Web API（注入总结存储实例供总结历史端点使用，注入人物分析服务与存储实例）
         self.web_api = WebAPI(
             context,
@@ -139,6 +170,7 @@ class GroupHistoryPlugin(Star):
             profile_service=self.profile_service,
             profile_storage=self.profile_service.storage,
             profile_renderer=self.profile_service.renderer,
+            stats_service=self.stats_service,
         )
 
         self._initialized = False
@@ -196,6 +228,11 @@ class GroupHistoryPlugin(Star):
                         await self.profile_service.start()
                     except Exception as e:
                         logger.error(f"[Profile] 启动人物分析服务失败: {e}")
+                    # 启动数据分析调度器（失败仅记日志，不阻断插件启动）
+                    try:
+                        await self.stats_service.start()
+                    except Exception as e:
+                        logger.error(f"[Stats] 启动数据分析服务失败: {e}")
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )
@@ -267,6 +304,11 @@ class GroupHistoryPlugin(Star):
                 return
             if not await self.config_mgr.is_group_enabled(group_id_int):
                 return
+
+            # v0.5.0 数据分析：白名单群的消息经过即登记 群→umo 推送目标缓存
+            # （定时日报/周报经 context.send_message(umo) 主动推送；服务未创建时跳过）
+            if self.stats_service is not None:
+                self.stats_service.record_group_umo(group_id, event.unified_msg_origin)
 
             # 解析消息链
             message_chain = event.get_messages()
@@ -618,6 +660,78 @@ class GroupHistoryPlugin(Star):
         """分析群成员发言习惯与人物画像。用法: /人物分析 [@成员 或 QQ号]"""
         await self.profile_service.handle_command(event, arg)
 
+    @filter.command("群统计", alias={"群数据", "统计"})
+    async def group_stats(self, event: AstrMessageEvent, arg: GreedyStr):
+        """群/个人数据统计图片报告卡。
+
+        用法: /群统计 [@某人 | QQ号] [时间范围]（参数顺序自由，均可省略）
+        时间范围: 今日（默认）/ 昨日 / 7天 / 30天 / 全部 / 单日或区间日期
+
+        参数注解用 ``GreedyStr``（框架内置指令同款写法）接收指令名之后的
+        **全部剩余文本**：普通 ``arg: str`` 注入只给第一个空格分词，会把
+        「2026-08-01 2026-08-04」空格分隔日期区间截断成单日。
+        """
+        try:
+            # 仅群环境有效：私聊回用法提示
+            group_id = event.get_group_id()
+            if not group_id:
+                yield event.plain_result(f"请在群内使用。\n{USAGE_TEXT}")
+                return
+
+            service = self.stats_service
+            if service is None:
+                yield event.plain_result("统计模块尚未就绪")
+                return
+
+            # 每群冷却（async，时长读 stats_cooldown）：冷却期内静默忽略——
+            # 不回复，仅经 finally 的 stop_event 阻止指令文本流入 LLM
+            if not await service.check_cooldown(str(group_id)):
+                return
+
+            # @ 目标：消息链提取（已剔除 "all"）后再剔除 bot 自身（写法同 profile）
+            at_targets = extract_at_targets(event.get_messages())
+            try:
+                self_id = str(event.get_self_id() or "")
+            except Exception:
+                self_id = ""
+            if self_id:
+                at_targets = [qq for qq in at_targets if qq != self_id]
+
+            # 解析指令参数（成员 + 时间范围）；失败回附带的用法文案
+            try:
+                member_id, time_range = parse_stats_args(arg or "", at_targets)
+            except StatsParseError as e:
+                yield event.plain_result(getattr(e, "usage", "") or USAGE_TEXT)
+                return
+
+            # 组装查询：top_n 读 stats_top_n 配置（typed 读取自带默认回退，
+            # build_stats 内部再夹住 1–50 防御）
+            query = StatsQuery(
+                group_id=str(group_id),
+                member_id=member_id,
+                time_range=time_range,
+                top_n=await self.config_mgr.get_stats_setting_typed("stats_top_n"),
+            )
+            try:
+                data = await service.build_stats(query)
+            except StatsBuildError as e:
+                yield event.plain_result(str(e))
+                return
+
+            # 渲染报告卡：成功发图片；失败降级纯文本摘要
+            image = await service.render(data, f"{group_id} 群聊统计")
+            if image:
+                yield event.image_result(image)
+            else:
+                yield event.plain_result(stats_fallback_text(data, time_range.label))
+        except Exception as e:
+            # 最外层兜底：任何异常不冒泡出 handler
+            logger.error(f"[Stats] 群统计指令处理异常: {e}", exc_info=True)
+            yield event.plain_result("统计失败，请稍后重试")
+        finally:
+            # 指令消息一律终止传播（含冷却静默路径），避免指令文本继续流入 LLM
+            event.stop_event()
+
     def _resolve_group_id(
         self, event: AstrMessageEvent, group_id_str: str
     ) -> int | None:
@@ -645,6 +759,11 @@ class GroupHistoryPlugin(Star):
                 await self._init_task
             except asyncio.CancelledError:
                 pass
+        # 停止数据分析调度器（LIFO：最后启动的最先停止；吞 CancelledError 不阻塞后续清理）
+        try:
+            await self.stats_service.stop()
+        except asyncio.CancelledError:
+            pass
         # 停止总结清理调度器（与 cleaner 停止并列，吞 CancelledError 不阻塞后续清理）
         try:
             await self.summary_service.stop()

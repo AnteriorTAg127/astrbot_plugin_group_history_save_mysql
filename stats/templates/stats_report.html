@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<!--
+  群聊数据统计 · T2I 报告模板（v0.5.0 模块 E）
+
+  由 StatsT2IRenderer.render_card 经 Star.html_render（标准 Jinja2 环境）渲染为图片，
+  /群统计 指令与定时日报/周报推送共用本模板（三端同源）。
+  单文件自包含：CSS / JS 全部内联，外部依赖仅 echarts（页面尾部 CDN 加载器
+  按 provider 顺序容灾加载，全挂时降级为纯 CSS 兜底图表，页面依然完整）。
+  与 summary_report.html / profile_report.html 同款设计语言（双主题 CSS 变量、
+  与 dashboard 同款设计令牌），画布 860px、基础字号 16px。
+
+  数据契约（StatsT2IRenderer._build_context 注入，键名不可更改）：
+    theme / title / label / group_desc / generated_at
+    cards{total_messages,total_images,active_senders,peak_hour_text}
+    trend[{date,count}] / trend_bars[{label,count,percent}] / trend_label_every
+    hour_dist[24] / weekday_dist[7] / peak_hour / peak_weekday
+    hour_bars[{label,count,percent,peak}] / weekday_bars[同]
+    hour_peak_label / weekday_peak_label
+    ranking[{id,name,chart_name,count,count_text,image_count,image_count_text,percent,highlight}]
+    member_in_ranking(bool)
+    group_ranking([{group_id,count,count_text,image_count_text,active_senders,percent}] | None)
+    member({id,name,count_text,image_count_text,ratio_text,rank_text,active_days,avg_text,
+            hour_dist,weekday_dist,peak_hour,peak_weekday,hour_bars,weekday_bars,
+            hour_peak_label,weekday_peak_label} | None)
+    disclaimer / cdn{providers,libs{echarts}}
+
+  安全约定（同 profile_report.html）：
+    - 所有用户数据（昵称 / 群号 / 标题）直出时统一附 |e 过滤器，autoescape
+      on/off 双环境均单次转义、不会双重转义；
+    - ECharts 数据经 |tojson 注入页面尾部内联 JS 变量（Jinja2 tojson 恒做 HTML
+      无害化，无论 autoescape 开关，尖括号 / & / 单引号均被 Unicode 转义为
+      \uXXXX），杜绝内联脚本块被注入数据提前闭合或构造新可执行标签。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title | e }}</title>
+<style>
+/* ===== 设计令牌（与 summary_report.html / profile_report.html / pages/dashboard/style.css 同款，双主题；组件禁止硬编码色值） ===== */
+:root {
+    --bg: #f0f2f5;
+    --surface: #ffffff;
+    --surface-hover: #f8f9fa;
+    --text: #1d2129;
+    --text-2: #4e5969;
+    --text-3: #86909c;
+    --border: #e5e6eb;
+    --primary: #165dff;
+    --primary-light: #e8f3ff;
+    --primary-hover: #4080ff;
+    --success: #00b42a;
+    --success-light: #e8ffea;
+    --warning: #ff7d00;
+    --warning-light: #fff7e8;
+    --danger: #f53f3f;
+    --danger-light: #ffece8;
+    --purple-light: #f5e8ff;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+    /* 模板专用补充令牌（dashboard 同源） */
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08);
+    --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    --dot: rgba(22, 93, 255, 0.055);        /* 页面点阵纹理 */
+    --headwash: rgba(22, 93, 255, 0.06);     /* 页首主色晕染 */
+    --chart-bar: rgba(22, 93, 255, 0.28);    /* 图表非峰值柱体浅色 */
+}
+
+[data-theme="dark"] {
+    --bg: #17171a;
+    --surface: #232324;
+    --surface-hover: #2a2a2b;
+    --text: #f6f6f6;
+    --text-2: #c9cdd4;
+    --text-3: #86909c;
+    --border: #3f3f3f;
+    --primary: #3c7eff;
+    --primary-light: #1a2a44;
+    --primary-hover: #5a94ff;
+    --success: #23c343;
+    --success-light: #162e1a;
+    --warning: #ff9a2e;
+    --warning-light: #332a1a;
+    --danger: #f76560;
+    --danger-light: #3d1f1e;
+    --purple-light: #2a1f3d;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.3);
+    --dot: rgba(60, 126, 255, 0.07);
+    --headwash: rgba(60, 126, 255, 0.09);
+    --chart-bar: rgba(60, 126, 255, 0.32);
+}
+
+/* ===== 基础 ===== */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--text);
+    background-color: var(--bg);
+    /* 分层氛围背景：页首主色晕染 + 细点阵纹理（全部走令牌，双主题自适应） */
+    background-image:
+        linear-gradient(180deg, var(--headwash) 0, transparent 240px),
+        radial-gradient(var(--dot) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* 画布：860px 宽，居中于 T2I 视口 */
+.page {
+    width: 860px;
+    margin: 0 auto;
+    padding: 22px;
+}
+
+/* ===== 报告头 ===== */
+.report-head { padding: 4px 4px 0; }
+
+.head-row { display: flex; align-items: center; gap: 12px; }
+
+.head-badge {
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.45rem;
+    border-radius: var(--radius);
+    background: var(--primary-light);
+    box-shadow: var(--shadow);
+}
+
+.head-title {
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.25;
+    letter-spacing: 0.5px;
+}
+
+.head-sub {
+    margin-top: 8px;
+    font-size: 14px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+
+.head-rule {
+    margin-top: 12px;
+    width: 60px;
+    height: 3px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, var(--primary), var(--primary-hover));
+}
+
+/* ===== 统计卡片行（对齐 dashboard .stat-card 形态） ===== */
+.stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.stat-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 14px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    transition: var(--transition);
+}
+
+.stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+
+.stat-icon {
+    width: 42px;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9px;
+    font-size: 1.2rem;
+    flex-shrink: 0;
+}
+
+/* 图标块底色（与 dashboard 同款辅色，双主题走令牌） */
+.stat-blue .stat-icon { background: var(--primary-light); }
+.stat-green .stat-icon { background: var(--success-light); }
+.stat-orange .stat-icon { background: var(--warning-light); }
+.stat-purple .stat-icon { background: var(--purple-light); }
+
+.stat-value {
+    font-size: 1.35rem;
+    font-weight: 700;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+}
+
+.stat-label {
+    font-size: 0.78rem;
+    color: var(--text-3);
+    margin-top: 2px;
+}
+
+/* ===== 通用 Section 卡片（对齐 dashboard .section-card） ===== */
+.section-card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-top: 14px;
+    box-shadow: var(--shadow);
+}
+
+/* 区块标题 20px/700 + 主色渐变侧标 */
+.section-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 12px;
+}
+
+.section-heading::before {
+    content: "";
+    flex-shrink: 0;
+    width: 5px;
+    height: 19px;
+    border-radius: 3px;
+    background: linear-gradient(180deg, var(--primary), var(--primary-hover));
+}
+
+/* ===== 图表通用 ===== */
+.chart-block { margin-top: 4px; }
+.chart-block + .chart-block { margin-top: 18px; }
+
+/* 子标题行 + 峰值胶囊徽标 */
+.chart-title {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-2);
+    margin-bottom: 8px;
+}
+
+.chart-peak {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--primary);
+    background: var(--primary-light);
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ECharts 容器（初始 display:none，加载成功后显示并隐藏 CSS 兜底） */
+.chart { width: 100%; }
+.chart-trend { height: 260px; }
+.chart-hour { height: 240px; }
+.chart-weekday { height: 200px; }
+.chart-member-hour { height: 200px; }
+.chart-member-weekday { height: 170px; }
+
+/* 纯 CSS 兜底竖向柱状图（永远在 DOM，ECharts 成功后隐藏） */
+.vbars { display: flex; gap: 3px; }
+.vbars--week { gap: 8px; }
+
+.vcol {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.vbar-track {
+    width: 100%;
+    height: 180px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+}
+
+.vbars--week .vbar-track { height: 140px; }
+
+.vbar {
+    width: 68%;
+    max-width: 20px;
+    border-radius: 4px 4px 0 0;
+    background: var(--chart-bar);
+}
+
+/* 峰值柱：主色渐变高亮 */
+.vcol--peak .vbar {
+    background: linear-gradient(180deg, var(--primary-hover), var(--primary));
+}
+
+.vlabel {
+    margin-top: 5px;
+    font-size: 11px;
+    line-height: 1.2;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+
+.vcol--peak .vlabel { color: var(--primary); font-weight: 700; }
+
+/* 每日趋势 CSS 兜底变体：柱更窄、轨道更矮，适配最多 366 根柱 */
+.vbars--trend { gap: 2px; }
+.vbars--trend .vbar-track { height: 160px; }
+.vbars--trend .vbar { width: 100%; max-width: none; border-radius: 2px 2px 0 0; }
+.vbars--trend .vlabel { font-size: 10px; }
+
+/* ===== 排行（ECharts 横向条形 + 纯 CSS 兜底，复用 profile 排行范式） ===== */
+.rank-css { display: flex; flex-direction: column; gap: 12px; }
+
+.rank-row {
+    display: grid;
+    grid-template-columns: 116px 1fr 96px;
+    align-items: center;
+    gap: 12px;
+    padding: 5px 8px;
+    border-radius: var(--radius-sm);
+}
+
+/* member 维度目标成员行高亮 */
+.rank-row--hl {
+    background: var(--primary-light);
+    box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.rank-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-2);
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.rank-row--hl .rank-name { color: var(--primary); }
+
+/* 横条轨道与柱体（dashboard .daily-bar 同款主色渐变） */
+.rank-track {
+    height: 24px;
+    background: var(--bg);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.rank-bar {
+    height: 100%;
+    min-width: 3px;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--primary), var(--primary-hover));
+}
+
+.rank-count {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    font-size: 14px;
+    font-weight: 700;
+    text-align: right;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+.rank-row--hl .rank-count { color: var(--primary); }
+
+/* 消息数下方的小字（图片数 / 活跃人数） */
+.rank-sub {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-3);
+    line-height: 1.3;
+}
+
+/* ===== 个人数据（member 区） ===== */
+.member-id {
+    font-size: 13px;
+    color: var(--text-3);
+    margin: -6px 0 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.member-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.member-stat {
+    background: var(--bg);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    text-align: center;
+}
+
+.ms-value {
+    font-size: 1.15rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.ms-label {
+    font-size: 0.75rem;
+    color: var(--text-3);
+    margin-top: 2px;
+}
+
+/* ===== 页脚 ===== */
+.report-foot {
+    margin-top: 18px;
+    padding: 0 4px 4px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-3);
+}
+
+.foot-disclaimer {
+    font-weight: 600;
+    color: var(--warning);
+    margin-bottom: 6px;
+}
+
+.foot-meta { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body data-theme="{{ theme }}">
+<div class="page">
+
+    <!-- ===== 报告头：📊 徽标 + 标题 + 副信息行（群描述 / 时间范围 / 生成时间） ===== -->
+    <header class="report-head">
+        <div class="head-row">
+            <div class="head-badge">📊</div>
+            <h1 class="head-title">{{ title | e }}</h1>
+        </div>
+        <p class="head-sub">{{ group_desc | e }} · {{ label | e }} · 生成于 {{ generated_at | e }}</p>
+        <div class="head-rule"></div>
+    </header>
+
+    <!-- ===== 统计卡片行（4 卡：总消息 / 图片数 / 活跃成员 / 峰值时段） ===== -->
+    <section class="stat-row">
+        <div class="stat-card stat-blue">
+            <div class="stat-icon">💬</div>
+            <div>
+                <div class="stat-value">{{ cards.total_messages }}</div>
+                <div class="stat-label">总消息数</div>
+            </div>
+        </div>
+        <div class="stat-card stat-green">
+            <div class="stat-icon">🖼️</div>
+            <div>
+                <div class="stat-value">{{ cards.total_images }}</div>
+                <div class="stat-label">图片数（快照）</div>
+            </div>
+        </div>
+        <div class="stat-card stat-orange">
+            <div class="stat-icon">👥</div>
+            <div>
+                <div class="stat-value">{{ cards.active_senders }}</div>
+                <div class="stat-label">活跃成员</div>
+            </div>
+        </div>
+        <div class="stat-card stat-purple">
+            <div class="stat-icon">⏰</div>
+            <div>
+                <div class="stat-value">{{ cards.peak_hour_text }}</div>
+                <div class="stat-label">峰值时段</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== 每日趋势：ECharts 容器初始隐藏，加载成功后显示并隐藏 CSS 兜底；
+         CDN 全挂时纯 CSS 兜底柱图永远在 DOM，页面依然完整。 ===== -->
+    <section class="section-card">
+        <h2 class="section-heading">📈 每日趋势</h2>
+        <div id="trend-chart" class="chart chart-trend" style="display:none"></div>
+        <div id="trend-css" class="vbars vbars--trend">
+            {% for b in trend_bars %}
+            <div class="vcol" title="{{ b.label | e }} · {{ b.count }} 条">
+                <div class="vbar-track">
+                    <div class="vbar" style="height:{{ '%.2f'|format(b.percent) }}%"></div>
+                </div>
+                <div class="vlabel">{% if (loop.index0 % trend_label_every) == 0 %}{{ b.label | e }}{% endif %}</div>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+
+    {% if ranking %}
+    <!-- ===== 发言人排行：ECharts 横向条形图（inverse 保序）+ 纯 CSS 渐变横条兜底（永远在 DOM） ===== -->
+    <section class="section-card">
+        <h2 class="section-heading">🏆 发言人排行{% if member_in_ranking %}<span class="chart-peak">高亮：{{ member.name | e }}</span>{% endif %}</h2>
+        <div id="rank-chart" class="chart" style="display:none"></div>
+        <div id="rank-css" class="rank-css">
+            {% for r in ranking %}
+            <div class="rank-row{% if r.highlight %} rank-row--hl{% endif %}">
+                <span class="rank-name" title="{{ r.name | e }}">{{ r.name | e }}</span>
+                <div class="rank-track">
+                    <div class="rank-bar" style="width:{{ '%.2f'|format(r.percent) }}%"></div>
+                </div>
+                <span class="rank-count">{{ r.count_text }}<span class="rank-sub">图片 {{ r.image_count_text }}</span></span>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    <!-- ===== 活跃时段分布：24 小时 + 星期（ECharts 峰值高亮；CSS 竖柱兜底） ===== -->
+    <section class="section-card">
+        <h2 class="section-heading">🕐 活跃时段分布</h2>
+
+        <div class="chart-block">
+            <div class="chart-title">按小时分布{% if hour_peak_label %}<span class="chart-peak">峰值 {{ hour_peak_label | e }}</span>{% endif %}</div>
+            <div id="hour-chart" class="chart chart-hour" style="display:none"></div>
+            <div id="hour-css" class="vbars">
+                {% for b in hour_bars %}
+                <div class="vcol{% if b.peak %} vcol--peak{% endif %}" title="{{ b.label | e }}点 · {{ b.count }} 条">
+                    <div class="vbar-track">
+                        <div class="vbar" style="height:{{ '%.2f'|format(b.percent) }}%"></div>
+                    </div>
+                    <div class="vlabel">{{ b.label | e }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="chart-block">
+            <div class="chart-title">按星期分布{% if weekday_peak_label %}<span class="chart-peak">峰值 {{ weekday_peak_label | e }}</span>{% endif %}</div>
+            <div id="weekday-chart" class="chart chart-weekday" style="display:none"></div>
+            <div id="weekday-css" class="vbars vbars--week">
+                {% for b in weekday_bars %}
+                <div class="vcol{% if b.peak %} vcol--peak{% endif %}" title="{{ b.label | e }} · {{ b.count }} 条">
+                    <div class="vbar-track">
+                        <div class="vbar" style="height:{{ '%.2f'|format(b.percent) }}%"></div>
+                    </div>
+                    <div class="vlabel">{{ b.label | e }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </section>
+
+    {% if group_ranking %}
+    <!-- ===== 群排行（仅全部群视图：上下文存在 group_ranking 时渲染） ===== -->
+    <section class="section-card">
+        <h2 class="section-heading">🏅 群排行</h2>
+        <div class="rank-css">
+            {% for g in group_ranking %}
+            <div class="rank-row">
+                <span class="rank-name" title="{{ g.group_id | e }}">{{ g.group_id | e }}</span>
+                <div class="rank-track">
+                    <div class="rank-bar" style="width:{{ '%.2f'|format(g.percent) }}%"></div>
+                </div>
+                <span class="rank-count">{{ g.count_text }}<span class="rank-sub">图片 {{ g.image_count_text }} · 活跃 {{ g.active_senders }} 人</span></span>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    {% if member %}
+    <!-- ===== 个人数据（可选：member_id 非 None 时渲染） ===== -->
+    <section class="section-card" id="member-section">
+        <h2 class="section-heading">👤 个人数据 · {{ member.name | e }}</h2>
+        <p class="member-id">QQ {{ member.id | e }}</p>
+
+        <div class="member-grid">
+            <div class="member-stat">
+                <div class="ms-value">{{ member.count_text }}</div>
+                <div class="ms-label">消息数</div>
+            </div>
+            <div class="member-stat">
+                <div class="ms-value">{{ member.image_count_text }}</div>
+                <div class="ms-label">图片数（快照）</div>
+            </div>
+            <div class="member-stat">
+                <div class="ms-value">{{ member.ratio_text }}</div>
+                <div class="ms-label">占群比例</div>
+            </div>
+            <div class="member-stat">
+                <div class="ms-value">{{ member.rank_text }}</div>
+                <div class="ms-label">群内名次</div>
+            </div>
+            <div class="member-stat">
+                <div class="ms-value">{{ member.active_days }}</div>
+                <div class="ms-label">活跃天数</div>
+            </div>
+            <div class="member-stat">
+                <div class="ms-value">{{ member.avg_text }}</div>
+                <div class="ms-label">日均条数</div>
+            </div>
+        </div>
+
+        <div class="chart-block">
+            <div class="chart-title">TA 的按小时分布{% if member.hour_peak_label %}<span class="chart-peak">峰值 {{ member.hour_peak_label | e }}</span>{% endif %}</div>
+            <div id="member-hour-chart" class="chart chart-member-hour" style="display:none"></div>
+            <div id="member-hour-css" class="vbars">
+                {% for b in member.hour_bars %}
+                <div class="vcol{% if b.peak %} vcol--peak{% endif %}" title="{{ b.label | e }}点 · {{ b.count }} 条">
+                    <div class="vbar-track">
+                        <div class="vbar" style="height:{{ '%.2f'|format(b.percent) }}%"></div>
+                    </div>
+                    <div class="vlabel">{{ b.label | e }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="chart-block">
+            <div class="chart-title">TA 的按星期分布{% if member.weekday_peak_label %}<span class="chart-peak">峰值 {{ member.weekday_peak_label | e }}</span>{% endif %}</div>
+            <div id="member-weekday-chart" class="chart chart-member-weekday" style="display:none"></div>
+            <div id="member-weekday-css" class="vbars vbars--week">
+                {% for b in member.weekday_bars %}
+                <div class="vcol{% if b.peak %} vcol--peak{% endif %}" title="{{ b.label | e }} · {{ b.count }} 条">
+                    <div class="vbar-track">
+                        <div class="vbar" style="height:{{ '%.2f'|format(b.percent) }}%"></div>
+                    </div>
+                    <div class="vlabel">{{ b.label | e }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </section>
+    {% endif %}
+
+    <!-- ===== 页脚：免责声明（图片数为小时级快照 Top K 口径）+ 插件署名 ===== -->
+    <footer class="report-foot">
+        <div class="foot-disclaimer">⚠️ {{ disclaimer | e }}</div>
+        <div class="foot-meta">由 群聊数据分析 生成</div>
+    </footer>
+
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    /* ===== 数据注入（|tojson 恒做 HTML 无害化，防 XSS / 模板逃逸） ===== */
+    var CDN = {{ cdn | tojson }};
+    var TREND = {{ trend | tojson }};
+    var HOUR_DIST = {{ hour_dist | tojson }};
+    var WEEKDAY_DIST = {{ weekday_dist | tojson }};
+    var PEAK_HOUR = {{ peak_hour | tojson }};
+    var PEAK_WEEKDAY = {{ peak_weekday | tojson }};
+    var RANKING = {{ ranking | tojson }};
+    {% if member %}
+    var MEMBER_HOUR_DIST = {{ member.hour_dist | tojson }};
+    var MEMBER_WEEKDAY_DIST = {{ member.weekday_dist | tojson }};
+    var MEMBER_PEAK_HOUR = {{ member.peak_hour | tojson }};
+    var MEMBER_PEAK_WEEKDAY = {{ member.peak_weekday | tojson }};
+    {% else %}
+    var MEMBER_HOUR_DIST = [];
+    var MEMBER_WEEKDAY_DIST = [];
+    var MEMBER_PEAK_HOUR = null;
+    var MEMBER_PEAK_WEEKDAY = null;
+    {% endif %}
+    var WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+    var HOUR_LABELS = HOUR_DIST.map(function (v, i) { return String(i); });
+
+    /* ===== CDN 加载器（移植自 profile_report.html） =====
+     * URL 拼装规则表：与 Python 侧配置解析一致的冗余实现，加载器自包含、
+     * 不依赖 Python；未知 provider key 自动忽略，列表为空回退默认顺序。 */
+    var CDN_URLS = {
+        bootcdn: function (p, v, f) { return "https://cdn.bootcdn.net/ajax/libs/" + p + "/" + v + "/" + f; },
+        npmmirror: function (p, v, f) { return "https://registry.npmmirror.com/" + p + "/" + v + "/files/" + f; },
+        staticfile: function (p, v, f) { return "https://cdn.staticfile.org/" + p + "/" + v + "/" + f; },
+        jsdelivr: function (p, v, f) { return "https://cdn.jsdelivr.net/npm/" + p + "@" + v + "/" + f; },
+        unpkg: function (p, v, f) { return "https://unpkg.com/" + p + "@" + v + "/" + f; }
+    };
+    var DEFAULT_PROVIDERS = ["bootcdn", "npmmirror", "staticfile", "jsdelivr", "unpkg"];
+    var NODE_TIMEOUT = 8000; /* 单节点脚本级超时（ms） */
+
+    /* 按 provider 顺序加载单个库。
+     * 成功判定：onload 触发 且 window[lib.global] 存在；
+     * 失败判定：onerror 或 8s 超时 → 立即切换下一节点；
+     * 全部节点失败 resolve(null)，永不 reject（降级交给 CSS 兜底形态）。 */
+    function loadLib(lib) {
+        return new Promise(function (resolve) {
+            var providers = (CDN && CDN.providers && CDN.providers.length)
+                ? CDN.providers : DEFAULT_PROVIDERS;
+            var idx = 0;
+
+            function tryNext() {
+                while (idx < providers.length && !CDN_URLS[providers[idx]]) { idx++; }
+                if (idx >= providers.length) { resolve(null); return; }
+                var key = providers[idx++];
+                var script = document.createElement("script");
+                script.src = CDN_URLS[key](lib.pkg, lib.ver, lib.file);
+                var settled = false;
+                var timer = setTimeout(fail, NODE_TIMEOUT);
+
+                function fail() {
+                    if (settled) { return; }
+                    settled = true;
+                    clearTimeout(timer);
+                    script.onload = script.onerror = null;
+                    if (script.parentNode) { script.parentNode.removeChild(script); }
+                    console.warn("[Stats] CDN 节点不可用: " + key + "（" + lib.pkg + "），切换下一节点");
+                    tryNext();
+                }
+
+                script.onerror = fail;
+                script.onload = function () {
+                    if (window[lib.global]) {
+                        if (settled) { return; }
+                        settled = true;
+                        clearTimeout(timer);
+                        console.info("[Stats] " + lib.pkg + " 经 " + key + " 加载成功");
+                        resolve(key);
+                    } else {
+                        fail(); /* 脚本返回但全局对象缺失 → 视为节点失败 */
+                    }
+                };
+                document.head.appendChild(script);
+            }
+
+            tryNext();
+        });
+    }
+
+    /* ===== 主题色读取辅助（读 CSS 令牌，避免硬编码泄漏） ===== */
+    function tv(name, fb) {
+        var v = getComputedStyle(document.body).getPropertyValue(name);
+        return (v && v.trim()) ? v.trim() : fb;
+    }
+
+    /* ===== 每日趋势柱状图：数据点多时自动旋转标签并启用自动间隔 ===== */
+    function renderTrendChart() {
+        var box = document.getElementById("trend-chart");
+        var cssBox = document.getElementById("trend-css");
+        if (!box || !cssBox || !TREND || !TREND.length) { return; }
+        box.style.display = "block"; /* 先显示容器，保证 echarts.init 拿到真实宽高 */
+        try {
+            var n = TREND.length;
+            var rotate = n > 31 ? 60 : (n > 14 ? 45 : 0);
+            var chart = echarts.init(box);
+            chart.setOption({
+                grid: { left: 48, right: 12, top: 18, bottom: rotate ? 46 : 26 },
+                tooltip: { trigger: "axis" },
+                xAxis: {
+                    type: "category",
+                    data: TREND.map(function (t) { return String(t.date).slice(5); }),
+                    axisLabel: {
+                        fontSize: 11,
+                        rotate: rotate,
+                        interval: n > 31 ? "auto" : 0,
+                        color: tv("--text-3", "#86909c")
+                    },
+                    axisTick: { alignWithLabel: true },
+                    axisLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                yAxis: {
+                    type: "value",
+                    minInterval: 1,
+                    axisLabel: { fontSize: 11, color: tv("--text-3", "#86909c") },
+                    splitLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                series: [{
+                    type: "bar",
+                    barMaxWidth: 26,
+                    data: TREND.map(function (t) { return t.count; }),
+                    itemStyle: {
+                        color: tv("--primary", "#165dff"),
+                        borderRadius: [4, 4, 0, 0]
+                    }
+                }]
+            });
+            cssBox.style.display = "none"; /* 图表就绪 → 隐藏 CSS 兜底柱图 */
+        } catch (e) {
+            /* 初始化失败 → 还原 CSS 兜底柱图 */
+            box.style.display = "none";
+            cssBox.style.display = "";
+        }
+    }
+
+    /* ===== 竖向柱状图通用构建器（群/个人的小时、星期分布共用） =====
+     * 峰值柱以 --primary 高亮，其余柱走 --chart-bar 浅色令牌；peakIdx 可为
+     * null（全零分布无高亮）；成功 → 隐藏 CSS 兜底；init 异常 → 还原 CSS
+     * 兜底（降级而非渲染失败）。 */
+    function renderVBarChart(chartId, cssId, dist, peakIdx, xLabels) {
+        var box = document.getElementById(chartId);
+        var cssBox = document.getElementById(cssId);
+        if (!box || !cssBox || !dist || !dist.length) { return; }
+        box.style.display = "block";
+        try {
+            var primary = tv("--primary", "#165dff");
+            var muted = tv("--chart-bar", "rgba(22, 93, 255, 0.28)");
+            var chart = echarts.init(box);
+            chart.setOption({
+                grid: { left: 40, right: 12, top: 18, bottom: 26 },
+                xAxis: {
+                    type: "category",
+                    data: xLabels,
+                    axisLabel: { fontSize: 11, interval: 0, color: tv("--text-3", "#86909c") },
+                    axisTick: { alignWithLabel: true },
+                    axisLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                yAxis: {
+                    type: "value",
+                    minInterval: 1,
+                    axisLabel: { fontSize: 11, color: tv("--text-3", "#86909c") },
+                    splitLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                series: [{
+                    type: "bar",
+                    barWidth: "62%",
+                    data: dist.map(function (v, i) {
+                        var isPeak = (peakIdx !== null) && (i === peakIdx) && v > 0;
+                        return {
+                            value: v,
+                            itemStyle: {
+                                color: isPeak ? primary : muted,
+                                borderRadius: [4, 4, 0, 0]
+                            }
+                        };
+                    })
+                }]
+            });
+            cssBox.style.display = "none"; /* 图表就绪 → 隐藏 CSS 兜底柱图 */
+        } catch (e) {
+            /* 初始化失败 → 还原 CSS 兜底柱图 */
+            box.style.display = "none";
+            cssBox.style.display = "";
+        }
+    }
+
+    /* ===== 发言人排行图表（横向条形，inverse 保序；member 维度目标成员以
+     * --warning 高亮，悬停提示含图片数） ===== */
+    function renderRankChart() {
+        var box = document.getElementById("rank-chart");
+        var cssBox = document.getElementById("rank-css");
+        /* 容器缺失（ranking 为空时区块整体不输出）或数据为空 → 跳过 */
+        if (!box || !cssBox || !RANKING || !RANKING.length) { return; }
+        /* 高度随行数自适应：行高 40px + 底部轴留白 */
+        box.style.height = (RANKING.length * 40 + 36) + "px";
+        box.style.display = "block";
+        try {
+            var primary = tv("--primary", "#165dff");
+            var warn = tv("--warning", "#ff7d00");
+            var chart = echarts.init(box);
+            chart.setOption({
+                grid: { left: 116, right: 72, top: 8, bottom: 24 },
+                tooltip: {
+                    trigger: "item",
+                    formatter: function (p) {
+                        var it = RANKING[p.dataIndex] || {};
+                        return it.name + "：" + it.count + " 条（图片 " + it.image_count + "）";
+                    }
+                },
+                xAxis: {
+                    type: "value",
+                    minInterval: 1,
+                    axisLabel: { fontSize: 13, color: tv("--text-3", "#86909c") },
+                    splitLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                yAxis: {
+                    type: "category",
+                    inverse: true, /* 保持第一名在最上 */
+                    data: RANKING.map(function (r) { return r.chart_name; }),
+                    axisLabel: { fontSize: 14, color: tv("--text-2", "#4e5969") },
+                    axisTick: { show: false },
+                    axisLine: { lineStyle: { color: tv("--border", "#e5e6eb") } }
+                },
+                series: [{
+                    type: "bar",
+                    barWidth: 22,
+                    data: RANKING.map(function (r) {
+                        return {
+                            value: r.count,
+                            itemStyle: {
+                                color: r.highlight ? warn : primary,
+                                borderRadius: [0, 7, 7, 0]
+                            }
+                        };
+                    }),
+                    label: {
+                        show: true,
+                        position: "right",
+                        fontSize: 13,
+                        fontWeight: 600,
+                        color: tv("--text-2", "#4e5969")
+                    }
+                }]
+            });
+            cssBox.style.display = "none"; /* 图表就绪 → 隐藏 CSS 兜底横条 */
+        } catch (e) {
+            /* 初始化失败 → 还原 CSS 兜底横条（降级而非渲染失败） */
+            box.style.display = "none";
+            cssBox.style.display = "";
+        }
+    }
+
+    /* ===== 主流程：echarts 加载成功才初始化图表，全挂时保留纯 CSS 兜底 ===== */
+    var libs = (CDN && CDN.libs) || {};
+    Promise.all([
+        libs.echarts ? loadLib(libs.echarts) : Promise.resolve(null)
+    ]).then(function () {
+        if (!window.echarts) { return; }
+        renderTrendChart();
+        renderRankChart();
+        renderVBarChart("hour-chart", "hour-css", HOUR_DIST, PEAK_HOUR, HOUR_LABELS);
+        renderVBarChart("weekday-chart", "weekday-css", WEEKDAY_DIST, PEAK_WEEKDAY, WEEKDAY_LABELS);
+        /* member 区图表：容器仅在 member 存在时渲染，renderVBarChart 内按 id 兜底 */
+        if (MEMBER_HOUR_DIST.length) {
+            renderVBarChart("member-hour-chart", "member-hour-css",
+                MEMBER_HOUR_DIST, MEMBER_PEAK_HOUR, HOUR_LABELS);
+        }
+        if (MEMBER_WEEKDAY_DIST.length) {
+            renderVBarChart("member-weekday-chart", "member-weekday-css",
+                MEMBER_WEEKDAY_DIST, MEMBER_PEAK_WEEKDAY, WEEKDAY_LABELS);
+        }
+    });
+})();
+</script>
+</body>
+</html>

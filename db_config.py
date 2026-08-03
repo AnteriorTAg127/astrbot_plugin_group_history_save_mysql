@@ -1,11 +1,13 @@
 """本地配置存储层（aiosqlite）。
 
-负责管理群白名单和插件设置的本地持久化存储。
+负责管理群白名单、插件设置、总结/人物分析/数据分析配置、群推送开关与
+图片统计快照的本地持久化存储。
 数据文件位于 data/plugin_data/astrbot_plugin_group_history_save_mysql/config.db
 """
 
 import asyncio
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -176,6 +178,53 @@ class ConfigManager:
         "profile_keep_days": "int",
     }
 
+    # ========== 数据分析功能配置常量（v0.5.0） ==========
+
+    # 数据分析功能 8 项配置的默认值（见 PRD §3）。值一律字符串存储。
+    # 同时作为初始化播种目标与 dashboard「恢复默认」的目标值。
+    STATS_DEFAULTS: dict[str, str] = {
+        # 排行展示条数（合法范围 1–50）
+        "stats_top_n": "10",
+        # /群统计 指令每群冷却秒数（合法范围 0–600）
+        "stats_cooldown": "30",
+        # 图片快照每小时每群个人 Top K（合法范围 1–100）
+        "stats_image_top_k": "20",
+        # 日报全局总开关（仍需群级开关同时开启才推送）
+        "push_daily_enabled": "true",
+        # 日报推送时间（HH:MM，24 小时制）
+        "push_daily_time": "21:00",
+        # 周报开关（可选功能，默认关）
+        "push_weekly_enabled": "false",
+        # 周报推送星期（1=周一 … 7=周日）
+        "push_weekly_weekday": "1",
+        # 周报推送时间（HH:MM，24 小时制）
+        "push_weekly_time": "09:00",
+    }
+
+    # 各配置键的值类型声明（字符串形式 "bool"/"int"/"str"），供
+    # get_stats_setting_typed() 类型化读取与 set_stats_setting() 写入校验使用
+    STATS_TYPES: dict[str, str] = {
+        "stats_top_n": "int",
+        "stats_cooldown": "int",
+        "stats_image_top_k": "int",
+        "push_daily_enabled": "bool",
+        "push_daily_time": "str",
+        "push_weekly_enabled": "bool",
+        "push_weekly_weekday": "int",
+        "push_weekly_time": "str",
+    }
+
+    # int 型配置合法范围（闭区间），超范围的写入请求整体拒绝
+    STATS_RANGES: dict[str, tuple[int, int]] = {
+        "stats_top_n": (1, 50),
+        "stats_cooldown": (0, 600),
+        "stats_image_top_k": (1, 100),
+        "push_weekly_weekday": (1, 7),
+    }
+
+    # HH:MM 时间格式配置键，写入时校验并归一化为两位补零形式
+    STATS_TIME_KEYS: tuple[str, ...] = ("push_daily_time", "push_weekly_time")
+
     def __init__(self):
         # 使用 StarTools.get_data_dir() 获取规范的数据目录（返回 Path，已自动创建）
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
@@ -228,7 +277,7 @@ class ConfigManager:
                 raise
 
     async def _create_tables(self):
-        """创建群配置表、插件设置表，以及 v0.3 总结配置表与忽略名单表。"""
+        """创建群配置表、插件设置表，以及总结/人物分析/数据分析各功能表。"""
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS group_config (
                 group_id INTEGER PRIMARY KEY,
@@ -265,6 +314,45 @@ class ConfigManager:
                 value TEXT NOT NULL
             )
         """)
+        # v0.5.0：数据分析功能配置表（key/value 形式，8 项配置统一落库）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS stats_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # v0.5.0：群级推送开关表（以 group_config 白名单为准，
+        # 不在白名单的 push_group 行在 get_push_groups 中忽略）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS push_group (
+                group_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # v0.5.0：图片统计小时级快照（群级全量），主键 (date, hour, group_id)。
+        # 定时 UPSERT 覆盖写，解决 image_records 滚动清理后无法回溯统计
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS image_stats_hourly (
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                image_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, group_id)
+            )
+        """)
+        # v0.5.0：图片统计小时级快照（每小时每群个人 Top K），
+        # 主键 (date, hour, group_id, sender_id)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS image_stats_hourly_top (
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
+                image_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, hour, group_id, sender_id)
+            )
+        """)
         await self.db.commit()
 
     async def _init_default_settings(self):
@@ -289,6 +377,12 @@ class ConfigManager:
         for key, value in self.PROFILE_DEFAULTS.items():
             await self.db.execute(
                 "INSERT OR IGNORE INTO profile_settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        # v0.5.0：数据分析功能 8 项配置播种（范式同 summary/profile_settings）
+        for key, value in self.STATS_DEFAULTS.items():
+            await self.db.execute(
+                "INSERT OR IGNORE INTO stats_settings (key, value) VALUES (?, ?)",
                 (key, value),
             )
         await self.db.commit()
@@ -946,3 +1040,372 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"[HistorySummary] 获取忽略群列表失败: {e}")
             return []
+
+    # ========== 数据分析配置（v0.5.0） ==========
+
+    @staticmethod
+    def _convert_stats_value(value: str, target: str):
+        """将配置字符串按声明类型字符串转换，失败时抛出异常由调用方兜底。
+
+        Args:
+            value: 数据库中存储的原始字符串
+            target: STATS_TYPES 声明的目标类型字符串（"bool"/"int"/"str"）
+
+        Returns:
+            转换后的值
+
+        Raises:
+            ValueError: 值无法解析为目标类型（如 bool 串非法、int 串非数字）
+        """
+        if target == "bool":
+            # 不能直接 bool(value)（"false" 也是真值），必须显式匹配字符串
+            lowered = value.strip().lower()
+            if lowered in ("true", "1"):
+                return True
+            if lowered in ("false", "0"):
+                return False
+            raise ValueError(f"无法识别的布尔值: {value!r}")
+        if target == "int":
+            return int(value)
+        return value
+
+    @classmethod
+    def _validate_stats_setting(cls, key: str, str_value: str) -> str | None:
+        """按类型 + 范围 + HH:MM 格式校验配置值。
+
+        Args:
+            key: 配置键（必须在 STATS_TYPES 中声明）
+            str_value: 已归一化为字符串的待写入值
+
+        Returns:
+            str | None: 合法时返回归一化后的存储字符串（int 去前导零、
+            bool 归一 "true"/"false"、时间两位补零）；
+            类型/范围/格式任一不合法时返回 None
+        """
+        target = cls.STATS_TYPES[key]
+        try:
+            converted = cls._convert_stats_value(str_value, target)
+        except (ValueError, TypeError):
+            return None
+        if target == "bool":
+            # 归一化存储，避免 "1"/"0" 与 "true"/"false" 混存
+            return "true" if converted else "false"
+        # int 键范围校验（STATS_RANGES 声明的闭区间）
+        if key in cls.STATS_RANGES:
+            low, high = cls.STATS_RANGES[key]
+            if not low <= converted <= high:
+                return None
+            return str(converted)
+        # HH:MM 时间键格式校验（容忍一位小时数，归一化为两位补零）
+        if key in cls.STATS_TIME_KEYS:
+            match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str_value.strip())
+            if match is None:
+                return None
+            return f"{int(match.group(1)):02d}:{match.group(2)}"
+        return str_value
+
+    async def get_stats_setting(self, key: str) -> str:
+        """获取数据分析配置值（字符串形式）。
+
+        键在表中缺失时自动以规范默认值播种（INSERT OR IGNORE，绝不覆盖并发/已存值）；
+        键不在 STATS_DEFAULTS 中时返回空串。
+
+        Args:
+            key: 配置键（STATS_DEFAULTS 8 项之一）
+
+        Returns:
+            str: 配置值（字符串形式）
+        """
+        fallback = self.STATS_DEFAULTS.get(key, "")
+        try:
+            await self._ensure_db()
+            async with self.db.execute(
+                "SELECT value FROM stats_settings WHERE key = ?", (key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                return row[0]
+            # 缺失键自动播种：OR IGNORE 保证并发与重复调用下不覆盖已插入值
+            if key in self.STATS_DEFAULTS:
+                await self.db.execute(
+                    "INSERT OR IGNORE INTO stats_settings (key, value) VALUES (?, ?)",
+                    (key, fallback),
+                )
+                await self.db.commit()
+            return fallback
+        except Exception as e:
+            logger.error(f"[Stats] 获取数据分析配置失败: {e}")
+            return fallback
+
+    async def get_stats_setting_typed(self, key: str) -> Any:
+        """获取数据分析配置并按 STATS_TYPES 声明的类型转换。
+
+        bool 识别 "true"/"false"/"1"/"0"（大小写不敏感）。
+        转换失败时记录 warning 并回退默认值的同类型结果。
+
+        Args:
+            key: 配置键
+
+        Returns:
+            声明类型的配置值（未在 STATS_TYPES 中声明的键按字符串原样返回）
+        """
+        raw = await self.get_stats_setting(key)
+        target = self.STATS_TYPES.get(key, "str")
+        try:
+            return self._convert_stats_value(raw, target)
+        except Exception as e:
+            logger.warning(
+                f"[Stats] 配置 {key} 的值 {raw!r} 类型转换失败，回退默认值: {e}"
+            )
+            default_raw = self.STATS_DEFAULTS.get(key, "")
+            try:
+                return self._convert_stats_value(default_raw, target)
+            except Exception:
+                # 默认值构造上保证合法，此分支仅为最终兜底
+                return default_raw
+
+    async def set_stats_setting(self, key: str, value: Any) -> bool:
+        """保存单项数据分析配置（先校验后写入，非法值拒绝写入）。
+
+        校验链：未知键 → 类型（STATS_TYPES）→ 范围（STATS_RANGES 闭区间）→
+        HH:MM 格式（STATS_TIME_KEYS，归一化两位补零）。
+        值归一化：bool→"true"/"false"；其余→str()。
+
+        Args:
+            key: 配置键
+            value: 配置值（任意可归一化类型）
+
+        Returns:
+            bool: 是否保存成功（键未知、值非法或数据库写入异常时返回 False）
+        """
+        if key not in self.STATS_TYPES:
+            logger.warning(f"[Stats] 忽略未知配置键: {key}")
+            return False
+        # 值归一化为存储字符串（范式同 save_profile_settings）
+        if isinstance(value, bool):
+            str_value = "true" if value else "false"
+        else:
+            str_value = str(value)
+        normalized = self._validate_stats_setting(key, str_value)
+        if normalized is None:
+            logger.warning(
+                f"[Stats] 配置项 {key} 的值 {str_value!r} 非法（类型/范围/格式），"
+                "本次不写入"
+            )
+            return False
+        try:
+            await self._ensure_db()
+            await self.db.execute(
+                "INSERT OR REPLACE INTO stats_settings (key, value) VALUES (?, ?)",
+                (key, normalized),
+            )
+            await self.db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[Stats] 保存数据分析配置失败: {e}")
+            return False
+
+    async def get_all_stats_settings(self) -> dict[str, Any]:
+        """获取全部数据分析配置（完整 8 项，缺失以默认值补全，逐项类型化）。
+
+        各值按 STATS_TYPES 声明类型转换；单项非法值回退该项默认值的同类型结果。
+
+        Returns:
+            dict[str, Any]: 按 STATS_DEFAULTS 顺序的完整 typed 配置字典
+            （数据库异常时返回空字典）
+        """
+        try:
+            await self._ensure_db()
+            async with self.db.execute(
+                "SELECT key, value FROM stats_settings"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            stored = {row[0]: row[1] for row in rows}
+            # 以 STATS_DEFAULTS 为骨架补全缺失项，保证返回恒为完整 8 项
+            result: dict[str, Any] = {}
+            for key, default_raw in self.STATS_DEFAULTS.items():
+                raw = stored.get(key, default_raw)
+                target = self.STATS_TYPES.get(key, "str")
+                try:
+                    result[key] = self._convert_stats_value(raw, target)
+                except Exception:
+                    # 非法值回退默认值的同类型结果（默认值构造上保证合法）
+                    try:
+                        result[key] = self._convert_stats_value(default_raw, target)
+                    except Exception:
+                        result[key] = default_raw
+            return result
+        except Exception as e:
+            logger.error(f"[Stats] 获取所有数据分析配置失败: {e}")
+            return {}
+
+    async def reset_stats_settings(self) -> None:
+        """将数据分析功能全部 8 项配置重置为 STATS_DEFAULTS 默认值。"""
+        try:
+            await self._ensure_db()
+            for key, value in self.STATS_DEFAULTS.items():
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO stats_settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+            await self.db.commit()
+        except Exception as e:
+            logger.error(f"[Stats] 重置数据分析配置失败: {e}")
+
+    # ========== 群推送开关（v0.5.0） ==========
+
+    async def get_push_groups(self) -> list[dict]:
+        """获取所有白名单群的推送开关状态。
+
+        以 group_config 白名单表为准 LEFT JOIN push_group：不在白名单的
+        push_group 行忽略；白名单群无 push_group 行时默认 False。
+
+        Returns:
+            list[dict]: [{"group_id": str, "enabled": bool}]，按群号升序
+        """
+        try:
+            await self._ensure_db()
+            # group_config.group_id 为 INTEGER、push_group.group_id 为 TEXT，
+            # 连接键需 CAST 统一为字符串比较
+            async with self.db.execute(
+                "SELECT gc.group_id, pg.enabled "
+                "FROM group_config AS gc "
+                "LEFT JOIN push_group AS pg "
+                "ON CAST(gc.group_id AS TEXT) = pg.group_id "
+                "ORDER BY gc.group_id ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            # LEFT JOIN 未命中时 enabled 为 NULL，bool(None) == False 即默认关
+            return [{"group_id": str(row[0]), "enabled": bool(row[1])} for row in rows]
+        except Exception as e:
+            logger.error(f"[Stats] 获取群推送开关失败: {e}")
+            return []
+
+    async def set_push_group(self, group_id: str, enabled: bool) -> bool:
+        """UPSERT 群级推送开关（新增或覆盖，幂等）。
+
+        Args:
+            group_id: 群号（内部统一字符串化）
+            enabled: 推送开关目标状态
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            await self._ensure_db()
+            await self.db.execute(
+                "INSERT INTO push_group (group_id, enabled) VALUES (?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET enabled = excluded.enabled",
+                (str(group_id), 1 if enabled else 0),
+            )
+            await self.db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[Stats] 保存群推送开关失败: {e}")
+            return False
+
+    # ========== 图片统计快照（v0.5.0） ==========
+
+    async def snapshot_upsert(
+        self, hour_rows: list[tuple], top_rows: list[tuple]
+    ) -> None:
+        """UPSERT 图片统计小时级快照行（同主键覆盖写，可重复执行）。
+
+        Args:
+            hour_rows: (date, hour, group_id, image_count) 行列表（群级全量）
+            top_rows: (date, hour, group_id, sender_id, sender_name, image_count)
+                行列表（每小时每群个人 Top K，覆盖时同步更新 sender_name）
+
+        两列表均为空时直接返回；异常仅记日志不抛出（定时任务调用方依赖）。
+        """
+        if not hour_rows and not top_rows:
+            return
+        try:
+            await self._ensure_db()
+            if hour_rows:
+                await self.db.executemany(
+                    "INSERT INTO image_stats_hourly "
+                    "(date, hour, group_id, image_count) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(date, hour, group_id) "
+                    "DO UPDATE SET image_count = excluded.image_count",
+                    hour_rows,
+                )
+            if top_rows:
+                await self.db.executemany(
+                    "INSERT INTO image_stats_hourly_top "
+                    "(date, hour, group_id, sender_id, sender_name, image_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(date, hour, group_id, sender_id) "
+                    "DO UPDATE SET image_count = excluded.image_count, "
+                    "sender_name = excluded.sender_name",
+                    top_rows,
+                )
+            await self.db.commit()
+        except Exception as e:
+            logger.error(f"[Stats] 写入图片统计快照失败: {e}")
+
+    async def snapshot_query(
+        self, start: datetime, end: datetime, group_id: str | None = None
+    ) -> dict:
+        """按 (date, hour) 半开区间 [start, end) 聚合查询图片统计快照。
+
+        区间展开：date > start_date 或 (date == start_date 且 hour >= start.hour)；
+        end 不含：date < end_date 或 (date == end_date 且 hour < end.hour)。
+        total/by_group 取自 image_stats_hourly（群级全量口径），
+        by_sender 取自 image_stats_hourly_top（Top K 个人口径）。
+
+        Args:
+            start: 起始时间（含）
+            end: 结束时间（不含）
+            group_id: 可选群过滤；None 时聚合全部群
+
+        Returns:
+            dict: {"total": int, "by_group": {gid: int},
+                   "by_sender": {(gid, sender_id): int}}；异常返回全零结构
+        """
+        empty = {"total": 0, "by_group": {}, "by_sender": {}}
+        try:
+            await self._ensure_db()
+            start_date = start.strftime("%Y-%m-%d")
+            end_date = end.strftime("%Y-%m-%d")
+            # (date, hour) 半开区间条件，比较值全部参数化绑定
+            time_cond = (
+                "((date > ?) OR (date = ? AND hour >= ?)) AND "
+                "((date < ?) OR (date = ? AND hour < ?))"
+            )
+            params: tuple = (
+                start_date,
+                start_date,
+                start.hour,
+                end_date,
+                end_date,
+                end.hour,
+            )
+            group_cond = ""
+            if group_id is not None:
+                group_cond = " AND group_id = ?"
+                params = params + (str(group_id),)
+            result: dict = {"total": 0, "by_group": {}, "by_sender": {}}
+            # 群级全量：总图片数与分群聚合
+            async with self.db.execute(
+                "SELECT group_id, SUM(image_count) FROM image_stats_hourly "
+                f"WHERE {time_cond}{group_cond} GROUP BY group_id",
+                params,
+            ) as cursor:
+                for gid, count in await cursor.fetchall():
+                    result["by_group"][gid] = count
+                    result["total"] += count
+            # 个人 Top K：(group_id, sender_id) 维度聚合
+            async with self.db.execute(
+                "SELECT group_id, sender_id, SUM(image_count) "
+                "FROM image_stats_hourly_top "
+                f"WHERE {time_cond}{group_cond} "
+                "GROUP BY group_id, sender_id",
+                params,
+            ) as cursor:
+                for gid, sid, count in await cursor.fetchall():
+                    result["by_sender"][(gid, sid)] = count
+            return result
+        except Exception as e:
+            logger.error(f"[Stats] 查询图片统计快照失败: {e}")
+            return empty
