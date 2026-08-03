@@ -86,7 +86,7 @@ def extract_image_urls(message_obj, message_chain) -> list[str]:
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）",
-    "0.4.5",
+    "0.4.6",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
