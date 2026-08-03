@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.1] - 2026-08-03
+
+### Added
+
+- **历史记录前端导出图片**：「历史总结」与「历史分析」详情弹窗新增「🖼️ 导出图片」按钮，
+  一键将详情内容（统计卡 / 活动图表 / 排行 / 板块 Markdown）渲染为 PNG 下载
+- **零依赖前端截图方案**：插件页 iframe 为 opaque origin（无 allow-same-origin / allow-modals），
+  无法读取样式表或使用 html2canvas / 浏览器打印，故自研 SVG foreignObject 截图器
+  （`pages/dashboard/capture.js`）——逐元素内联 `getComputedStyle` 计算样式、CSS 变量随根节点注入、
+  ECharts canvas 以 `toDataURL` 转为 `<img>` 捕获、`:before/:after` 伪元素物化为真实元素、
+  滚动容器展开完整内容、背景渐变/透明度/内阴影保留并裁剪不支持项，导出图跟随页面亮/暗主题；
+  大图自动限制边长，最高 2x 缩放
+
 ## [0.4.0] - 2026-08-03
 
 ### Added

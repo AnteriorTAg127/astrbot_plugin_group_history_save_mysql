@@ -1,4 +1,5 @@
 const bridge = window.AstrBotPluginPage;
+import { exportSectionAsPng } from "./capture.js";
 
 function showToast(msg, type = "") {
     const toast = document.getElementById("toast");
@@ -29,6 +30,8 @@ export function openSummaryDetail(groupId, filename) {
     const mask = document.getElementById("historyDetailModal");
     const body = document.getElementById("historyDetailBody");
     document.getElementById("historyDetailTitle").textContent = `📄 总结详情 · 群 ${groupId}`;
+    // 导出文件名：群号 + 总结文件名中的时间戳（如 v0.3.3_20260730_1200_群123）
+    document.getElementById("historyDetailExportBtn").dataset.filename = filename;
     mask.style.display = "flex";
     body.innerHTML = "";
     body.appendChild(el("div", "loading", "加载中..."));
@@ -125,6 +128,12 @@ function detailStatTile(value, label) {
 
 export function bindSummaryDetailEvents() {
     document.getElementById("historyDetailCloseBtn").addEventListener("click", closeSummaryDetail);
+    // 导出图片：把详情正文（不含按钮行）渲染为 PNG 并触发下载
+    document.getElementById("historyDetailExportBtn").addEventListener("click", async () => {
+        const filename = document.getElementById("historyDetailExportBtn").dataset.filename || "";
+        const safe = String(filename || "").replace(/[^\w.-]+/g, "_") || `群聊总结_${Date.now()}`;
+        await exportSectionAsPng(document.getElementById("historyDetailBody"), safe);
+    });
     // 详情弹窗只能通过「关闭」按钮关闭，点击遮罩不执行任何操作。
     document.getElementById("historyDetailModal").addEventListener("click", (event) => {
         event.stopPropagation();
