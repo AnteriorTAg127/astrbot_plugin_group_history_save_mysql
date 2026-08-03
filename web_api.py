@@ -360,6 +360,12 @@ class WebAPI:
                 "数据分析统计数据",
             ),
             (
+                f"/{PLUGIN_NAME}/stats/groups",
+                self.api_stats_groups,
+                ["GET"],
+                "数据分析群列表",
+            ),
+            (
                 f"/{PLUGIN_NAME}/stats/settings",
                 self.api_stats_settings,
                 ["GET"],
@@ -1315,12 +1321,35 @@ class WebAPI:
     async def api_stats_settings(self):
         """获取数据分析设置（8 项 typed 配置）与群级推送开关列表。
 
-        返回 ``{"settings": {...}, "push_groups": [{"group_id", "enabled"}]}``。
-        两个 db_config 方法内部已兜底异常（失败返回空结构），无需再包 try。
+        返回 ``{"settings": {...}, "push_groups": [...], "all_mode": bool}``。
+        push_groups 模式感知（v0.5.1）：白名单模式以 group_config 为基准；
+        all_mode 全局模式下白名单为空，改以 chat_history 有数据的群为基准
+        （经 stats_service.resolve_push_groups，未注入时回落白名单语义）。
         """
         settings = await self.config_mgr.get_all_stats_settings()
-        push_groups = await self.config_mgr.get_push_groups()
-        return json_response({"settings": settings, "push_groups": push_groups})
+        if self.stats_service is not None:
+            push_groups = await self.stats_service.resolve_push_groups()
+            all_mode = await self.stats_service.is_all_mode()
+        else:
+            push_groups = await self.config_mgr.get_push_groups()
+            base = await self.config_mgr.get_all_settings()
+            all_mode = base.get("all_mode", "false") == "true"
+        return json_response(
+            {"settings": settings, "push_groups": push_groups, "all_mode": all_mode}
+        )
+
+    async def api_stats_groups(self):
+        """获取数据分析群下拉列表（v0.5.1，修复 all_mode 下无群可选）。
+
+        返回 ``{"groups": [{"group_id", "enabled", "count"}], "all_mode": bool}``：
+        白名单 ∪ chat_history 有数据的群（去重、消息数降序），两种记录模式下
+        下拉框都能列出可查看统计的群。stats_service 未注入返 503。
+        """
+        if self.stats_service is None:
+            return error_response("数据分析模块尚未初始化", status_code=503)
+        groups = await self.stats_service.resolve_dropdown_groups()
+        all_mode = await self.stats_service.is_all_mode()
+        return json_response({"groups": groups, "all_mode": all_mode})
 
     async def api_stats_settings_save(self):
         """批量保存数据分析设置。body 为扁平 ``{key: value}`` 键值对象。

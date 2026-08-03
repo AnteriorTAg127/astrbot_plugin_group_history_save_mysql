@@ -247,11 +247,12 @@ async function loadDataAnalysis() {
     await refreshStats(); // 统计主体
 }
 
-// 群下拉：复用既有 groups 端点（与群管理同源），首项「全部群」value=""
+// 群下拉：stats/groups 端点（白名单 ∪ 有数据的群，all_mode 全局模式下也有群可选）
+// 首项「全部群」value=""
 async function loadGroupOptions() {
     const select = document.getElementById("daGroupSelect");
     try {
-        const data = await bridge.apiGet("groups", { _t: Date.now() });
+        const data = await bridge.apiGet("stats/groups", { _t: Date.now() });
         const groups = Array.isArray(data.groups) ? data.groups : [];
         select.innerHTML = "";
         const all = el("option", null, "全部群");
@@ -260,7 +261,12 @@ async function loadGroupOptions() {
         for (const g of groups) {
             const gid = String(g.group_id ?? "");
             if (!gid) continue;
-            const opt = el("option", null, `群 ${gid}${g.enabled ? "" : "（未启用记录）"}`);
+            const cntTxt = g.count != null ? `（${fmtInt(g.count)} 条）` : "";
+            const opt = el(
+                "option",
+                null,
+                `群 ${gid}${cntTxt}${g.enabled ? "" : "（未启用记录）"}`
+            );
             opt.value = gid;
             select.appendChild(opt);
         }
@@ -707,13 +713,16 @@ function renderGroupRanking(stats) {
  * ⑦ 渲染：推送设置区（群级开关列表 + 全局 8 项表单）
  * ===================================================================== */
 
-// GET stats/settings → {settings, push_groups}；失败仅提示不阻断统计主体
+// GET stats/settings → {settings, push_groups, all_mode}；失败仅提示不阻断统计主体
 async function loadPushSettings() {
     const list = document.getElementById("daPushGroupList");
     try {
         const data = await bridge.apiGet("stats/settings", { _t: Date.now() });
         fillSettingsForm(data.settings || {});
-        renderPushGroups(Array.isArray(data.push_groups) ? data.push_groups : []);
+        renderPushGroups(
+            Array.isArray(data.push_groups) ? data.push_groups : [],
+            !!data.all_mode
+        );
     } catch (e) {
         list.innerHTML = "";
         list.appendChild(el("div", "loading", "推送设置加载失败"));
@@ -722,11 +731,20 @@ async function loadPushSettings() {
 }
 
 // 群级开关列表：每群 toggle → POST stats/push/toggle
-function renderPushGroups(groups) {
+// allMode：全局记录模式下列表源为「有数据的群」（白名单为空属正常）
+function renderPushGroups(groups, allMode) {
     const list = document.getElementById("daPushGroupList");
     list.innerHTML = "";
     if (groups.length === 0) {
-        list.appendChild(el("div", "loading", "暂无白名单群，请先在「群管理」添加"));
+        list.appendChild(
+            el(
+                "div",
+                "loading",
+                allMode
+                    ? "暂无有聊天数据的群，群消息入库后自动出现"
+                    : "暂无白名单群，请先在「群管理」添加"
+            )
+        );
         return;
     }
     for (const g of groups) {
@@ -734,8 +752,15 @@ function renderPushGroups(groups) {
         if (!gid) continue;
         const row = el("div", "s-item");
         const info = el("div", "setting-info");
-        info.appendChild(el("div", "setting-name", `群 ${gid}`));
-        info.appendChild(el("div", "setting-desc", "开启后接收该群的日报/周报推送（需全局开关同时开启）"));
+        const cntTxt = g.count != null ? `（历史 ${fmtInt(g.count)} 条）` : "";
+        info.appendChild(el("div", "setting-name", `群 ${gid}${cntTxt}`));
+        info.appendChild(
+            el(
+                "div",
+                "setting-desc",
+                "开启后接收该群的日报/周报推送（需全局开关同时开启）"
+            )
+        );
         row.appendChild(info);
         const control = el("div", "setting-control");
         const label = el("label", "all-mode-switch");

@@ -361,6 +361,38 @@ class StatsRepository:
             for row in rows
         ]
 
+    async def get_all_groups_summary(self) -> list[dict]:
+        """全量群清单（v0.5.1）：chat_history 中实际有数据的群。
+
+        all_mode（全局记录模式）下白名单表为空，群下拉/推送开关列表失去
+        数据源，改以「有数据的群」为准。不限时间窗口、不截断（群数量级
+        有限，走 idx_group_time 索引分组扫描）。
+
+        口径：按 group_id 分组，COUNT(*) 计消息数、MAX(timestamp) 记最近
+        活跃时刻；排序 COUNT(*) DESC、同数 group_id ASC（输出确定性）。
+
+        Returns:
+            list[dict]: [{"group_id": str, "count": int,
+                "last_active": datetime | None}]
+        """
+        sql = (
+            "SELECT group_id, COUNT(*) AS cnt, MAX(timestamp) "
+            "FROM chat_history GROUP BY group_id "
+            "ORDER BY cnt DESC, group_id ASC"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql)
+                rows = await cur.fetchall()
+        return [
+            {
+                "group_id": str(row[0]),
+                "count": int(row[1] or 0),
+                "last_active": row[2],
+            }
+            for row in rows
+        ]
+
     async def get_member_overview(
         self,
         group_id: str | None,

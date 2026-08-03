@@ -1304,6 +1304,37 @@ class ConfigManager:
             logger.error(f"[Stats] 保存群推送开关失败: {e}")
             return False
 
+    async def get_push_flags(self, group_ids: list[str]) -> dict[str, bool]:
+        """批量读取指定群号的推送开关状态（v0.5.1，all_mode 列表源配套）。
+
+        与 get_push_groups 以白名单为基准不同，本方法对调用方给出的任意
+        群号列表取 push_group 行：无行的群默认 False（开关默认关）。
+
+        Args:
+            group_ids: 群号列表（内部统一字符串化）；空列表直接返回 {}
+
+        Returns:
+            dict[str, bool]: {group_id: enabled}；异常仅记日志返回 {}
+        """
+        if not group_ids:
+            return {}
+        try:
+            await self._ensure_db()
+            placeholders = ",".join("?" for _ in group_ids)
+            async with self.db.execute(
+                f"SELECT group_id, enabled FROM push_group "
+                f"WHERE group_id IN ({placeholders})",
+                [str(g) for g in group_ids],
+            ) as cursor:
+                rows = await cursor.fetchall()
+            # 请求的群号全部出现在结果中：无行的群默认 False（开关默认关）
+            flags = {str(g): False for g in group_ids}
+            flags.update({str(row[0]): bool(row[1]) for row in rows})
+            return flags
+        except Exception as e:
+            logger.error(f"[Stats] 读取推送开关标志失败: {e}")
+            return {}
+
     # ========== 图片统计快照（v0.5.0） ==========
 
     async def snapshot_upsert(

@@ -395,12 +395,101 @@ class StatsService:
     # 推送侧（调度器调用）
     # ------------------------------------------------------------------
 
+    async def is_all_mode(self) -> bool:
+        """读取全局记录模式开关（all_mode，v0.5.1 群列表模式感知配套）。
+
+        Returns:
+            bool: 配置异常时按 False（白名单模式）处理，保守不扩大列表源。
+        """
+        try:
+            settings = await self._config_mgr.get_all_settings()
+            return settings.get("all_mode", "false") == "true"
+        except Exception as e:
+            logger.warning(f"[Stats] 读取 all_mode 失败（按白名单模式处理）: {e}")
+            return False
+
+    async def resolve_push_groups(self) -> list[dict]:
+        """群级推送开关列表（模式感知，Web 展示与推送发送共用）。
+
+        白名单模式下以 group_config 白名单为基准（get_push_groups 原语义）；
+        all_mode 全局模式下白名单为空，改以 chat_history 有数据的群为基准，
+        开关状态经 get_push_flags 批量读取（默认关）。
+
+        Returns:
+            list[dict]: [{"group_id": str, "enabled": bool}]（all_mode 下附带
+            "count" 消息数供前端展示）；底层异常时 all_mode 分支返回 []。
+        """
+        if not await self.is_all_mode():
+            return await self._config_mgr.get_push_groups()
+        try:
+            data_groups = await self.repo.get_all_groups_summary()
+        except Exception as e:
+            logger.error(f"[Stats] 查询有数据的群失败（推送列表为空）: {e}")
+            return []
+        ids = [g["group_id"] for g in data_groups]
+        flags = await self._config_mgr.get_push_flags(ids)
+        return [
+            {
+                "group_id": g["group_id"],
+                "enabled": bool(flags.get(g["group_id"])),
+                "count": g["count"],
+            }
+            for g in data_groups
+        ]
+
+    async def resolve_dropdown_groups(self) -> list[dict]:
+        """Web 群下拉列表：白名单 ∪ 有数据的群（去重，消息数降序）。
+
+        白名单模式：白名单群 + 残留历史数据群；all_mode：即有数据的群。
+        保证两种模式下下拉框都能列出可查看统计的群（修复 all_mode 下
+        只剩「全部群」的问题）。
+
+        Returns:
+            list[dict]: [{"group_id": str, "enabled": bool, "count": int | None}]；
+            enabled 为白名单启用态（不在白名单记 True，all_mode 无白名单概念）；
+            count 为历史消息总数（仅白名单且无数据的群为 None）。
+        """
+        try:
+            whitelist = await self._config_mgr.get_groups()
+        except Exception as e:
+            logger.warning(f"[Stats] 读取白名单失败（下拉仅含有数据的群）: {e}")
+            whitelist = []
+        try:
+            data_groups = await self.repo.get_all_groups_summary()
+        except Exception as e:
+            logger.warning(f"[Stats] 查询有数据的群失败（下拉仅含白名单）: {e}")
+            data_groups = []
+        merged: dict[str, dict] = {}
+        for entry in whitelist or []:
+            gid = str(entry.get("group_id", "") or "").strip()
+            if gid:
+                merged[gid] = {
+                    "group_id": gid,
+                    "enabled": bool(entry.get("enabled")),
+                    "count": None,
+                }
+        for entry in data_groups or []:
+            gid = entry["group_id"]
+            if gid in merged:
+                merged[gid]["count"] = entry["count"]
+            else:
+                merged[gid] = {
+                    "group_id": gid,
+                    "enabled": True,
+                    "count": entry["count"],
+                }
+        return sorted(
+            merged.values(),
+            key=lambda item: (-(item["count"] or 0), item["group_id"]),
+        )
+
     async def push_report(self, kind: str, now: datetime | None = None) -> None:
         """定时推送日报/周报（全局开关与到点判定由调度器负责，本方法只管发）。
 
         - kind="daily"：时间范围 [今日 00:00, 明日 00:00)，label「今日」；
         - kind="weekly"：上一整周 [上周一 00:00, 本周一 00:00)，label「上周」；
-        - 遍历 ``get_push_groups()`` 中 enabled 的群：无 umo warning 跳过；
+        - 遍历 ``resolve_push_groups()`` 中 enabled 的群（all_mode 下以有数据
+          的群为基准，见该方法注释）：无 umo warning 跳过；
           build_stats 失败记日志跳过；渲染失败降级纯文本摘要（总消息数 +
           Top3 发言人一行文本），文本发送再失败则跳过；成功经
           ``context.send_message(umo, chain)`` 发送图片链；
@@ -428,7 +517,7 @@ class StatsService:
             return
 
         try:
-            groups = await self._config_mgr.get_push_groups()
+            groups = await self.resolve_push_groups()
         except Exception as e:
             logger.error(f"[Stats] 读取群推送开关失败，本轮终止: {e}")
             return
