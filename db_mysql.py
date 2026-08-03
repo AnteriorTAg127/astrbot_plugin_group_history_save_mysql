@@ -866,7 +866,8 @@ class MySQLManager:
                         INDEX idx_group_time (group_id, timestamp),
                         INDEX idx_sender_time (sender_id, timestamp),
                         INDEX idx_group_sender_time (group_id, sender_id, timestamp),
-                        INDEX idx_message_id (message_id)
+                        INDEX idx_message_id (message_id),
+                        INDEX idx_timestamp (timestamp)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """,
                     timeout=DDL_TIMEOUT_SECONDS,
@@ -900,6 +901,10 @@ class MySQLManager:
         - v0.4.0：chat_history 缺少 at_list / reply_id 列时自动 ADD COLUMN
           （人物分析所需 @ 对象 / 回复目标标记；MySQL 无 ADD COLUMN IF NOT EXISTS
           语法，先查 INFORMATION_SCHEMA.COLUMNS 判定缺列再 ALTER，重复执行幂等）
+        - v0.4.1/v0.5.2：chat_history 必需索引幂等补建（idx_group_time /
+          idx_sender_time / idx_group_sender_time / idx_message_id / idx_timestamp；
+          旧表由早期版本建出时 CREATE TABLE IF NOT EXISTS 为 no-op，复合索引缺失
+          导致按群查询全表扫描，先查 INFORMATION_SCHEMA.STATISTICS 再 ALTER）
 
         每一步独立 try/except 包裹，失败仅记录日志（warning/error），
         绝不向上抛异常、不阻断插件启动。
@@ -998,34 +1003,51 @@ class MySQLManager:
                                 f"[HistorySave] 表结构迁移 chat_history.{column} 失败: {e}"
                             )
 
-                    # v0.4.1：chat_history.message_id 补索引（查询/人物分析按 message_id
-                    # 批量反查被回复消息，表增大后无索引会退化为全表扫描）。
-                    # ADD INDEX 无 IF NOT EXISTS 语法，先查 INFORMATION_SCHEMA.STATISTICS
-                    # 判定索引存在与否再 ALTER，幂等可重入；MySQL 8.0 ADD INDEX 为
-                    # 在线 DDL（INPLACE），几百万行也不阻塞持续写入。
-                    try:
-                        await self._execute(
-                            cur,
-                            "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS"
-                            " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s"
-                            " LIMIT 1",
-                            ("chat_history", "idx_message_id"),
-                            timeout=DDL_TIMEOUT_SECONDS,
-                        )
-                        row = await cur.fetchone()
-                        if not row:
+                    # v0.5.2：必需索引统一幂等补建。复合索引只存在于
+                    # CREATE TABLE IF NOT EXISTS 的 DDL 中，早期版本已建出的旧表
+                    # 该 DDL 为 no-op，索引永久缺失——按群查询（数据分析/查询页
+                    # 的 WHERE group_id = … AND timestamp …、全表 GROUP BY）全部
+                    # 退化为全表扫描，大表上吃满 CPU。ADD INDEX 无 IF NOT EXISTS
+                    # 语法，先查 INFORMATION_SCHEMA.STATISTICS 判定索引存在与否
+                    # 再 ALTER，幂等可重入；MySQL 8.0 ADD INDEX 为在线 DDL
+                    # （INPLACE），几百万行也不阻塞持续写入。
+                    required_indexes = [
+                        ("chat_history", "idx_group_time", "group_id, timestamp"),
+                        ("chat_history", "idx_sender_time", "sender_id, timestamp"),
+                        (
+                            "chat_history",
+                            "idx_group_sender_time",
+                            "group_id, sender_id, timestamp",
+                        ),
+                        ("chat_history", "idx_message_id", "message_id"),
+                        # 时间窗聚合（概览每日趋势/群排行/快照）无群条件时
+                        # 走 timestamp 前缀范围扫描，避免全表扫描
+                        ("chat_history", "idx_timestamp", "timestamp"),
+                    ]
+                    for table, index_name, columns in required_indexes:
+                        try:
                             await self._execute(
                                 cur,
-                                "ALTER TABLE chat_history ADD INDEX idx_message_id (message_id)",
+                                "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS"
+                                " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s"
+                                " LIMIT 1",
+                                (table, index_name),
                                 timeout=DDL_TIMEOUT_SECONDS,
                             )
-                            logger.info(
-                                "[HistorySave] 表结构迁移: chat_history 已新增 idx_message_id 索引"
+                            row = await cur.fetchone()
+                            if not row:
+                                await self._execute(
+                                    cur,
+                                    f"ALTER TABLE {table} ADD INDEX {index_name} ({columns})",
+                                    timeout=DDL_TIMEOUT_SECONDS,
+                                )
+                                logger.info(
+                                    f"[HistorySave] 表结构迁移: {table} 已新增 {index_name} 索引"
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"[HistorySave] 表结构迁移 {table}.{index_name} 失败: {e}"
                             )
-                    except Exception as e:
-                        logger.warning(
-                            f"[HistorySave] 表结构迁移 chat_history.idx_message_id 失败: {e}"
-                        )
         except Exception as e:
             logger.error(f"[HistorySave] 表结构迁移失败（无法获取连接）: {e}")
 

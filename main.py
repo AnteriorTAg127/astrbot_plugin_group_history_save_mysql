@@ -113,7 +113,7 @@ def stats_fallback_text(data, label: str) -> str:
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 图片小时级快照统计）",
-    "0.5.1",
+    "0.5.2",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""

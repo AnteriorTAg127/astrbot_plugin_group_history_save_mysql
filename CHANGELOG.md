@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.2] - 2026-08-04
+
+修复旧表按群查询吃满 CPU 的问题：复合索引（`idx_group_time` 等）只存在于
+`CREATE TABLE IF NOT EXISTS` 的 DDL 中，早期版本已建出的表该 DDL 为 no-op，
+而旧迁移逻辑只补 `idx_message_id`，导致旧表的按群过滤
+（`WHERE group_id = … AND timestamp …`）与全表 `GROUP BY` 全部退化为全表扫描，
+数据分析/查询页打开即打满 CPU。现 `_migrate_schema` 启动时幂等补建全部必需索引。
+
+### Changed
+
+- `_migrate_schema` 索引补建改为数据驱动循环：先查 `INFORMATION_SCHEMA.STATISTICS`
+  判定缺失再 `ALTER TABLE ... ADD INDEX`（在线 DDL，不阻塞写入），覆盖
+  `idx_group_time` / `idx_sender_time` / `idx_group_sender_time` /
+  `idx_message_id` / 新增 `idx_timestamp`
+- 新建表 DDL 同步增加 `idx_timestamp (timestamp)`：无群条件的时间窗聚合
+  （概览每日趋势、群排行、快照任务）走 timestamp 前缀范围扫描
+- 版本升至 0.5.2，静态引用 `?v=0.5.2`
+
 ## [0.5.1] - 2026-08-04
 
 修复 `all_mode`（全局记录模式）下数据分析模块群列表为空的问题：此前群下拉与
