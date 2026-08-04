@@ -41,7 +41,7 @@ const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const SETTINGS_FIELDS = [
     { key: "stats_top_n", label: "排行条数", kind: "int", min: 1, max: 50, id: "daTopN" },
     { key: "stats_cooldown", label: "指令冷却", kind: "int", min: 0, max: 600, id: "daCooldown" },
-    { key: "stats_image_top_k", label: "快照 Top K", kind: "int", min: 1, max: 100, id: "daImageTopK" },
+    { key: "stats_image_top_k", label: "快照 Top K（图片/消息）", kind: "int", min: 1, max: 100, id: "daImageTopK" },
     { key: "push_daily_enabled", label: "日报开关", kind: "bool", id: "daDailyEnabled" },
     { key: "push_daily_time", label: "日报推送时间", kind: "time", id: "daDailyTime" },
     { key: "push_weekly_enabled", label: "周报开关", kind: "bool", id: "daWeeklyEnabled" },

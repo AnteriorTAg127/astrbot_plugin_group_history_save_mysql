@@ -1,4 +1,4 @@
-"""数据分析调度器（模块 F）：日报/周报定时推送检查 + 小时级图片快照调度。
+"""数据分析调度器（模块 F）：日报/周报定时推送检查 + 小时/日/月分段快照调度。
 
 两个相互独立的 asyncio 后台循环（生命周期与退避范式沿用
 ``profile/scheduler.py`` / ``cleaner.py`` 的后台循环模式）：
@@ -9,24 +9,40 @@
   ``service.push_report(kind)``（kind="daily"/"weekly"）；周报额外要求
   ``now.weekday() + 1 == 配置星期``（1=周一 … 7=周日）。
 - **快照循环**（每 ``SNAPSHOT_CHECK_INTERVAL`` 秒醒一次，默认 60s）：
-  当前分钟 >= 5 且本 ``(date, hour)`` 尚未成功跑过时调用
-  ``snapshot.run_hourly_snapshot()`` 聚合上一整点图片数据。
+  同一循环体内**顺序**判定三类快照任务（各自独立去重戳）：
+
+  - 小时快照：当前分钟 >= 5 且本 ``(date, hour)`` 尚未成功跑过时调用
+    ``snapshot.run_hourly_snapshot()`` 聚合上一整点数据；
+  - 日快照：当前分钟 >= 15 且「昨日」尚未盖章时调用
+    ``snapshot.run_daily_snapshot()`` 聚合上一完整自然日，成功后紧接
+    ``snapshot.evict_expired()`` 淘汰过期快照；
+  - 月快照：当前分钟 >= 25 且「上一自然月」尚未盖章时调用
+    ``snapshot.run_monthly_snapshot()`` 聚合上一自然月。
+
+  分钟阈值分段错开（5/15/25）：给上游小时快照与数据沉淀留出时间，且日任务
+  须在 00:05 小时快照跑完之后；检查被延迟时同一小时/日/月内仍可补跑。
 
 去重语义（内存戳，进程重启后自然清零，重启当日可能补触发一次，属预期）：
 
 - 推送：``{kind: date}`` 日期戳——同一天每种 kind 至多触发一次；
   **成功推送后才盖章**，推送失败不盖章，由退避重试补发；跨日戳自然失配，
   无需手动清理。
-- 快照：``(date, hour)`` 戳——同一小时至多成功执行一次；**成功后才盖章**，
+- 小时快照：``(date, hour)`` 戳——同一小时至多成功执行一次；**成功后才盖章**，
   失败由退避重试补跑；跨小时/跨日戳失配后照常触发。
+- 日快照：``date`` 戳——盖章对象是**被聚合的那一天**（即昨日，而非执行日），
+  同一被聚合日至多成功一次；次日被聚合对象变化后戳自然失配恢复。
+- 月快照：``"YYYY-MM"`` 戳——盖章对象是被聚合的上一自然月，同一被聚合月
+  至多成功一次；次月被聚合对象变化后戳自然失配恢复（1 月的上一自然月为
+  上一年 12 月，跨年正确衔接）。
 
-退避语义：循环体内任意异常（配置读取/推送/快照执行）按 60→120→300→600s
+退避语义：循环体内任意异常（配置读取/推送/三类快照执行）按 60→120→300→600s
 退避序列等待后重试（封顶 600s），任一次成功后复位失败计数；
 ``CancelledError`` 一律向上抛出，保证 :meth:`stop` cancel + await 时
 两个循环都能干净退出（v0.4.5 取消安全范式）。
 
 可测性：核心判定抽为纯函数 :func:`check_push_due` /
-:func:`check_snapshot_due`（时钟、配置、去重戳全部显式传入）；循环体只是
+:func:`check_snapshot_due` / :func:`check_daily_due` /
+:func:`check_monthly_due`（时钟、配置、去重戳全部显式传入）；循环体只是
 薄封装，时钟经 ``_now_fn`` 注入点获取，测试可换假时钟；两个检查间隔为
 类属性，测试可改小以加速。
 """
@@ -34,7 +50,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
@@ -49,6 +65,15 @@ if TYPE_CHECKING:
 # 快照触发分钟阈值：每小时第 5 分钟起（含）才允许执行，给上游 image_records
 # 入库留出沉淀时间；同一小时内持续满足条件，由 (date, hour) 戳去重
 SNAPSHOT_MINUTE_THRESHOLD = 5
+
+# 日快照触发分钟阈值：每小时第 15 分钟起（含）才允许执行——给上游小时快照
+# 与数据沉淀留出时间，且日任务须在 00:05 小时快照跑完之后；同一日内持续
+# 满足条件（任意小时补跑自愈），由「被聚合的那一天（昨日）」日期戳去重
+DAILY_MINUTE_THRESHOLD = 15
+
+# 月快照触发分钟阈值：每小时第 25 分钟起（含）才允许执行——给上游小时/日
+# 快照与数据沉淀留出时间；同一月内持续满足条件，由上一自然月 "YYYY-MM" 戳去重
+MONTHLY_MINUTE_THRESHOLD = 25
 
 # 推送配置键（每轮检查经 get_stats_setting_typed 逐项读取）
 _PUSH_SETTING_KEYS = (
@@ -161,8 +186,66 @@ def check_snapshot_due(now: datetime, last_snap: tuple[date, int] | None) -> boo
     return last_snap != (now.date(), now.hour)
 
 
+def _prev_month_str(now: datetime) -> str:
+    """计算 ``now`` 所在月份的上一自然月的 "YYYY-MM" 字符串。
+
+    跨年处理：``now`` 为 1 月时上一自然月是上一年 12 月。
+
+    Args:
+        now: 当前时刻
+
+    Returns:
+        str: 上一自然月（两位补零），如 "2026-07"
+    """
+    if now.month == 1:
+        return f"{now.year - 1}-12"
+    return f"{now.year}-{now.month - 1:02d}"
+
+
+def check_daily_due(now: datetime, last_daily: date | None) -> bool:
+    """判定 ``now`` 时刻是否应执行日快照（纯函数）。
+
+    条件：当前分钟 >= :data:`DAILY_MINUTE_THRESHOLD`（每小时第 15 分钟起，
+    给上游小时快照与数据沉淀留时间，且须在 00:05 小时快照跑完之后；检查被
+    延迟时同一日内任意小时仍可补跑），且「昨日」尚未成功盖章（盖章对象是
+    **被聚合的那一天** = ``now.date() - 1 天``；同一被聚合日不重复执行，
+    次日被聚合对象变化后戳自然失配恢复）。
+
+    Args:
+        now: 当前时刻
+        last_daily: 上次成功聚合的「被聚合那一天」日期戳；从未执行过为 None
+
+    Returns:
+        bool: 是否应执行日快照
+    """
+    if now.minute < DAILY_MINUTE_THRESHOLD:
+        return False
+    return last_daily != now.date() - timedelta(days=1)
+
+
+def check_monthly_due(now: datetime, last_monthly: str | None) -> bool:
+    """判定 ``now`` 时刻是否应执行月快照（纯函数）。
+
+    条件：当前分钟 >= :data:`MONTHLY_MINUTE_THRESHOLD`（每小时第 25 分钟起，
+    给上游小时/日快照与数据沉淀留时间；检查被延迟时同一月内仍可补跑），
+    且「上一自然月」尚未成功盖章（盖章为 "YYYY-MM" 字符串，由
+    :func:`_prev_month_str` 计算，1 月跨年正确取上一年 12 月；同一被聚合月
+    不重复执行，次月被聚合对象变化后戳自然失配恢复）。
+
+    Args:
+        now: 当前时刻
+        last_monthly: 上次成功聚合的被聚合月 "YYYY-MM" 戳；从未执行过为 None
+
+    Returns:
+        bool: 是否应执行月快照
+    """
+    if now.minute < MONTHLY_MINUTE_THRESHOLD:
+        return False
+    return last_monthly != _prev_month_str(now)
+
+
 class StatsScheduler:
-    """数据分析调度器：推送检查循环 + 小时快照循环（异常退避、可取消）。"""
+    """数据分析调度器：推送检查循环 + 小时/日/月三类快照循环（异常退避、可取消）。"""
 
     # 推送检查循环唤醒间隔（秒）。类属性，测试可改小以加速
     PUSH_CHECK_INTERVAL = 20.0
@@ -181,7 +264,7 @@ class StatsScheduler:
 
         Args:
             service: 编排服务（推送执行入口 push_report）
-            snapshot: 图片快照管理器（run_hourly_snapshot）
+            snapshot: 快照管理器（小时/日/月快照执行与过期淘汰入口）
             config_mgr: 配置管理器（get_stats_setting_typed 读推送配置）
         """
         self.service = service
@@ -189,17 +272,21 @@ class StatsScheduler:
         self.config_mgr = config_mgr
         self._push_task: asyncio.Task | None = None
         self._snapshot_task: asyncio.Task | None = None
-        # 推送同日去重戳 {kind: 触发日期}；快照 (date, hour) 去重戳。
+        # 推送同日去重戳 {kind: 触发日期}；小时快照 (date, hour) 去重戳；
+        # 日快照 date 去重戳（盖章对象是被聚合的那一天=昨日）；
+        # 月快照 "YYYY-MM" 去重戳（盖章对象是被聚合的上一自然月）。
         # 均在成功执行后才更新（见模块 docstring 去重语义）
         self._push_last_fired: dict[str, date] = {}
         self._snapshot_last_done: tuple[date, int] | None = None
+        self._daily_last_done: date | None = None
+        self._monthly_last_done: str | None = None
         self._push_fail_count = 0  # 推送循环连续失败次数（成功后复位）
         self._snapshot_fail_count = 0  # 快照循环连续失败次数（成功后复位）
         # 时钟注入点：循环体经此取当前时刻，测试可替换为假时钟
         self._now_fn: Callable[[], datetime] = datetime.now
 
     async def start(self) -> None:
-        """启动推送检查循环与小时快照循环（两个 asyncio task）。
+        """启动推送检查循环与小时/日/月快照循环（两个 asyncio task）。
 
         可重入防护：任一循环任务仍在运行时直接返回，不重复创建 task。
         """
@@ -215,8 +302,10 @@ class StatsScheduler:
         self._snapshot_task = asyncio.create_task(self._snapshot_loop())
         logger.info(
             "[Stats] 数据分析调度器已启动"
-            f"（推送检查每 {self.PUSH_CHECK_INTERVAL:g}s，"
-            f"快照每 {self.SNAPSHOT_CHECK_INTERVAL:g}s 检查、整点第 5 分钟起执行）"
+            f"（推送检查每 {self.PUSH_CHECK_INTERVAL:g}s；"
+            f"快照每 {self.SNAPSHOT_CHECK_INTERVAL:g}s 检查，"
+            f"小时任务整点第 5 分钟起、日任务第 15 分钟起、"
+            f"月任务第 25 分钟起执行）"
         )
 
     async def stop(self) -> None:
@@ -270,22 +359,41 @@ class StatsScheduler:
                 await asyncio.sleep(backoff)
 
     async def _snapshot_loop(self) -> None:
-        """小时快照循环：每 SNAPSHOT_CHECK_INTERVAL 秒醒一次判定并执行。
+        """快照循环：每 SNAPSHOT_CHECK_INTERVAL 秒醒一次，顺序判定小时/日/月并执行。
 
-        每轮：check_snapshot_due 判定（分钟 >= 5 且本 (date, hour) 未跑过）
-        → 执行 run_hourly_snapshot 并在**成功后**盖 (date, hour) 戳。
-        异常退避与失败计数复位语义同推送循环；失败不盖章，本小时会在
-        退避重试后补跑。
+        每轮在同一循环体内顺序判定三类任务（各自独立去重戳）：
+
+        1. 小时：check_snapshot_due（分钟 >= 5 且本 (date, hour) 未跑过）
+           → 执行 run_hourly_snapshot 并在**成功后**盖 (date, hour) 戳；
+        2. 日：check_daily_due（分钟 >= 15 且昨日未盖章）→ 执行
+           run_daily_snapshot，成功后紧接 evict_expired 淘汰过期快照，
+           再盖昨日（**被聚合的那一天**）戳；
+        3. 月：check_monthly_due（分钟 >= 25 且上一自然月未盖章）→ 执行
+           run_monthly_snapshot 并在**成功后**盖上月 "YYYY-MM" 戳。
+
+        异常退避与失败计数复位语义同推送循环；任一步失败不盖章，失败的
+        任务在退避重试后补跑（三类判定相互独立，前序任务已盖的戳不受
+        影响，未轮到的任务下一轮照常判定）。
         """
         while True:
             try:
                 now = self._now_fn()
+                # 1) 小时快照判定
                 if check_snapshot_due(now, self._snapshot_last_done):
                     await self.snapshot.run_hourly_snapshot(now)
                     self._snapshot_last_done = (now.date(), now.hour)
-                    logger.info(
-                        f"[Stats] 小时图片快照任务已触发（{now:%Y-%m-%d %H:%M}）"
-                    )
+                    logger.info(f"[Stats] 小时快照任务已触发（{now:%Y-%m-%d %H:%M}）")
+                # 2) 日快照判定（成功后顺带淘汰过期快照）
+                if check_daily_due(now, self._daily_last_done):
+                    await self.snapshot.run_daily_snapshot(now)
+                    await self.snapshot.evict_expired(now)
+                    self._daily_last_done = now.date() - timedelta(days=1)
+                    logger.info(f"[Stats] 日快照任务已触发（{now:%Y-%m-%d %H:%M}）")
+                # 3) 月快照判定
+                if check_monthly_due(now, self._monthly_last_done):
+                    await self.snapshot.run_monthly_snapshot(now)
+                    self._monthly_last_done = _prev_month_str(now)
+                    logger.info(f"[Stats] 月快照任务已触发（{now:%Y-%m-%d %H:%M}）")
                 self._snapshot_fail_count = 0
                 await asyncio.sleep(self.SNAPSHOT_CHECK_INTERVAL)
             except asyncio.CancelledError:

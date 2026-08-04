@@ -16,8 +16,10 @@ astrbot.api），若在子包 ``__init__`` 顶层急切执行，会使任何仅�
   与各模块单测的 stub 隔离范式兼容，支持多测试文件合跑。
 
 注意：``_LAZY_EXPORTS`` 仅登记需要以 ``from .stats import X`` 形式导出的重依赖名；
-models / parser / snapshot / scheduler 等轻量子模块由调用方直接按模块路径导入
-（web_api.py / main.py 即 ``from .stats.models import ...``），不在此登记，
+models / parser / scheduler 等轻量子模块由调用方直接按模块路径导入
+（web_api.py / main.py 即 ``from .stats.models import ...``），不在此登记。
+v0.5.5 起 ``SnapshotManager`` 与其兼容别名 ``ImageSnapshotManager`` 也登记为
+惰性导出（首次访问才按需加载 snapshot 模块，不影响下述轻量子模块的隔离性）。
 **切勿**在此文件顶层急切 import 整条依赖链。
 """
 
@@ -28,6 +30,8 @@ _LAZY_EXPORTS = {
     "StatsRepository": ".repository",
     "StatsService": ".service",
     "StatsBuildError": ".service",
+    "SnapshotManager": ".snapshot",
+    "ImageSnapshotManager": ".snapshot",
 }
 
 __all__ = list(_LAZY_EXPORTS)
@@ -49,3 +53,4 @@ def __getattr__(name: str):
 if TYPE_CHECKING:  # 供静态分析/IDE 识别导出名（运行时不执行）
     from .repository import StatsRepository  # noqa: F401
     from .service import StatsBuildError, StatsService  # noqa: F401
+    from .snapshot import ImageSnapshotManager, SnapshotManager  # noqa: F401

@@ -1,13 +1,22 @@
-"""统计编排服务（v0.5.0 数据分析模块 G）。
+"""统计编排服务（v0.5.0 数据分析模块 G，v0.5.5 群级查询迁分段快照）。
 
 三端同源的数据组装与推送编排层，串联模块 B（MySQL 聚合仓储）、模块 D
-（图片快照）、模块 E（T2I 渲染）与模块 F（调度器，惰性引用）：
+（分段快照：消息+图片 × 小时/日/月三段式）、模块 E（T2I 渲染）与模块 F
+（调度器，惰性引用）：
 
 - :meth:`StatsService.build_stats`：**唯一**数据组装入口（Web ``/stats/data``、
-  ``/群统计`` 指令、定时推送三端共用），顺序为——强制刷新当前小时图片快照 →
-  ``asyncio.gather`` 并发 repo 聚合查询（按 query 维度裁剪）→ daily_trend
-  连续补零 → 个人维度 ratio/rank/avg 计算 → ``snapshot.fill_counts`` 注入
-  图片数；任何底层异常统一包装为 :class:`StatsBuildError`（友好文案）上抛；
+  ``/群统计`` 指令、定时推送三端共用），顺序为——强制刷新当前小时快照 →
+  群级维度快照取数判定（总消息数 / 每日趋势 / 群排行 count 走**消息快照
+  三层归并**（月+日+时），快照返回 None（范围不可服务/快照异常）精确回退
+  对应 repo 实时 SQL 路径）→ ``asyncio.gather`` 并发聚合查询（按 query
+  维度裁剪）→ daily_trend 连续补零 → 个人维度 ratio/rank/avg 计算 →
+  ``snapshot.fill_counts`` 注入图片数；任何底层异常统一包装为
+  :class:`StatsBuildError`（友好文案）上抛；活跃成员数、首末条时间、
+  发言人排行、个人维度保持实时 SQL（群级快照无法推导）；
+- :meth:`StatsService.overview_daily_stats`：Web 概览「最近 N 天趋势」快照
+  口径供数（v0.5.5，days ≤ 31 时消息/图片日快照逐日组装，供数前触发一次
+  限流强制刷新保证「今天」柱子实时；越界/快照不可用/任何异常返回 None，
+  调用方回落 MySQL 实时路径）；
 - :meth:`StatsService.check_cooldown`：``/群统计`` 每群冷却（时长读
   ``stats_cooldown``，0=不限流），放行即盖章（``time.monotonic()``）；
 - :meth:`StatsService.record_group_umo` / :meth:`StatsService.get_group_umo`：
@@ -19,7 +28,10 @@
 - :meth:`StatsService.start` / :meth:`StatsService.stop`：惰性创建/停止
   ``stats.scheduler.StatsScheduler``（模块 F 并行开发，按契约
   ``StatsScheduler(service, snapshot, config_mgr)`` 惰性引用），均可重入、
-  异常不外抛。
+  异常不外抛；stop 同时取消安全清理启动回填任务句柄；
+- :meth:`StatsService.startup_backfill`：启动历史回填后台任务薄封装
+  （v0.5.5，``create_task(snapshot.backfill_on_startup())`` 自持句柄，
+  重复调用幂等，stop 时 cancel + await）。
 
 签名说明：契约草图中 ``check_cooldown`` 为同步 def，但冷却时长需经
 ``db_config.get_stats_setting_typed``（async-only）实时读取，故实现为异步
@@ -27,7 +39,8 @@
 冷却检查范式一致；模块 M 接线时按实际签名 await 调用。
 
 日志统一 ``[Stats]`` 前缀。契约见 ``开发/v0.5.0/分工.md``「接口契约 →
-编排服务（模块 G）」，字段与注释与其保持一致。
+编排服务（模块 G）」；v0.5.5 迁移点与回退矩阵见 ``开发/v0.5.5/分工.md``
+「E. stats/service.py 迁移点与回退矩阵」，字段与注释与其保持一致。
 """
 
 from __future__ import annotations
@@ -100,9 +113,14 @@ class StatsBuildError(Exception):
 class StatsService:
     """数据分析编排服务：build_stats 单一组装出口 + 冷却 + umo 缓存 + 推送。
 
+    v0.5.5 起群级查询（总消息数 / 每日趋势 / 群排行 count）迁分段快照读数，
+    快照不可用时精确回退实时 SQL（回退矩阵见 开发/v0.5.5/分工.md）；Web
+    概览趋势经 :meth:`overview_daily_stats` 走快照口径。
+
     Attributes:
         repo: MySQL 聚合仓储（模块 B）实例，公开以便测试注入替换。
-        snapshot: 图片快照管理器（模块 D）实例，公开以便测试注入替换。
+        snapshot: 分段快照管理器（模块 D，消息+图片 × 小时/日/月）实例，
+            公开以便测试注入替换。
         renderer: T2I 渲染器（模块 E）实例，公开以便测试注入替换。
     """
 
@@ -142,6 +160,9 @@ class StatsService:
         self._cooldown: dict[str, float] = {}
         # 调度器（模块 F）：start() 时惰性创建，未启动为 None
         self._scheduler = None
+        # 启动回填后台任务句柄（v0.5.5）：startup_backfill() 创建，
+        # stop() 取消安全清理；None = 未创建或已清理
+        self._backfill_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -170,10 +191,19 @@ class StatsService:
             )
 
     async def stop(self) -> None:
-        """停止调度器并清空内存缓存（umo / 冷却盖章表）。
+        """停止调度器、取消启动回填任务并清空内存缓存（umo / 冷却盖章表）。
 
         可重入、异常不外抛：调度器停止异常仅记日志，缓存清理恒执行。
         """
+        # 启动回填任务取消安全清理（v0.4.5 范式：cancel 后必须 await 等待真正
+        # 退出并吞 CancelledError，避免悬挂任务；句柄已自然结束同样置 None）
+        if self._backfill_task is not None and not self._backfill_task.done():
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except asyncio.CancelledError:
+                pass
+        self._backfill_task = None
         try:
             if self._scheduler is not None:
                 try:
@@ -186,6 +216,18 @@ class StatsService:
         finally:
             self._umo_cache.clear()
             self._cooldown.clear()
+
+    async def startup_backfill(self) -> None:
+        """启动快照历史回填（v0.5.5 PRD F4.1，MySQL 初始化成功后由 main.py 调用）。
+
+        薄封装：``asyncio.create_task(snapshot.backfill_on_startup())`` 并自持
+        句柄（:meth:`stop` 负责取消安全清理）。幂等：已有句柄未结束时直接
+        返回，不新建任务；句柄已自然结束（完成/异常）则允许再次发起。回填
+        自身异常由快照层吞掉仅记日志（契约），绝不阻断插件启动。
+        """
+        if self._backfill_task is not None and not self._backfill_task.done():
+            return
+        self._backfill_task = asyncio.create_task(self.snapshot.backfill_on_startup())
 
     # ------------------------------------------------------------------
     # umo 缓存（推送目标）
@@ -244,11 +286,15 @@ class StatsService:
     async def build_stats(self, query: StatsQuery) -> StatsData:
         """组装完整统计数据（三端同源的唯一入口）。
 
-        流程：强制刷新当前小时图片快照 → ``asyncio.gather`` 并发 repo 聚合
-        查询（按 query 维度裁剪：群维度查发言人排行、全部群视图查群排行、
-        个人维度附加 member_overview 与 sender 维度分布/完整排行）→
-        daily_trend 连续补零（start 所在日 ~ end 前一日）→ ratio/rank/
-        peak_hour/avg_per_day 计算 → ``snapshot.fill_counts`` 注入图片数。
+        流程：强制刷新当前小时快照 → 群级维度快照取数判定（total_messages /
+        daily_trend / 群排行 count 走消息快照三层归并（月+日+时）；快照返回
+        None（范围不可服务/快照异常）精确回退对应 repo 实时 SQL，回退矩阵见
+        ``开发/v0.5.5/分工.md``）→ ``asyncio.gather`` 并发聚合查询（按 query
+        维度裁剪：群维度查发言人排行、全部群视图查群排行、个人维度附加
+        member_overview 与 sender 维度分布/完整排行；快照路径的 overview 仅查
+        活跃数与首末条时间 meta、群排行仅查每群活跃数）→ daily_trend 连续补零
+        （start 所在日 ~ end 前一日）→ ratio/rank/peak_hour/avg_per_day 计算 →
+        ``snapshot.fill_counts`` 注入图片数。
 
         Args:
             query: 统计查询条件（group_id=None 为全部群汇总；member_id
@@ -270,24 +316,44 @@ class StatsService:
             raise StatsBuildError(_BUILD_ERROR_MSG) from e
 
     async def _build(self, query: StatsQuery) -> StatsData:
-        """build_stats 内部实现（异常由外层统一包装为 StatsBuildError）。"""
+        """build_stats 内部实现（异常由外层统一包装为 StatsBuildError）。
+
+        v0.5.5 数据源切换（PRD F2 回退矩阵）：total_messages / daily_trend /
+        群排行 count 三处先问消息快照三层归并（毫秒级 SQLite 读，gather 前
+        完成判定），快照返回 None（范围不可服务/快照异常）的维度精确回退
+        对应 repo 实时 SQL 路径，输出字段与 v0.5.2 逐字段一致。
+        """
         group_id = query.group_id
         member_id = query.member_id
         start = query.time_range.start
         end = query.time_range.end
         top_n = self._clamp_top_n(query.top_n)
 
-        # 1) 强制刷新当前小时图片快照（契约：内部异常仅日志不抛；若意外抛出
-        #    由外层统一兜底为 StatsBuildError）
+        # 1) 强制刷新当前小时快照（契约：内部已 60s 限流、异常仅日志不抛；
+        #    若意外抛出由外层统一兜底为 StatsBuildError）
         await self.snapshot.refresh_current_hour()
 
-        # 2) 并发 repo 聚合查询（按 query 维度裁剪调用）
+        # 2) 快照取数判定（v0.5.5 群级迁快照；None = 该维度回退实时 SQL）
+        snap_total = await self.snapshot.msg_total(start, end, group_id)
+        snap_trend = await self.snapshot.msg_daily_trend(start, end, group_id)
+        snap_per_group = None
+        if group_id is None and member_id is None:
+            snap_per_group = await self.snapshot.msg_per_group(start, end)
+
+        # 3) 并发聚合查询（快照路径的实时配套 / 回退协程一并塞入 tasks，
+        #    保持单次 gather 结构）
         tasks: dict = {
-            "overview": self.repo.get_overview(group_id, start, end),
             "hourly": self.repo.get_hourly_dist(group_id, None, start, end),
             "weekday": self.repo.get_weekday_dist(group_id, None, start, end),
-            "trend": self.repo.get_daily_trend(group_id, start, end),
         }
+        if snap_total is None:
+            # 回退：整体走 v0.5.2 全量实时查询（含 COUNT(*)）
+            tasks["overview"] = self.repo.get_overview(group_id, start, end)
+        else:
+            # 快照路径：total 由快照供数，实时 SQL 只补活跃数与首末条时间
+            tasks["overview_meta"] = self.repo.get_overview_meta(group_id, start, end)
+        if snap_trend is None:
+            tasks["trend"] = self.repo.get_daily_trend(group_id, start, end)
         if member_id is not None:
             # 个人维度：附加个人概览 + sender 维度双分布；
             # 完整排行（limit=50）兼顾名次查找与展示排行切片（单次查询两用）
@@ -308,22 +374,35 @@ class StatsService:
             tasks["sender_ranking"] = self.repo.get_sender_ranking(
                 group_id, start, end, top_n
             )
-        else:
+        elif snap_per_group is None:
+            # 全部群视图回退：v0.5.2 群排行实时查询（含 COUNT(*) 与活跃数）
             tasks["group_ranking"] = self.repo.get_group_ranking(start, end, top_n)
+        else:
+            # 全部群视图快照路径：count 由快照供数，活跃数无法由群级快照
+            # 推导，实时补齐（Python 侧合并见下文）
+            tasks["group_active"] = self.repo.get_group_active_senders(start, end)
 
         keys = list(tasks)
         values = await asyncio.gather(*(tasks[k] for k in keys))
         got = dict(zip(keys, values))
 
-        # 3) 总览 / 分布 / 趋势补零 / 峰值
-        overview = got.get("overview") or {}
+        # 4) 总览（快照 total + 实时 meta；回退时整体取 repo overview）/
+        #    分布 / 趋势补零 / 峰值
+        if snap_total is None:
+            overview = got.get("overview") or {}
+        else:
+            overview = {"total": snap_total, **(got.get("overview_meta") or {})}
         total = int(overview.get("total", 0) or 0)
         hourly = list(got.get("hourly") or [])
         weekday = list(got.get("weekday") or [])
-        trend = self._fill_trend(got.get("trend"), start, end)
+        # 快照日趋势 dict → [(date, count)] 交给既有补零逻辑（顺序不敏感）
+        trend_raw = (
+            list(snap_trend.items()) if snap_trend is not None else got.get("trend")
+        )
+        trend = self._fill_trend(trend_raw, start, end)
         peak_hour = self._peak_of(hourly)
 
-        # 4) 排行（个人维度展示排行取完整排行前 top_n；全部群视图无发言人排行）
+        # 5) 排行（个人维度展示排行取完整排行前 top_n；全部群视图无发言人排行）
         if member_id is not None:
             sender_rows = (
                 (got.get("ranking_full") or [])[:top_n] if group_id is not None else []
@@ -333,13 +412,28 @@ class StatsService:
         else:
             sender_rows = []
         sender_ranking = [self._sender_item(row) for row in sender_rows]
-        group_ranking = (
-            [self._group_item(row) for row in (got.get("group_ranking") or [])]
-            if group_id is None and member_id is None
-            else []
-        )
+        if group_id is None and member_id is None:
+            if snap_per_group is None:
+                rank_rows = got.get("group_ranking") or []
+            else:
+                # 快照路径：Python 侧合并 count 与活跃数，排序口径与
+                # repo.get_group_ranking 一致（count DESC、同数 group_id ASC）
+                active = got.get("group_active") or {}
+                rank_rows = [
+                    {
+                        "group_id": gid,
+                        "count": cnt,
+                        "active_senders": active.get(gid, 0),
+                    }
+                    for gid, cnt in snap_per_group.items()
+                ]
+                rank_rows.sort(key=lambda row: (-row["count"], row["group_id"]))
+                rank_rows = rank_rows[:top_n]
+            group_ranking = [self._group_item(row) for row in rank_rows]
+        else:
+            group_ranking = []
 
-        # 5) 个人维度 MemberStats 组装
+        # 6) 个人维度 MemberStats 组装
         member = None
         if member_id is not None:
             mo = got.get("member_overview") or {}
@@ -380,7 +474,7 @@ class StatsService:
             member=member,
             generated_at=datetime.now(),
         )
-        # 6) 注入图片数（total_images / 排行 / 群排行 / 个人 image_count）
+        # 7) 注入图片数（total_images / 排行 / 群排行 / 个人 image_count）
         return await self.snapshot.fill_counts(data)
 
     # ------------------------------------------------------------------
@@ -395,6 +489,62 @@ class StatsService:
             契约绝不抛异常）。
         """
         return await self.renderer.render_card(data, title)
+
+    # ------------------------------------------------------------------
+    # Web 概览趋势（v0.5.5 快照口径，PRD F3）
+    # ------------------------------------------------------------------
+
+    async def overview_daily_stats(
+        self, days: int, now: datetime | None = None
+    ) -> list[dict] | None:
+        """Web 概览「最近 N 天趋势」快照口径供数（PRD F3，供 api_daily_stats）。
+
+        days ≤ 31 时由消息/图片日快照供数（今天 = 小时快照求和）：供数前
+        触发一次 ``refresh_current_hour``（60s 限流在快照层内部），保证
+        「今天」柱子实时；窗口 ``[今日 00:00 - days 天, 明日 00:00)``，
+        逐日组装 ``{"date", "messages", "images"}``，窗口内缺失日补 0，
+        按日期升序返回。快照行只增盖不删，image_records 滚动清理不再影响
+        趋势（快照行在清理前已固化）。
+
+        Args:
+            days: 趋势天数；<1 或 >31（快照日趋势仅服务 31 天内）返回 None。
+            now: 当前时刻（缺省 ``datetime.now()``），独立成参便于测试注入。
+
+        Returns:
+            list[dict] | None: 逐日条目列表；days 越界 / 快照不可用
+            （msg 或 image 任一趋势返回 None）/ 任何异常返回 None
+            （契约：调用方 WebAPI 回落 MySQL 实时路径）。
+        """
+        try:
+            if days < 1 or days > 31:
+                return None
+            if now is None:
+                now = datetime.now()
+            today = datetime(now.year, now.month, now.day)
+            start = today - timedelta(days=days)
+            end = today + timedelta(days=1)
+            await self.snapshot.refresh_current_hour(now)
+            msgs = await self.snapshot.msg_daily_trend(start, end)
+            imgs = await self.snapshot.image_daily_trend(start, end)
+            if msgs is None or imgs is None:
+                return None
+            items: list[dict] = []
+            cur = start.date()
+            last = today.date()
+            while cur <= last:
+                key = cur.strftime("%Y-%m-%d")
+                items.append(
+                    {
+                        "date": key,
+                        "messages": msgs.get(key, 0),
+                        "images": imgs.get(key, 0),
+                    }
+                )
+                cur += timedelta(days=1)
+            return items
+        except Exception as e:
+            logger.warning(f"[Stats] 概览趋势快照供数失败（回落 MySQL 实时路径）: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # 推送侧（调度器调用）

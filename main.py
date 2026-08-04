@@ -112,8 +112,8 @@ def stats_fallback_text(data, label: str) -> str:
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
-    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 图片小时级快照统计）",
-    "0.5.2",
+    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
+    "0.5.5",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -157,7 +157,9 @@ class GroupHistoryPlugin(Star):
 
         # 初始化数据分析服务（v0.5.0，须在 WebAPI 之前构造，以便注入服务实例；
         # 构造仅组装上游模块引用无 I/O，调度器在 MySQL 初始化成功后才 start）
-        self.stats_service = StatsService(context, self.mysql_mgr, self.config_mgr, self)
+        self.stats_service = StatsService(
+            context, self.mysql_mgr, self.config_mgr, self
+        )
 
         # 初始化 Web API（注入总结存储实例供总结历史端点使用，注入人物分析服务与存储实例）
         self.web_api = WebAPI(
@@ -233,6 +235,13 @@ class GroupHistoryPlugin(Star):
                         await self.stats_service.start()
                     except Exception as e:
                         logger.error(f"[Stats] 启动数据分析服务失败: {e}")
+                    # v0.5.5 快照启动回填：MySQL 可用且 stats 服务已启动后发起后台
+                    # 批量回填（服务层 create_task 自持句柄、terminate 自行取消，
+                    # 幂等可重入）；失败仅记日志，不阻断插件加载
+                    try:
+                        await self.stats_service.startup_backfill()
+                    except Exception as e:
+                        logger.error(f"[HistorySave] 快照启动回填发起失败: {e}")
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )

@@ -518,7 +518,12 @@ class WebAPI:
         return json_response({"saved": True, "settings": settings})
 
     async def api_daily_stats(self):
-        """获取每日存储统计。"""
+        """获取每日存储统计。
+
+        v0.5.5：days<=31 时优先由快照口径供数（stats_service.overview_daily_stats），
+        days 超出、快照不可用或 stats_service 未注入时回落 MySQL 实时路径；
+        响应结构不变（{"days", "items": [{date, messages, images}]}）。
+        """
         days_str = request.query.get("days") or "7"
         try:
             days = int(days_str)
@@ -528,7 +533,11 @@ class WebAPI:
             days = 7
         if days > 90:
             days = 90
-        stats = await self.mysql_mgr.get_daily_stats(days)
+        stats = None
+        if self.stats_service is not None:
+            stats = await self.stats_service.overview_daily_stats(days)
+        if stats is None:
+            stats = await self.mysql_mgr.get_daily_stats(days)
         return json_response({"days": days, "items": stats})
 
     async def api_clean(self):

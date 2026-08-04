@@ -26,10 +26,13 @@ class StatsRepository:
     口径总览（各方法明细见其 docstring）：
 
     - 消息口径：chat_history（text/mixed，纯图片消息不入该表）；
-      图片口径：image_records（仅 get_image_window_counts 使用，快照任务专用）
+      图片口径：image_records（快照任务/批量聚合专用）
     - 时间窗口一律 [start, end) 半开区间
     - 排序规则：发言人行排行 COUNT(*) DESC、同数 sender_id ASC；
       群排行 COUNT(*) DESC、同数 group_id ASC（保证输出确定性）
+    - v0.5.5 批量聚合（get_hourly_batch / get_daily_batch /
+      get_monthly_batch）经 source 白名单 _SOURCE_TABLES
+      {"msg": chat_history, "image": image_records} 映射表名，非法值抛 ValueError
     """
 
     def __init__(self, mysql_mgr):
@@ -549,3 +552,403 @@ class StatsRepository:
         await self._execute(cur, sql, params)
         rows = await cur.fetchall()
         return {str(row[0]): str(row[1] or "") for row in rows}
+
+    # ------------------------------------------------------------------
+    # v0.5.5 分段快照体系：消息窗口聚合（快照 msg 源）
+    # ------------------------------------------------------------------
+
+    async def get_msg_window_counts(
+        self, start: datetime, end: datetime, top_k: int
+    ) -> dict:
+        """聚合 chat_history 窗口 [start, end) 的消息数（消息快照任务/强制刷新专用）。
+
+        chat_history 版 get_image_window_counts，结构与口径完全镜像：
+        SQL 侧按 (group_id, sender_id) 分组计数（一条聚合 SQL），
+        Python 侧汇总群总量并对每群按 count 降序、同数 sender_id ASC 截断
+        前 top_k（不用窗口函数，MySQL 5.7 兼容）；top_k 内 sender 的昵称
+        再发一条 IN 查询取各人窗口内最新一条 chat_history 的 sender_name
+        （派生表 MAX(id) 等值回表，跨群汇总去重后取最新，同人在多群
+        条目共用同一昵称）。
+
+        注意：groups 的群总量是**截断前**的全量求和，不受 top_k 影响；
+        senders 仅 Top K 内准确（与 get_image_window_counts 口径一致）。
+
+        Args:
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+            top_k: 每群保留的个人条数上限（调用方已夹住合法范围）
+
+        Returns:
+            dict: {
+                "groups": {group_id: count},
+                "senders": {group_id: [(sender_id, sender_name, count), …]}
+            }
+        """
+        sql = (
+            "SELECT group_id, sender_id, COUNT(*) "
+            "FROM chat_history WHERE timestamp >= %s AND timestamp < %s "
+            "GROUP BY group_id, sender_id"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, [start, end])
+                rows = await cur.fetchall()
+                if not rows:
+                    return {"groups": {}, "senders": {}}
+
+                # Python 侧分组：群总量（截断前全量累加）+ 每群个人明细
+                groups: dict = {}
+                per_group: dict = {}
+                for row in rows:
+                    gid = str(row[0])
+                    sid = str(row[1])
+                    cnt = int(row[2] or 0)
+                    groups[gid] = groups.get(gid, 0) + cnt
+                    per_group.setdefault(gid, []).append((sid, cnt))
+
+                # 每群 count 降序（同数 sender_id ASC 保确定性）截断前 top_k
+                senders: dict = {}
+                for gid, entries in per_group.items():
+                    entries.sort(key=lambda item: (-item[1], item[0]))
+                    senders[gid] = entries[: max(0, int(top_k))]
+
+                # 上榜 sender 最新昵称（跨群汇总去重后一条 IN 查询）
+                top_ids = sorted(
+                    {sid for entries in senders.values() for sid, _ in entries}
+                )
+                if top_ids:
+                    names = await self._latest_msg_sender_names(
+                        cur, top_ids, start, end
+                    )
+                else:
+                    names = {}
+        return {
+            "groups": groups,
+            "senders": {
+                gid: [(sid, names.get(sid, ""), cnt) for sid, cnt in entries]
+                for gid, entries in senders.items()
+            },
+        }
+
+    async def _latest_msg_sender_names(
+        self, cur, sender_ids: list[str], start: datetime, end: datetime
+    ) -> dict:
+        """批量取上榜 sender 在 chat_history 窗口内的最新昵称（5.7 兼容）。
+
+        与 _latest_image_sender_names 同构：派生表取各 sender 窗口内 MAX(id)
+        （auto_increment 单调，即窗口内最后一条）再等值回表；不区分群
+        （同人跨群条目共用最新昵称），供 get_msg_window_counts 跨群场景
+        汇总去重后批量取回。
+
+        Args:
+            cur: 已打开的游标（复用调用方连接）
+            sender_ids: 上榜 sender_id 列表（非空）
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            dict: {sender_id: sender_name}；查不到的 sender 不在其中
+        """
+        placeholders = ",".join(["%s"] * len(sender_ids))
+        sql = (
+            "SELECT t.sender_id, t.sender_name FROM chat_history AS t "
+            "JOIN ("
+            "SELECT t2.sender_id, MAX(t2.id) AS max_id FROM chat_history AS t2 "
+            "WHERE t2.timestamp >= %s AND t2.timestamp < %s "
+            f"AND t2.sender_id IN ({placeholders}) "
+            "GROUP BY t2.sender_id"
+            ") AS m ON m.sender_id = t.sender_id AND m.max_id = t.id "
+            "WHERE t.timestamp >= %s AND t.timestamp < %s"
+        )
+        params = [start, end, *sender_ids, start, end]
+        await self._execute(cur, sql, params)
+        rows = await cur.fetchall()
+        return {str(row[0]): str(row[1] or "") for row in rows}
+
+    # ------------------------------------------------------------------
+    # v0.5.5 分段快照体系：批量聚合（F4.1 启动窗口重聚合/回填专用）
+    # ------------------------------------------------------------------
+
+    # source 白名单 → 表名映射（get_hourly_batch / get_daily_batch /
+    # get_monthly_batch 共用）；表名只来自该常量，不接受用户输入
+    _SOURCE_TABLES = {"msg": "chat_history", "image": "image_records"}
+
+    @classmethod
+    def _resolve_source_table(cls, source: str) -> str:
+        """把 source 白名单键映射为表名，非法值抛 ValueError。
+
+        Args:
+            source: 数据源键，"msg"（chat_history）或 "image"（image_records）
+
+        Returns:
+            str: 对应表名
+
+        Raises:
+            ValueError: source 不在白名单内
+        """
+        table = cls._SOURCE_TABLES.get(source)
+        if table is None:
+            raise ValueError(f"unknown source: {source!r} (expect 'msg' or 'image')")
+        return table
+
+    async def get_hourly_batch(
+        self, source: str, start: datetime, end: datetime, top_k: int
+    ) -> tuple[list[tuple], list[tuple]]:
+        """批量小时聚合：窗口内逐 (日期, 小时, 群) 的群总量与发言人 Top K。
+
+        启动窗口重聚合/历史回填专用（PRD F4.1）：一条 GROUP BY
+        DATE(timestamp), HOUR(timestamp), group_id, sender_id 的聚合 SQL
+        拉回窗口全量明细，Python 侧逐 (date, hour, group) 汇总群总量
+        （hour_rows）并对 sender 按 count 降序、同数 sender_id ASC 截断
+        前 top_k（top_rows）；昵称另发一条派生表查询（窗口内 GROUP BY
+        sender_id 聚出 MAX(id) 等值回表，MySQL 5.7 兼容，不带 IN 列表）
+        取窗口内每个 sender 最新一条记录的 sender_name（不区分群，
+        同人跨群共用最新昵称），查不到的空串兜底。
+
+        口径：窗口 [start, end) 半开；hour_rows 为截断前群总量，不受
+        top_k 影响；输出按 (date, hour, group_id) 升序展开（确定性）。
+        image_records 因滚动清理只剩近几天，旧窗口自然为空——接受。
+
+        Args:
+            source: 数据源键，"msg"（chat_history）或 "image"（image_records），
+                非法值抛 ValueError
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+            top_k: 每 (date, hour, group) 保留的个人条数上限
+                （调用方已夹住合法范围）
+
+        Returns:
+            tuple[list[tuple], list[tuple]]: (hour_rows, top_rows)
+                hour_rows: [(date_str, hour, group_id, count), …]
+                top_rows: [(date_str, hour, group_id, sender_id,
+                            sender_name, count), …]
+                窗口无数据返回 ([], [])
+        """
+        table = self._resolve_source_table(source)
+        sql = (
+            "SELECT DATE(timestamp), HOUR(timestamp), group_id, sender_id, COUNT(*) "
+            f"FROM {table} WHERE timestamp >= %s AND timestamp < %s "
+            "GROUP BY DATE(timestamp), HOUR(timestamp), group_id, sender_id"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, [start, end])
+                rows = await cur.fetchall()
+                if not rows:
+                    return ([], [])
+
+                # Python 侧按 (date, hour, group) 汇总：群总量 + sender 明细
+                hour_totals: dict = {}
+                buckets: dict = {}
+                for row in rows:
+                    key = (self._format_date(row[0]), int(row[1]), str(row[2]))
+                    sid = str(row[3])
+                    cnt = int(row[4] or 0)
+                    hour_totals[key] = hour_totals.get(key, 0) + cnt
+                    buckets.setdefault(key, []).append((sid, cnt))
+
+                # 逐桶 count 降序（同数 sender_id ASC 保确定性）截断前 top_k
+                limit = max(0, int(top_k))
+                top_buckets: dict = {}
+                for key, entries in buckets.items():
+                    entries.sort(key=lambda item: (-item[1], item[0]))
+                    top_buckets[key] = entries[:limit]
+
+                # 窗口内每个 sender 的最新昵称（一条派生表查询，无 IN 列表）
+                top_ids = {
+                    sid for entries in top_buckets.values() for sid, _ in entries
+                }
+                if top_ids:
+                    names = await self._window_latest_sender_names(
+                        cur, table, start, end
+                    )
+                else:
+                    names = {}
+
+        # 确定性输出：按 (date, hour, group_id) 升序展开
+        hour_rows = []
+        top_rows = []
+        for key in sorted(hour_totals):
+            date_str, hour, gid = key
+            hour_rows.append((date_str, hour, gid, hour_totals[key]))
+            for sid, cnt in top_buckets[key]:
+                top_rows.append((date_str, hour, gid, sid, names.get(sid, ""), cnt))
+        return (hour_rows, top_rows)
+
+    async def _window_latest_sender_names(
+        self, cur, table: str, start: datetime, end: datetime
+    ) -> dict:
+        """取窗口内每个 sender 的最新昵称（派生表 MAX(id) 回表，5.7 兼容）。
+
+        仿 _latest_sender_names 的派生表范式，但不带 sender_id IN 列表——
+        窗口内全 sender 一次 GROUP BY sender_id 聚出 MAX(id)（auto_increment
+        单调，即窗口内最后一条）再等值回表，供 get_hourly_batch 批量回填
+        昵称；不区分群（同人跨群共用最新昵称）。
+
+        Args:
+            cur: 已打开的游标（复用调用方连接）
+            table: 表名（仅来自 _SOURCE_TABLES 白名单，无拼接风险）
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            dict: {sender_id: sender_name}
+        """
+        sql = (
+            f"SELECT t.sender_id, t.sender_name FROM {table} AS t "
+            "JOIN ("
+            f"SELECT t2.sender_id, MAX(t2.id) AS max_id FROM {table} AS t2 "
+            "WHERE t2.timestamp >= %s AND t2.timestamp < %s "
+            "GROUP BY t2.sender_id"
+            ") AS m ON m.sender_id = t.sender_id AND m.max_id = t.id "
+            "WHERE t.timestamp >= %s AND t.timestamp < %s"
+        )
+        await self._execute(cur, sql, [start, end, start, end])
+        rows = await cur.fetchall()
+        return {str(row[0]): str(row[1] or "") for row in rows}
+
+    async def get_daily_batch(
+        self, source: str, start: datetime, end: datetime
+    ) -> list[tuple]:
+        """批量日聚合：窗口内逐 (日期, 群) 的消息/图片总数。
+
+        启动窗口重聚合日层/历史回填专用（PRD F4.1）：一条 GROUP BY
+        DATE(timestamp), group_id 的聚合 SQL，群级全量不截断；
+        供日快照表（msg_stats_daily / image_stats_daily）UPSERT。
+
+        口径：窗口 [start, end) 半开；只含窗口内实际有数据的 (date, group)；
+        按日期升序、同日按 group_id 升序（输出确定性）。
+
+        Args:
+            source: 数据源键，"msg"（chat_history）或 "image"（image_records），
+                非法值抛 ValueError
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            list[tuple]: [(date_str, group_id, count), …]；窗口无数据返回 []
+        """
+        table = self._resolve_source_table(source)
+        sql = (
+            "SELECT DATE(timestamp), group_id, COUNT(*) "
+            f"FROM {table} WHERE timestamp >= %s AND timestamp < %s "
+            "GROUP BY DATE(timestamp), group_id "
+            "ORDER BY DATE(timestamp) ASC, group_id ASC"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, [start, end])
+                rows = await cur.fetchall()
+        return [
+            (self._format_date(row[0]), str(row[1]), int(row[2] or 0)) for row in rows
+        ]
+
+    async def get_monthly_batch(
+        self, source: str, start: datetime, end: datetime
+    ) -> list[tuple]:
+        """批量月聚合：窗口内逐 (月, 群) 的消息/图片总数。
+
+        月层增量补齐专用（PRD F4.1）：一条 GROUP BY YEAR(timestamp),
+        MONTH(timestamp), group_id 的聚合 SQL，群级全量不截断；
+        供月快照表（msg_stats_monthly / image_stats_monthly）UPSERT。
+
+        口径：窗口 [start, end) 半开；月戳两位补零 "YYYY-MM"（跨年窗口
+        自然按年月分组）；只含窗口内实际有数据的 (month, group)；
+        按月升序、同月按 group_id 升序（输出确定性）。
+        窗口首尾的不完整月同样会被聚合，是否入库由调用方按游标判定。
+
+        Args:
+            source: 数据源键，"msg"（chat_history）或 "image"（image_records），
+                非法值抛 ValueError
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            list[tuple]: [("YYYY-MM", group_id, count), …]；窗口无数据返回 []
+        """
+        table = self._resolve_source_table(source)
+        sql = (
+            "SELECT YEAR(timestamp), MONTH(timestamp), group_id, COUNT(*) "
+            f"FROM {table} WHERE timestamp >= %s AND timestamp < %s "
+            "GROUP BY YEAR(timestamp), MONTH(timestamp), group_id "
+            "ORDER BY YEAR(timestamp) ASC, MONTH(timestamp) ASC, group_id ASC"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, [start, end])
+                rows = await cur.fetchall()
+        return [
+            (
+                f"{int(row[0])}-{int(row[1]):02d}",
+                str(row[2]),
+                int(row[3] or 0),
+            )
+            for row in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # v0.5.5 分段快照体系：快照路径元数据查询
+    # ------------------------------------------------------------------
+
+    async def get_overview_meta(
+        self, group_id: str | None, start: datetime, end: datetime
+    ) -> dict:
+        """窗口总览元数据：活跃成员数与首末条消息时间（v0.5.5 快照路径专用）。
+
+        get_overview 去掉 COUNT(*) 的精简版——总消息数改由快照三层归并供数，
+        实时 SQL 只补快照无法推导的维度。口径：COUNT(DISTINCT sender_id)
+        计去重发言者；MIN/MAX(timestamp) 取窗口内首末条时刻（窗口无数据时
+        为 None）。
+
+        Args:
+            group_id: 群号过滤；None = 全部群汇总
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            dict: {"active_senders": int, "first": datetime|None,
+                   "last": datetime|None}
+        """
+        where, params = self._window_clause(start, end, group_id=group_id)
+        sql = (
+            "SELECT COUNT(DISTINCT sender_id), MIN(timestamp), MAX(timestamp) "
+            f"FROM chat_history WHERE {where}"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, params)
+                row = await cur.fetchone()
+        if not row:
+            return {"active_senders": 0, "first": None, "last": None}
+        return {
+            "active_senders": int(row[0] or 0),
+            "first": row[1],
+            "last": row[2],
+        }
+
+    async def get_group_active_senders(
+        self, start: datetime, end: datetime
+    ) -> dict[str, int]:
+        """窗口内每群的活跃成员数（v0.5.5 群排行快照路径专用）。
+
+        口径：chat_history 按 group_id 分组 COUNT(DISTINCT sender_id)；
+        群排行迁快照后，活跃成员数无法由群级快照推导，由本方法实时补齐。
+        只统计窗口内实际有消息的群。
+
+        Args:
+            start: 窗口起点（含）
+            end: 窗口终点（不含）
+
+        Returns:
+            dict[str, int]: {group_id: 活跃成员数}；窗口无数据返回 {}
+        """
+        sql = (
+            "SELECT group_id, COUNT(DISTINCT sender_id) "
+            "FROM chat_history WHERE timestamp >= %s AND timestamp < %s "
+            "GROUP BY group_id"
+        )
+        async with self._mgr.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql, [start, end])
+                rows = await cur.fetchall()
+        return {str(row[0]): int(row[1] or 0) for row in rows}
