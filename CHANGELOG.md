@@ -2,11 +2,18 @@
 
 ## [0.5.2] - 2026-08-04
 
-修复旧表按群查询吃满 CPU 的问题：复合索引（`idx_group_time` 等）只存在于
-`CREATE TABLE IF NOT EXISTS` 的 DDL 中，早期版本已建出的表该 DDL 为 no-op，
-而旧迁移逻辑只补 `idx_message_id`，导致旧表的按群过滤
-（`WHERE group_id = … AND timestamp …`）与全表 `GROUP BY` 全部退化为全表扫描，
-数据分析/查询页打开即打满 CPU。现 `_migrate_schema` 启动时幂等补建全部必需索引。
+修复数据分析/查询页打开即吃满 CPU 的两个独立问题：
+
+1. **旧表复合索引缺失**：复合索引（`idx_group_time` 等）只存在于
+   `CREATE TABLE IF NOT EXISTS` 的 DDL 中，早期版本已建出的表该 DDL 为 no-op，
+   而旧迁移逻辑只补 `idx_message_id`，导致按群过滤（`WHERE group_id = … AND
+   timestamp …`）与全表 `GROUP BY` 退化为全表扫描。现 `_migrate_schema` 启动时
+   幂等补建全部必需索引。
+2. **相关子查询放大扫描**：发言人排行取最新昵称的 `_latest_sender_names` /
+   `_latest_image_sender_names` 使用相关子查询（外层每行重跑一次内层，
+   `ORDER BY timestamp DESC, id DESC LIMIT 1`），慢日志实测扫描行数放大到
+   434 万、单条 27 秒。改写为派生表按窗口聚合 `MAX(id)` 再按主键等值回表，
+   一条 SQL 批量取回全部昵称，5.7/8.0 兼容。
 
 ### Changed
 
@@ -16,6 +23,7 @@
   `idx_message_id` / 新增 `idx_timestamp`
 - 新建表 DDL 同步增加 `idx_timestamp (timestamp)`：无群条件的时间窗聚合
   （概览每日趋势、群排行、快照任务）走 timestamp 前缀范围扫描
+- `stats/repository` 最新昵称查询改派生表批量取回，消除相关子查询
 - 版本升至 0.5.2，静态引用 `?v=0.5.2`
 
 ## [0.5.1] - 2026-08-04

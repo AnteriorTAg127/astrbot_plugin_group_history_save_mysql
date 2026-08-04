@@ -95,9 +95,11 @@ class StatsRepository:
     ) -> dict:
         """批量取上榜 sender 在窗口内的最新昵称（MySQL 5.7 兼容）。
 
-        实现：对每个 sender 用关联子查询取「timestamp DESC、id DESC」的
-        唯一一行（id 打破同秒并列，保证每 sender 恰一条），避免 MySQL 8.0
-        窗口函数依赖。仅查窗口内记录：上榜者窗口内必有消息，子查询恒有结果。
+        实现：派生表按 sender 聚出窗口内 MAX(id)（auto_increment 单调，
+        与写入顺序一致，即窗口内最后一条），再按 id 等值回表取昵称——
+        一条 SQL 完成全部 sender。旧版用「外层每行执行一次相关子查询」
+        取 timestamp DESC 首行，慢日志实测扫描行数被放大到 434 万行、
+        单条 27 秒；派生表只物化一次窗口行，扫描量降回窗口大小。
 
         Args:
             cur: 已打开的游标（复用调用方连接）
@@ -112,15 +114,15 @@ class StatsRepository:
         placeholders = ",".join(["%s"] * len(sender_ids))
         sql = (
             "SELECT t.sender_id, t.sender_name FROM chat_history AS t "
-            f"WHERE t.group_id = %s AND t.timestamp >= %s AND t.timestamp < %s "
-            f"AND t.sender_id IN ({placeholders}) "
-            "AND t.id = ("
-            "SELECT t2.id FROM chat_history AS t2 "
-            "WHERE t2.group_id = t.group_id AND t2.sender_id = t.sender_id "
-            "AND t2.timestamp >= %s AND t2.timestamp < %s "
-            "ORDER BY t2.timestamp DESC, t2.id DESC LIMIT 1)"
+            "JOIN ("
+            "SELECT t2.sender_id, MAX(t2.id) AS max_id FROM chat_history AS t2 "
+            "WHERE t2.group_id = %s AND t2.timestamp >= %s AND t2.timestamp < %s "
+            f"AND t2.sender_id IN ({placeholders}) "
+            "GROUP BY t2.sender_id"
+            ") AS m ON m.sender_id = t.sender_id AND m.max_id = t.id "
+            "WHERE t.group_id = %s AND t.timestamp >= %s AND t.timestamp < %s"
         )
-        params = [group_id, start, end, *sender_ids, start, end]
+        params = [group_id, start, end, *sender_ids, group_id, start, end]
         await self._execute(cur, sql, params)
         rows = await cur.fetchall()
         return {str(row[0]): str(row[1] or "") for row in rows}
@@ -519,8 +521,9 @@ class StatsRepository:
     ) -> dict:
         """批量取上榜 sender 在 image_records 窗口内的最新昵称（5.7 兼容）。
 
-        与 _latest_sender_names 同构：关联子查询取「timestamp DESC、id DESC」
-        唯一一行；不区分群（同人跨群条目共用最新昵称）。
+        与 _latest_sender_names 同构：派生表取各 sender 窗口内 MAX(id) 再回表；
+        不区分群（同人跨群条目共用最新昵称）。旧版相关子查询写法同病——
+        外层逐行重跑内层子查询，本方法一并改为派生表批量取回。
 
         Args:
             cur: 已打开的游标（复用调用方连接）
@@ -534,13 +537,13 @@ class StatsRepository:
         placeholders = ",".join(["%s"] * len(sender_ids))
         sql = (
             "SELECT t.sender_id, t.sender_name FROM image_records AS t "
-            "WHERE t.timestamp >= %s AND t.timestamp < %s "
-            f"AND t.sender_id IN ({placeholders}) "
-            "AND t.id = ("
-            "SELECT t2.id FROM image_records AS t2 "
-            "WHERE t2.sender_id = t.sender_id "
-            "AND t2.timestamp >= %s AND t2.timestamp < %s "
-            "ORDER BY t2.timestamp DESC, t2.id DESC LIMIT 1)"
+            "JOIN ("
+            "SELECT t2.sender_id, MAX(t2.id) AS max_id FROM image_records AS t2 "
+            "WHERE t2.timestamp >= %s AND t2.timestamp < %s "
+            f"AND t2.sender_id IN ({placeholders}) "
+            "GROUP BY t2.sender_id"
+            ") AS m ON m.sender_id = t.sender_id AND m.max_id = t.id "
+            "WHERE t.timestamp >= %s AND t.timestamp < %s"
         )
         params = [start, end, *sender_ids, start, end]
         await self._execute(cur, sql, params)
