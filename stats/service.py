@@ -54,7 +54,7 @@ from .repository import StatsRepository
 from .t2i_render import StatsT2IRenderer
 
 if TYPE_CHECKING:
-    from astrbot.api.star import Context
+    from astrbot.api.star import Context, Star
 
     from ..db_config import ConfigManager
     from ..db_mysql import MySQLManager
@@ -107,15 +107,20 @@ class StatsService:
     """
 
     def __init__(
-        self, context: Context, mysql_mgr: MySQLManager, config_mgr: ConfigManager
+        self,
+        context: Context,
+        mysql_mgr: MySQLManager,
+        config_mgr: ConfigManager,
+        star: Star,
     ) -> None:
         """构造服务并自建上游模块实例（均暴露同名公开属性）。
 
         Args:
-            context: AstrBot ``Context``（主动推送经 ``send_message(umo, chain)``，
-                渲染器经其 ``html_render`` 鸭子类型约定工作）。
+            context: AstrBot ``Context``（主动推送经 ``send_message(umo, chain)``）。
             mysql_mgr: ``db_mysql.MySQLManager`` 实例（仅透传给仓储）。
             config_mgr: ``db_config.ConfigManager`` 实例（stats 配置/推送开关）。
+            star: 插件 Star 实例（T2I 渲染器经其 ``html_render`` 鸭子类型约定工作，
+                范式同 summary/profile 服务的 star 参数）。
         """
         self._context = context
         self._config_mgr = config_mgr
@@ -128,7 +133,7 @@ class StatsService:
         self.snapshot: ImageSnapshotManager = ImageSnapshotManager(
             config_mgr, self.repo
         )
-        self.renderer = StatsT2IRenderer(context, config_mgr)
+        self.renderer = StatsT2IRenderer(star, config_mgr)
 
         # 推送目标缓存：group_id → 最新 event.unified_msg_origin（仅内存不落盘，
         # 重启后由首条群消息重建，重建前该群推送跳过并 warning）

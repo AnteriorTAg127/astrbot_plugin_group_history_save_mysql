@@ -14,6 +14,11 @@
    `ORDER BY timestamp DESC, id DESC LIMIT 1`），慢日志实测扫描行数放大到
    434 万、单条 27 秒。改写为派生表按窗口聚合 `MAX(id)` 再按主键等值回表，
    一条 SQL 批量取回全部昵称，5.7/8.0 兼容。
+3. **/群统计 图片卡渲染必败**：`StatsService` 构造时把 AstrBot ``Context`` 当
+   渲染器注入了 `StatsT2IRenderer`（Context 无 ``html_render`` 属性），指令
+   报告卡与定时推送 T2I 首轮即报 ``'Context' object has no attribute
+   'html_render'`` 双双失败。`StatsService` 补 `star` 构造参数（范式同
+   summary/profile 服务），渲染器改注入 Star 实例，`_context` 仍专用于推送。
 
 ### Changed
 
@@ -24,6 +29,8 @@
 - 新建表 DDL 同步增加 `idx_timestamp (timestamp)`：无群条件的时间窗聚合
   （概览每日趋势、群排行、快照任务）走 timestamp 前缀范围扫描
 - `stats/repository` 最新昵称查询改派生表批量取回，消除相关子查询
+- `stats/service.StatsService` 新增 `star` 构造参数，T2I 渲染器改注入 Star 实例
+  （此前误传 Context 导致渲染必败）；`main.py` 构造处同步传入插件实例
 - 版本升至 0.5.2，静态引用 `?v=0.5.2`
 
 ## [0.5.1] - 2026-08-04

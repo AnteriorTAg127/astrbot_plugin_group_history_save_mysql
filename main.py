@@ -157,7 +157,7 @@ class GroupHistoryPlugin(Star):
 
         # 初始化数据分析服务（v0.5.0，须在 WebAPI 之前构造，以便注入服务实例；
         # 构造仅组装上游模块引用无 I/O，调度器在 MySQL 初始化成功后才 start）
-        self.stats_service = StatsService(context, self.mysql_mgr, self.config_mgr)
+        self.stats_service = StatsService(context, self.mysql_mgr, self.config_mgr, self)
 
         # 初始化 Web API（注入总结存储实例供总结历史端点使用，注入人物分析服务与存储实例）
         self.web_api = WebAPI(
