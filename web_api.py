@@ -1047,17 +1047,28 @@ class WebAPI:
         return json_response({"providers": providers})
 
     async def api_profile_groups(self):
-        """获取已保存的群列表，供前端「发起分析」下拉选群。
+        """获取「发起分析」群下拉列表（模式感知，v0.5.6 修复 all_mode 下无群可选）。
 
-        复用现有群白名单数据源 ``config_mgr.get_groups()``（与 api_get_groups
-        同源），返回群对象列表（含 group_id/enabled 等字段）。
+        返回 ``{"groups": [{"group_id", "enabled", "count"}], "all_mode": bool}``：
+        白名单 ∪ chat_history 有数据的群（去重、消息数降序），两种记录模式下
+        下拉框都能列出可分析的群。profile_service 未注入时回落白名单语义。
         """
-        try:
-            groups = await self.config_mgr.get_groups()
-        except Exception:
-            logger.error("[Profile] 获取群列表失败", exc_info=True)
-            return error_response("获取群列表失败", status_code=500)
-        return json_response({"groups": groups})
+        if self.profile_service is not None:
+            try:
+                groups = await self.profile_service.resolve_launch_groups()
+                all_mode = await self.profile_service.is_all_mode()
+            except Exception:
+                logger.error("[Profile] 获取群列表失败", exc_info=True)
+                return error_response("获取群列表失败", status_code=500)
+        else:
+            try:
+                groups = await self.config_mgr.get_groups()
+            except Exception:
+                logger.error("[Profile] 获取群列表失败", exc_info=True)
+                return error_response("获取群列表失败", status_code=500)
+            base = await self.config_mgr.get_all_settings()
+            all_mode = base.get("all_mode", "false") == "true"
+        return json_response({"groups": groups, "all_mode": all_mode})
 
     async def api_profile_analyze(self):
         """触发人物分析（跨群分析唯一入口）。

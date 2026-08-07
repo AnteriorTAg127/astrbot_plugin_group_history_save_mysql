@@ -490,6 +490,70 @@ class ProfileService:
         return True
 
     # ------------------------------------------------------------------
+    # Web 群下拉（模式感知，v0.5.6 修复 all_mode 下只能选「全局」）
+    # ------------------------------------------------------------------
+
+    async def is_all_mode(self) -> bool:
+        """读取全局记录模式开关（all_mode，口径同 stats 服务）。
+
+        Returns:
+            bool: 配置异常时按 False（白名单模式）处理，保守不扩大列表源。
+        """
+        try:
+            settings = await self._config_mgr.get_all_settings()
+            return settings.get("all_mode", "false") == "true"
+        except Exception as e:
+            logger.warning(f"[Profile] 读取 all_mode 失败（按白名单模式处理）: {e}")
+            return False
+
+    async def resolve_launch_groups(self) -> list[dict]:
+        """Web「发起分析」群下拉：白名单 ∪ 有数据的群（去重，消息数降序）。
+
+        白名单模式：白名单群 + 残留历史数据群；all_mode：即有数据的群
+        （白名单为空）。保证两种记录模式下下拉框都能列出可分析的群
+        （修复 all_mode 下只剩「全局」的问题，范式同
+        ``stats.service.resolve_dropdown_groups``）。
+
+        Returns:
+            list[dict]: [{"group_id": str, "enabled": bool, "count": int | None}]；
+            enabled 为白名单启用态（不在白名单记 True，all_mode 无白名单概念）；
+            count 为历史消息总数（仅白名单且无数据的群为 None）。
+        """
+        try:
+            whitelist = await self._config_mgr.get_groups()
+        except Exception as e:
+            logger.warning(f"[Profile] 读取白名单失败（下拉仅含有数据的群）: {e}")
+            whitelist = []
+        try:
+            data_groups = await self._fetcher.get_all_groups_summary()
+        except Exception as e:
+            logger.warning(f"[Profile] 查询有数据的群失败（下拉仅含白名单）: {e}")
+            data_groups = []
+        merged: dict[str, dict] = {}
+        for entry in whitelist or []:
+            gid = str(entry.get("group_id", "") or "").strip()
+            if gid:
+                merged[gid] = {
+                    "group_id": gid,
+                    "enabled": bool(entry.get("enabled")),
+                    "count": None,
+                }
+        for entry in data_groups or []:
+            gid = entry["group_id"]
+            if gid in merged:
+                merged[gid]["count"] = entry["count"]
+            else:
+                merged[gid] = {
+                    "group_id": gid,
+                    "enabled": True,
+                    "count": entry["count"],
+                }
+        return sorted(
+            merged.values(),
+            key=lambda item: (-(item["count"] or 0), item["group_id"]),
+        )
+
+    # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
 

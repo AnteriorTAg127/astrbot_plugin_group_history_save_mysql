@@ -8,6 +8,13 @@ import { bridge, showToast, el } from "./common.js";
 // weekday_dist 索引约定：Mon=0..Sun=6（与 Module E 统计锚定一致）
 const WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
+// 数字千分位（非法值归 0），与 data-analysis.js fmtInt 同口径
+function fmtInt(n) {
+    const v = Number(n);
+    if (!isFinite(v)) return "0";
+    return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
 // ========== ECharts 惰性加载（CDN 失败保留纯 CSS 柱图兜底） ==========
 let echartsPromise = null;
 function ensureECharts() {
@@ -49,7 +56,7 @@ function disposeCharts(root) {
     });
 }
 
-// ========== 范围下拉：全局 + /profile/groups 已保存群列表 ==========
+// ========== 范围下拉：全局 + /profile/groups 已保存群列表（模式感知，v0.5.6） ==========
 async function loadProfileGroups() {
     const select = document.getElementById("profileGroupSelect");
     try {
@@ -62,7 +69,12 @@ async function loadProfileGroups() {
         for (const g of groups) {
             const gid = String(g.group_id ?? "");
             if (!gid) continue;
-            const opt = el("option", null, `群 ${gid}${g.enabled ? "" : "（未启用记录）"}`);
+            const cntTxt = g.count != null ? `（${fmtInt(g.count)} 条）` : "";
+            const opt = el(
+                "option",
+                null,
+                `群 ${gid}${cntTxt}${g.enabled ? "" : "（未启用记录）"}`
+            );
             opt.value = gid;
             select.appendChild(opt);
         }

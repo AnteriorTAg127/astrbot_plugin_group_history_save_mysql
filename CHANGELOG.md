@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.5.6] - 2026-08-07
+
+修复 Web「人物分析 → 发起分析」群下拉在 all_mode 全局记录模式下只剩「全局」的问题
+（与 v0.5.1 修复数据分析群列表同因）：`GET /profile/groups` 此前仅以 group_config
+白名单为源，all_mode 下白名单为空 → 下拉无群可选。跟进 v0.5.1 模式感知范式——
+ProfileFetcher 新增 `get_all_groups_summary`（chat_history 分组清单，口径同 stats
+仓储）、ProfileService 新增 `is_all_mode`/`resolve_launch_groups`（白名单 ∪ 有数据的群，
+去重、消息数降序），端点返回 `{groups, all_mode}`；前端下拉按群展示历史消息数
+（同数据分析口径）。仅 Web 端修复，无 schema/依赖变更。
+
+### Fixed
+
+- **人物分析发起分析群下拉 all_mode 下无群可选**：`GET /profile/groups` 改为模式感知
+  ——白名单 ∪ chat_history 有数据的群（去重、消息数降序），两种记录模式下均能列出
+  可分析的群；前端下拉展示各群历史消息数（`群 xxx（N 条）`）
+- 版本升至 0.5.6，静态引用 `?v=0.5.6`
+
 ## [0.5.5] - 2026-08-05
 
 架构升级版本：落地 backlog「快照统计架构升级」——把 v0.5.0 的图片小时级快照泛化为
