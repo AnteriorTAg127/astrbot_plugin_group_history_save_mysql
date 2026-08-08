@@ -9,7 +9,7 @@ main.py 薄 handler 与 WebAPI 均经其 ``handle_command`` / ``run_analysis`` �
 急切执行，会使任何 ``import profile.models`` 的调用方（含各模块离线单测的轻量
 astrbot stub 环境）被迫加载全链而 ImportError。惰性导出保证：
 
-- 生产环境 ``from ...profile import ProfileService`` / ``profile.ProfileService``
+- 生产环境 ``from ..profile import ProfileService`` / ``profile.ProfileService``
   正常可用（首次访问时才加载 service 及其依赖）；
 - 仅导入 ``profile.models`` / ``profile.capture`` 等轻量子模块时不触发 service 链，
   与各模块单测的 stub 隔离范式（Agent-C 技巧）兼容，支持多测试文件合跑。

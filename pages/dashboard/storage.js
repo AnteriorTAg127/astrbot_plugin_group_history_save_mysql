@@ -107,6 +107,8 @@ async function loadSettings() {
     try {
         const settings = await bridge.apiGet("settings");
         document.getElementById("retentionDays").value = settings.image_retention_days || 3;
+        document.getElementById("backfillEnabled").checked = settings.backfill_enabled !== "false";
+        document.getElementById("backfillHours").value = settings.backfill_hours || 12;
     } catch { /* ignore */ }
 }
 
@@ -352,8 +354,14 @@ function bindStorageEvents() {
     document.getElementById("saveSettingsBtn").addEventListener("click", async () => {
         const days = parseInt(document.getElementById("retentionDays").value);
         if (isNaN(days) || days < 1) { showToast("请输入有效天数", "error"); return; }
+        const hours = parseInt(document.getElementById("backfillHours").value);
+        if (isNaN(hours) || hours < 1 || hours > 168) { showToast("补库时长需在 1–168 小时之间", "error"); return; }
         try {
-            await bridge.apiPost("settings/save", { image_retention_days: days });
+            await bridge.apiPost("settings/save", {
+                image_retention_days: days,
+                backfill_enabled: document.getElementById("backfillEnabled").checked,
+                backfill_hours: hours,
+            });
             showToast("设置已保存", "success");
         } catch (e) { showToast("保存失败: " + e.message, "error"); }
     });

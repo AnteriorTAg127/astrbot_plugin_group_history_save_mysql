@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.5.6">
+    <link rel="stylesheet" href="./style.css?v=0.6.0">
 </head>
 <body>
     <div class="app">
@@ -505,6 +505,33 @@
                             <span class="unit">天</span>
                         </div>
                     </div>
+                    <div class="summary-group">
+                        <div class="summary-group-title">🔄 重载自动补库（v0.6.0）</div>
+                        <div class="settings-form">
+                            <div class="setting-item">
+                                <div class="setting-info">
+                                    <div class="setting-name">启用自动补库</div>
+                                    <div class="setting-desc">插件重载、MySQL 就绪后自动从 OneBot 拉取历史消息补齐窗口缺口（修改后重启生效）</div>
+                                </div>
+                                <div class="setting-control">
+                                    <label class="all-mode-switch">
+                                        <input type="checkbox" id="backfillEnabled" checked>
+                                        <span class="switch-track"><span class="switch-thumb"></span></span>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="setting-item">
+                                <div class="setting-info">
+                                    <div class="setting-name">补库时长</div>
+                                    <div class="setting-desc">拉取最近 N 小时的历史消息（1–168，建议与协议端缓存一致）</div>
+                                </div>
+                                <div class="setting-control">
+                                    <input type="number" id="backfillHours" min="1" max="168" value="12" class="input input-sm">
+                                    <span class="unit">小时</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     <div class="setting-actions">
                         <button id="saveSettingsBtn" class="btn btn-primary">保存设置</button>
                     </div>
@@ -770,9 +797,9 @@
     <!-- marked 锁定主版本 @15（对齐 echarts@5 写法；v16 起包内不再提供根目录 marked.min.js） -->
     <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="./app.js?v=0.5.6"></script>
+    <script type="module" src="./app.js?v=0.6.0"></script>
     <!-- v0.5.0 数据分析 tab 模块（type=module 默认 defer，加载顺序与既有脚本一致；
          实际接线由 app.js import 驱动，重复引用按 ES Module 同 URL 去重、仅执行一次） -->
-    <script type="module" src="./data-analysis.js?v=0.5.6"></script>
+    <script type="module" src="./data-analysis.js?v=0.6.0"></script>
 </body>
 </html>

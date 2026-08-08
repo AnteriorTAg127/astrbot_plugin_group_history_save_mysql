@@ -10,7 +10,7 @@ astrbot.api），若在子包 ``__init__`` 顶层急切执行，会使任何仅�
 （如后续模块 C 的 models / parser）的调用方（含各模块离线单测的轻量 astrbot stub
 环境）被迫加载整条依赖链而 ImportError。惰性导出保证：
 
-- 生产环境 ``from ...stats import StatsRepository`` / ``stats.StatsRepository``
+- 生产环境 ``from ..stats import StatsRepository`` / ``stats.StatsRepository``
   正常可用（首次访问时才加载 repository 及其依赖）；
 - 仅导入 ``stats.models`` / ``stats.parser`` 等轻量子模块时不触发 repository 链，
   与各模块单测的 stub 隔离范式兼容，支持多测试文件合跑。

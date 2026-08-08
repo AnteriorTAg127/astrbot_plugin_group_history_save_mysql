@@ -1,6 +1,6 @@
 # astrbot_plugin_group_history_save_mysql
 
-将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）。
+将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构。
 
 ## 功能
 
@@ -29,6 +29,8 @@
 - 📬 定时推送（v0.5.0 新增）：日报（默认每天 21:00）与可选周报（默认关，默认周一 09:00），全局开关 + 群级开关 + 推送时间全部在 Web「数据分析」tab 管理，T2I 图片报告卡主动推送到群
 - 🕐 图片小时级快照（v0.5.0 新增）：每小时增量聚合图片数（群级全量 + 每小时每群个人 Top K），解决图片表滚动清理后无法回溯统计的问题，「今日」数据在每次统计前强制刷新
 - 🧱 分段快照统计（v0.5.5 新增）：图片小时级快照泛化为「消息 + 图片 × 小时/日/月」三段式预计算快照体系，数据分析群级统计（总消息数/每日趋势/群排行）直接读快照，快照不可服务或异常自动整体回退实时 SQL；启动自动回填历史快照（兼顾宕机缺档补偿），强制刷新 60 秒限流
+- 🔄 重载自动补库（v0.6.0 新增）：插件加载/重载、MySQL 初始化成功后，后台自动从 OneBot 协议端拉取白名单启用群近 `backfill_hours` 小时的历史消息（文本 + 图片 URL）补库，按 `message_id` 与图片 URL 双重去重，弥补重载窗口期间的消息缺口
+- 🧩 模块化重构（v0.6.0）：全部代码迁入 `core/` 子包——`core/db_mysql`（连接池 + 数据库访问拆分）、`core/db_config`（本地配置管理拆分）、`core/webapi`（Web API 按子功能拆分）、`core/{summary,profile,stats}`（三大功能包）、`core/{parsing,saver,cleaner}`（保存逻辑）；`main.py` 仅保留框架交互（指令注册与事件委托）
 
 ## 安装
 
@@ -137,7 +139,7 @@ SHOW TABLES;
 
 - **状态监控**：数据库连接状态、今日/总计消息量
 - **群管理**：添加/删除群、开关控制、ALL 模式
-- **设置**：图片保留天数配置
+- **设置**：图片保留天数配置；重载自动补库开关与时长（v0.6.0 新增）
 - **统计**：最近 7 天每日存储量（v0.5.5 起改由快照供数，图片表滚动清理不再影响趋势）
 - **查询**：按关键词（内容/昵称）、群号、QQ号、时间组合查询聊天记录
 - **数据维护**：手动清理过期图片；一键清空所有数据（需通过随机加减法验证，题目由后端生成、一次性有效）
@@ -241,6 +243,31 @@ SHOW TABLES;
 > 全局开关与群级开关同时开启的群才会收到日报/周报。
 > 报告卡图片渲染复用总结功能的 `summary_t2i_*` 共享配置（主题 auto/light/dark、时段、超时、CDN 节点顺序），不新增 stats 专用渲染键。
 
+## 重载自动补库配置说明（v0.6.0 新增）
+
+> 两项配置存于 config.db `plugin_settings` 表（key/value 形式），随插件初始化自动播种默认值；
+> 在 Web 管理后台「设置」页（🔄 重载自动补库分组）可修改；补库任务在启动/重载时读取，
+> 修改后**重启插件**生效。
+
+| 配置键 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| backfill_enabled | bool（字符串） | true | 重载自动补库总开关：`true` 开启，其他值跳过 |
+| backfill_hours | int | 12 | 补库时间窗口（小时），夹取 [1,168]（1 小时 ~ 7 天），非法值回退 12 |
+
+### 补库工作原理（v0.6.0 新增）
+
+1. **触发时机**：插件加载/重载、MySQL 初始化成功后，后台自动发起（不阻塞插件启动，失败仅记日志）
+2. **范围**：白名单模式取 group_config 白名单中 `enabled=1` 的群；all_mode 全局记录模式白名单无意义，
+   改以 `chat_history` 有数据的群为清单（补库只补缺口，无数据的群拉协议端也是空），逐群串行处理
+3. **拉取**：经 aiocqhttp 协议端 `get_group_msg_history` 按 `message_seq` 多轮翻页（单群上限 1000 条、单轮 1000 条、轮间 0.3s、超时 15s；首轮失败整群跳过，后续轮失败用已拉到的部分）
+4. **窗口过滤**：仅保留 `timestamp >= now - backfill_hours` 的消息
+5. **去重入库**：按 `message_id` 批量比对 `chat_history` 已存在记录（跳过）；图片 URL 按 `(group_id, image_url)` 比对 `image_records` 已存在记录（跳过），同一批内重复 URL 也只入一次
+6. **入库**：文本消息写入 `chat_history`（message_type 按有无图片 text/mixed，at_list/reply_id/真实时间戳透传），图片 URL 逐条写入 `image_records`；单条失败记 error 不中断整群
+7. **汇总日志**：每群完成与全部完成均输出 `[HistorySave] 重载自动补库` 汇总（拉取/新增文本/新增图片/跳过计数），可据日志核对补库情况
+
+> 协议端只能拉取其缓存范围内的近期消息，补库窗口建议与协议端缓存一致（默认 12 小时）；
+> 连续重载时重复消息由 `message_id` 去重自动跳过，不会重复入库。
+
 ## 总结工作原理（v0.3 新增）
 
 ### 混合数据源
@@ -276,19 +303,59 @@ SHOW TABLES;
 
 ### 代码结构
 
-新功能代码全部位于 `summary/` 子包，指令在 `main.py` 注册并薄封装异步委托子包处理函数；无新增 pip 依赖。
+新功能代码全部位于 `core/` 子包，指令在 `main.py` 注册并薄封装异步委托子包处理函数；无新增 pip 依赖。
+
+**v0.6.0 模块化结构**：`main.py` 只保留与框架的交互（指令注册、事件委托、初始化/退出），
+数据库访问、配置管理、Web API 与保存逻辑全部按子功能拆分到 `core/` 下独立文件：
+
+```
+main.py                          # 入口：仅框架交互（@register、指令 handler、事件委托）
+core/
+├── db_mysql/                    # MySQL 操作包（主文件只负责连接池管理与最终访问）
+│   ├── pool.py                  #   DynamicPool 连接池管理
+│   ├── base.py                  #   MySQLManagerBase 核心初始化/执行/迁移
+│   ├── chat_history.py          #   消息表读写 + message_id 批量查重
+│   ├── images.py                #   图片表读写 + 图片 URL 批量查重
+│   ├── stats.py                 #   统计聚合查询
+│   └── maintenance.py           #   清空数据维护
+├── db_config/                   # 本地配置包（SQLite config.db）
+│   ├── base.py                  #   ConfigManagerBase 建表/默认值/读写
+│   ├── groups.py                #   群白名单管理
+│   ├── summary_settings.py      #   总结配置
+│   ├── profile_settings.py      #   人物分析配置
+│   ├── stats_settings.py        #   数据分析配置
+│   └── snapshots.py             #   快照表读写
+├── webapi/                      # Web API 包（每个子功能一个文件）
+│   ├── base.py                  #   WebAPIBase 路由表注册 + 公共 helper
+│   ├── storage.py               #   状态/群管理/设置/清空
+│   ├── query.py                 #   消息查询
+│   ├── summary.py               #   总结设置/忽略/历史
+│   ├── profile.py               #   人物分析设置/发起/历史
+│   └── stats.py                 #   数据分析数据/设置/推送
+├── summary/                     # 总结功能（service/fetcher/onebot/summarizer/formatter/t2i_render/storage/scheduler/templates）
+├── profile/                     # 人物分析（service/fetcher/stats/analyzer/formatter/t2i_render/storage/scheduler/templates）
+├── stats/                       # 数据分析（repository/models/parser/service/snapshot/scheduler/t2i_render/templates）
+├── parsing.py                   # 消息解析纯函数（extract_image_urls / parse_onebot_raw_message / stats_fallback_text）
+├── saver.py                     # MessageSaver 消息缓冲/落库逻辑（原 main.py 内逻辑迁出）
+├── cleaner.py                   # ImageCleaner 图片过期清理
+└── backfill.py                  # ReloadBackfill 重载自动补库（v0.6.0 新增）
+```
+
+> 组装范式：各包以「主文件 base + 子功能 Mixin」多继承组装出单一公开类名
+> （`MySQLManager` / `ConfigManager` / `WebAPI`），对外调用零改动；类常量（如
+> `ConfigManager.SUMMARY_TYPES`）经 MRO 解析，业务模块可直接引用。
 
 | 模块 | 职责 |
 |------|------|
-| summary/service.py | 编排层：指令入口、白名单/限流校验、流程串联 |
-| summary/fetcher.py | 数据获取：混合策略（MySQL 优先 + OneBot 补齐 + 去重合并） |
-| summary/onebot.py | 协议端 `get_group_msg_history` 封装与消息段解析 |
-| summary/summarizer.py | 总结引擎：统计计算 + LLM 调用 + 提示词占位符渲染 |
-| summary/formatter.py | 输出格式化：合并转发节点（剥离 Markdown）/ 文转图（含 GFM 表格兜底转换） |
-| summary/t2i_render.py | 自研图片渲染核心：模板加载、日夜主题判定、多路 CDN/超时配置解析、两轮渲染 + 魔数校验 |
-| summary/templates/ | 自研 T2I 报告模板（HTML + 内联 CSS/JS，双主题 + CDN 容灾加载器） |
-| summary/storage.py | 总结 JSON 持久化（按群分目录、列表、读取、过期清理） |
-| summary/scheduler.py | 定时清理任务（每天清理过期 JSON） |
+| core/summary/service.py | 编排层：指令入口、白名单/限流校验、流程串联 |
+| core/summary/fetcher.py | 数据获取：混合策略（MySQL 优先 + OneBot 补齐 + 去重合并） |
+| core/summary/onebot.py | 协议端 `get_group_msg_history` 封装与消息段解析（补库复用其翻页范式） |
+| core/summary/summarizer.py | 总结引擎：统计计算 + LLM 调用 + 提示词占位符渲染 |
+| core/summary/formatter.py | 输出格式化：合并转发节点（剥离 Markdown）/ 文转图（含 GFM 表格兜底转换） |
+| core/summary/t2i_render.py | 自研图片渲染核心：模板加载、日夜主题判定、多路 CDN/超时配置解析、两轮渲染 + 魔数校验 |
+| core/summary/templates/ | 自研 T2I 报告模板（HTML + 内联 CSS/JS，双主题 + CDN 容灾加载器） |
+| core/summary/storage.py | 总结 JSON 持久化（按群分目录、列表、读取、过期清理） |
+| core/summary/scheduler.py | 定时清理任务（每天清理过期 JSON） |
 
 ### 人物分析模块（v0.4.0 新增）
 

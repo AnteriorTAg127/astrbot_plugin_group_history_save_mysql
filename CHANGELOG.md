@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.6.0] - 2026-08-08
+
+重构 + 新功能版本：全部代码迁入 `core/` 子包（数据库访问、配置管理、Web API 按子功能
+拆分到独立文件，`main.py` 瘦身为纯框架交互），并新增「插件重载后自动从 OneBot 拉取
+历史消息补库」功能，弥补重载窗口与协议端缓存期间的消息缺口。**无行为变化**：重构只
+物理搬代码，方法签名/返回值/日志逐字保留；补库为唯一新增行为。MySQL 零 schema 变更。
+
+### Added
+
+- **重载自动补库（新功能）**：插件加载/重载、MySQL 初始化成功后，后台自动经
+  OneBot 协议端 `get_group_msg_history` 拉取历史消息补库（文本 + 图片 URL）——
+  **all_mode 感知**（跟进 v0.5.1/v0.5.6 群列表修复范式）：白名单模式取白名单
+  enabled 群；all_mode 全群模式改以 `chat_history` 有数据的群为清单（新增
+  `db_mysql.get_all_group_ids`，白名单空也补库，清单查询失败降级跳过）——
+  按 `message_seq` 多轮翻页（单群上限 1000 条、轮间 0.3s、超时 15s，首轮失败
+  整群跳过、后续轮失败用已拉到的部分）、窗口过滤、按 `message_id` 与图片 URL
+  双重去重、文本/图片分别入库（真实时间戳透传、单条失败不中断），完成输出
+  汇总日志（拉取/新增文本/新增图片/跳过计数）
+- **补库配置**：config.db `plugin_settings` 表新增 `backfill_enabled`（默认
+  `true`）/ `backfill_hours`（默认 `12`，夹取 [1,168]）两项，初始化自动播种；
+  Web 管理后台「设置」页新增「🔄 重载自动补库」分组可改（保存接口新增
+  `backfill_enabled` / `backfill_hours` 校验与写入，非法值拒绝）；补库任务
+  启动/重载时读取，修改后重启生效
+- **`MessageSaver` 生命周期接口**：`is_initialized` 只读属性（供后台初始化循环
+  轮询，替代旧的自持标志位）
+
+### Changed
+
+- **全模块独立化重构**：`db_mysql.py` / `db_config.py` / `web_api.py` /
+  `cleaner.py` 分别拆分为 `core/db_mysql/`（pool + base + chat_history + images +
+  stats + maintenance 六文件）、`core/db_config/`（base + groups + 三功能配置 +
+  snapshots 七文件）、`core/webapi/`（base + 五功能文件七文件）、`core/cleaner.py`；
+  `summary/` / `profile/` / `stats/` 移入 `core/`；`main.py` 瘦身为纯框架交互
+  （指令注册、事件委托、初始化/退出），消息解析/缓冲/落库逻辑迁入
+  `core/parsing.py` + `core/saver.py`；各包以「base + Mixin」组装单一公开类名
+  （`MySQLManager` / `ConfigManager` / `WebAPI`），类常量经 MRO 访问，对外零改动
+- **消息入库路径收拢**：`on_group_message` 改为薄委托 `MessageSaver.handle_group_message`，
+  缓冲/落库/重试放弃逻辑自 main.py 迁入 `core/saver.py`（行为不变）
+- **`insert_image_record` 支持透传时间戳**：新增可选 `timestamp` 参数
+  （默认 None = 当前时间，保持原行为），补库时写入消息真实时间
+- **`db_mysql` 新增批量查重接口**：`get_existing_message_ids`（按群批量查已存在的
+  message_id，IN 分块 ≤500）、`get_existing_image_urls`（按群批量查已存在的图片
+  URL）与 `get_all_group_ids`（chat_history 有数据的群清单，all_mode 补库枚举用），
+  供补库使用；`core/parsing.py` 新增 `parse_onebot_raw_message`（OneBot
+  原始消息 → 结构化 dict，无文本无图片返 None，异常记 debug 不抛）
+- 版本升至 0.6.0，`@register` 与 metadata.yaml 同步
+
+### Notes
+
+- 重构为纯物理搬移，**对外行为零变化**（指令、Web API、配置、数据表结构全部不变）；
+  存量数据与配置完全向后兼容
+- 回归保障：v0.6.0 新增 31 例测试（重构回归 6 例 + 补库功能 8 组含 all_mode 3 例）+
+  全版本离线测试各目录单独运行全绿（v0.2 19 + v0.3 119 + v0.3.1 24 + v0.3.2 52 +
+  v0.4.0 304 + v0.5.0 23 + v0.5.5 20 + v0.6.0 31）；多目录合跑失败为历史遗留的
+  测试 stub 注入顺序冲突（不含 v0.6.0 的对照组同样失败 23 例），非本版引入
+
 ## [0.5.6] - 2026-08-07
 
 修复 Web「人物分析 → 发起分析」群下拉在 all_mode 全局记录模式下只剩「全局」的问题

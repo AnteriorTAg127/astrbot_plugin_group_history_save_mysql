@@ -1,119 +1,41 @@
 """群聊记录存储插件主入口。
 
 监听 QQ 群消息，将文本和图片分别存入 MySQL，提供管理指令和 Web 管理后台。
+v0.6.0 起本文件仅保留框架交互（指令注册 / 事件监听 / 生命周期），
+消息保存逻辑（解析/缓冲/落库/补录）全部委托给 core.saver.MessageSaver。
 """
 
 import asyncio
-import time
-from collections import deque
-from datetime import datetime
 
-import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
-from .cleaner import ImageCleaner
-from .db_config import ConfigManager
-from .db_mysql import MySQLManager
-from .profile.capture import extract_at_targets, extract_reply_id
-from .profile.service import ProfileService
-from .stats import StatsBuildError, StatsService
-from .stats.models import StatsQuery
-from .stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args
-from .summary import SummaryService
-from .web_api import WebAPI
+from .core.backfill import ReloadBackfill
+from .core.cleaner import ImageCleaner
+from .core.db_config import ConfigManager
+from .core.db_mysql import MySQLManager
+from .core.parsing import stats_fallback_text
+from .core.profile.capture import extract_at_targets
+from .core.profile.service import ProfileService
+from .core.saver import MessageSaver
+from .core.stats import StatsBuildError, StatsService
+from .core.stats.models import StatsQuery
+from .core.stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args
+from .core.summary import SummaryService
+from .core.webapi import WebAPI
 
 # 后台 MySQL 初始化的最大连续失败次数：超过后放弃重试并停用存储功能，
 # 避免数据库长期不可用时无限刷日志。恢复方式：修正配置后在插件管理重启插件。
 MAX_INIT_ATTEMPTS = 5
 
 
-def extract_image_urls(message_obj, message_chain) -> list[str]:
-    """提取图片的原始 http(s) 链接。
-
-    优先从 OneBot 原始事件(message_obj.raw_message)的图片消息段提取 QQ 下发的
-    原始链接;raw_message 不可用或提取不到时,回退到遍历消息链中的 Image 组件。
-    本地文件路径一律不返回(新版 AstrBot 预处理会把组件 url 改写为本地临时路径)。
-
-    Args:
-        message_obj: event.message_obj(AstrBotMessage,其 raw_message 为 OneBot 原始事件)
-        message_chain: event.get_messages() 返回的消息组件列表
-
-    Returns:
-        list[str]: 以 http 开头的图片链接列表
-    """
-    urls: list[str] = []
-
-    # 优先从 OneBot 原始事件的消息段数组提取(QQ 下发的原始链接)
-    raw = getattr(message_obj, "raw_message", None)
-    segments = raw.get("message") if isinstance(raw, dict) else None
-    if isinstance(segments, list):
-        for seg in segments:
-            try:
-                if not isinstance(seg, dict) or seg.get("type") != "image":
-                    continue
-                data = seg.get("data") or {}
-                if not isinstance(data, dict):
-                    continue
-                # 优先取 data.url;部分实现(如 Lagrange)把链接放在 data.file
-                url = data.get("url")
-                if isinstance(url, str) and url.startswith(("http://", "https://")):
-                    urls.append(url)
-                    continue
-                file = data.get("file")
-                if isinstance(file, str) and file.startswith(("http://", "https://")):
-                    urls.append(file)
-            except Exception as e:
-                logger.debug(f"[HistorySave] 解析图片消息段失败: {e}")
-                continue
-
-    if urls:
-        return urls
-
-    # 回退:遍历消息链中的 Image 组件(本地临时路径一律不收集)
-    try:
-        for component in message_chain or []:
-            if not isinstance(component, Comp.Image):
-                continue
-            value = component.url or component.file
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                urls.append(value)
-    except Exception as e:
-        logger.debug(f"[HistorySave] 遍历消息链提取图片链接失败: {e}")
-
-    return urls
-
-
-def stats_fallback_text(data, label: str) -> str:
-    """T2I 渲染失败时的降级纯文本摘要（单行）。
-
-    内容：时间范围 label + 总消息数 + 活跃成员数 + Top3 发言人（「昵称: N条」，
-    昵称缺失时回退 QQ 号）。供 ``/群统计`` 指令渲染失败兜底使用。
-
-    Args:
-        data: ``StatsData``（或其鸭子同构对象），需含 total_messages /
-            active_senders / sender_ranking（取前三条）。
-        label: 时间范围展示文案（如「今日」/「近7天」）。
-    """
-    tops = []
-    for item in (getattr(data, "sender_ranking", None) or [])[:3]:
-        name = getattr(item, "sender_name", "") or getattr(item, "sender_id", "")
-        tops.append(f"{name}: {getattr(item, 'count', 0)}条")
-    top_text = "、".join(tops) if tops else "暂无发言数据"
-    return (
-        f"【{label}】总消息数：{getattr(data, 'total_messages', 0)}，"
-        f"活跃成员：{getattr(data, 'active_senders', 0)}，"
-        f"Top3 发言人：{top_text}"
-    )
-
-
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
-    "0.5.6",
+    "0.6.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -175,13 +97,12 @@ class GroupHistoryPlugin(Star):
             stats_service=self.stats_service,
         )
 
-        self._initialized = False
+        # v0.6.0 消息保存逻辑委托（解析/缓冲/落库/补录全部在 core.saver）
+        self.saver = MessageSaver(self.mysql_mgr, self.config_mgr, self.stats_service)
+        # v0.6.0 重载自动补库服务（MySQL 初始化成功后从 OneBot 拉取历史补齐窗口缺口）
+        self.backfill = ReloadBackfill(context, self.mysql_mgr, self.config_mgr)
+
         self._init_task: asyncio.Task | None = None
-        # 重试耗尽后置 True：消息直接丢弃（不再缓冲），停止一切存储活动
-        self._db_gave_up = False
-        # MySQL 后台初始化窗口内的消息缓冲（FIFO，溢出自动丢弃最旧记录）
-        self._pending_records: deque[dict] = deque(maxlen=2000)
-        self._last_drop_warn = 0.0  # 缓冲区溢出告警节流时间戳（monotonic 秒）
 
     async def initialize(self):
         """异步初始化：连接数据库、启动定时任务。
@@ -209,16 +130,16 @@ class GroupHistoryPlugin(Star):
         # 本任务为后台任务，放长超时不阻塞框架启动（F8）
         init_timeout = 120
         attempt = 0
-        while not self._initialized:
+        while not self.saver.is_initialized:
             attempt += 1
             try:
                 mysql_ok = await asyncio.wait_for(
                     self.mysql_mgr.initialize(), timeout=init_timeout
                 )
                 if mysql_ok:
-                    self._initialized = True
+                    self.saver.set_initialized()
                     # 先补录初始化窗口内缓冲的消息，再启动定时清理
-                    await self._flush_pending_records()
+                    await self.saver.flush_pending()
                     await self.cleaner.start()
                     # 启动总结清理调度器（失败仅记日志，不阻断插件启动）
                     try:
@@ -242,6 +163,11 @@ class GroupHistoryPlugin(Star):
                         await self.stats_service.startup_backfill()
                     except Exception as e:
                         logger.error(f"[HistorySave] 快照启动回填发起失败: {e}")
+                    # v0.6.0 重载自动补库：MySQL 就绪后后台拉取历史补齐（失败仅记日志）
+                    try:
+                        await self.backfill.start()
+                    except Exception as e:
+                        logger.error(f"[HistorySave] 重载自动补库启动失败: {e}")
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )
@@ -265,16 +191,14 @@ class GroupHistoryPlugin(Star):
                 )
             # 重试耗尽：放弃并停用存储功能（关闭连接池使后续操作快速失败）
             if attempt >= MAX_INIT_ATTEMPTS:
-                self._db_gave_up = True
                 # 明确记录被丢弃的缓冲消息条数，避免静默丢失无迹可查（F6）
-                dropped = len(self._pending_records)
+                dropped = self.saver.mark_gave_up()
                 logger.error(
                     f"[HistorySave] MySQL 连续 {attempt} 次连接失败，停止重试，"
                     f"消息存储功能已停用，同时丢弃启动窗口缓冲消息 {dropped} 条。"
                     f"请检查数据库配置与连通性，"
                     f"然后在插件管理中重启本插件以恢复。"
                 )
-                self._pending_records.clear()
                 try:
                     await self.mysql_mgr.close()
                 except Exception:
@@ -289,249 +213,11 @@ class GroupHistoryPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_group_message(self, event: AstrMessageEvent):
-        """监听群消息并保存到 MySQL。
-
-        MySQL 后台初始化窗口内（首次启动/重连）消息先缓冲，
-        初始化成功后统一补录，避免该窗口内的消息丢失。
-        重试耗尽（_db_gave_up）后直接丢弃，不再做任何存储动作。
-        """
-        if self._db_gave_up:
-            return
+        """监听群消息并保存到 MySQL（委托给 core.saver.MessageSaver）。"""
         try:
-            # 记录消息到达时刻：实时入库与缓冲补录共用，
-            # 保证补录消息的时间戳为真实到达时刻而非补录时刻（F11）
-            arrived_at = datetime.now()
-            group_id = str(event.get_group_id())
-            sender_id = str(event.get_sender_id())
-            sender_name = event.get_sender_name()
-            message_id = event.message_obj.message_id or ""
-
-            # 检查群是否在白名单中（本地白名单以整数群号匹配）
-            try:
-                group_id_int = int(group_id)
-            except (ValueError, TypeError):
-                return
-            if not await self.config_mgr.is_group_enabled(group_id_int):
-                return
-
-            # v0.5.0 数据分析：白名单群的消息经过即登记 群→umo 推送目标缓存
-            # （定时日报/周报经 context.send_message(umo) 主动推送；服务未创建时跳过）
-            if self.stats_service is not None:
-                self.stats_service.record_group_umo(group_id, event.unified_msg_origin)
-
-            # 解析消息链
-            message_chain = event.get_messages()
-            text_parts = []
-            image_count = 0
-
-            for component in message_chain:
-                if isinstance(component, Comp.Plain):
-                    text = component.text.strip()
-                    if text:
-                        text_parts.append(text)
-                elif isinstance(component, Comp.Image):
-                    image_count += 1
-
-            # 提取图片原始链接（优先 OneBot 原始事件中的图片消息段）
-            image_urls = extract_image_urls(event.message_obj, message_chain)
-            if image_count > 0 and not image_urls:
-                logger.warning("[HistorySave] 图片消息未能提取到原始链接,已跳过入库")
-
-            # 提取 @ 对象与回复目标（v0.4 人物分析关系数据基础；防御式纯函数，失败为空不阻断）
-            at_targets = extract_at_targets(message_chain)
-            at_list_str = ",".join(at_targets)
-            reply_id = extract_reply_id(event)
-
-            if not text_parts and not image_urls:
-                return
-
-            if not self._initialized:
-                # MySQL 尚在后台初始化：缓冲待补录，避免启动窗口丢消息
-                self._buffer_message(
-                    group_id,
-                    sender_id,
-                    sender_name,
-                    text_parts,
-                    image_urls,
-                    message_id,
-                    at_list=at_list_str,
-                    reply_id=reply_id,
-                    timestamp=arrived_at,
-                )
-                return
-
-            await self._persist_message(
-                group_id,
-                sender_id,
-                sender_name,
-                text_parts,
-                image_urls,
-                message_id,
-                at_list=at_list_str,
-                reply_id=reply_id,
-                timestamp=arrived_at,
-            )
-
+            await self.saver.handle_group_message(event)
         except Exception as e:
             logger.error(f"[HistorySave] 处理群消息时出错: {e}", exc_info=True)
-
-    def _buffer_message(
-        self,
-        group_id: str,
-        sender_id: str,
-        sender_name: str,
-        text_parts: list[str],
-        image_urls: list[str],
-        message_id: str,
-        at_list: str = "",
-        reply_id: str = "",
-        timestamp: datetime | None = None,
-    ):
-        """MySQL 初始化窗口内缓冲消息，待初始化成功后补录。
-
-        缓冲区为固定容量 deque（maxlen=2000），溢出时自动丢弃最旧记录；
-        丢弃告警每 60 秒最多输出一次，避免刷屏。
-
-        Args:
-            timestamp: 消息到达时刻；None 时取当前时间。补录时透传给
-                insert_chat_message，保证补录消息使用真实到达时间（F11）
-        """
-        if len(self._pending_records) == self._pending_records.maxlen:
-            now = time.monotonic()
-            if now - self._last_drop_warn >= 60:
-                self._last_drop_warn = now
-                logger.warning("[HistorySave] 消息缓冲区已满，最旧的缓冲消息将被丢弃")
-        self._pending_records.append(
-            {
-                "group_id": group_id,
-                "sender_id": sender_id,
-                "sender_name": sender_name,
-                "text_parts": text_parts,
-                "image_urls": image_urls,
-                "message_id": message_id,
-                "at_list": at_list,
-                "reply_id": reply_id,
-                # 记录消息到达时刻，补录时透传入库（F11）
-                "timestamp": timestamp or datetime.now(),
-            }
-        )
-
-    async def _persist_message(
-        self,
-        group_id: str,
-        sender_id: str,
-        sender_name: str,
-        text_parts: list[str],
-        image_urls: list[str],
-        message_id: str,
-        at_list: str = "",
-        reply_id: str = "",
-        timestamp: datetime | None = None,
-        rebuffer_on_fail: bool = True,
-    ) -> bool:
-        """将一条已解析的消息写入 MySQL（文本记录 + 图片记录）。
-
-        Args:
-            timestamp: 消息到达时刻；None 时由 insert_chat_message 回退为当前时间。
-                补录路径透传缓冲时记录的到达时刻，保证时间窗统计正确（F11）
-            rebuffer_on_fail: 写入失败时是否将失败部分退回 _pending_records 等待
-                下次补录。实时路径为 True；补录路径必须传 False，避免失败记录
-                反复入缓冲形成自引用循环（F5）
-
-        Returns:
-            bool: 文本与图片是否全部写入成功
-        """
-        all_ok = True
-
-        # 保存文本消息
-        text_ok = True
-        if text_parts:
-            content = "\n".join(text_parts)
-            msg_type = "mixed" if image_urls else "text"
-            text_ok = await self.mysql_mgr.insert_chat_message(
-                group_id=group_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                message_type=msg_type,
-                content=content,
-                message_id=message_id,
-                at_list=at_list,
-                reply_id=reply_id,
-                timestamp=timestamp,
-            )
-            if not text_ok:
-                all_ok = False
-
-        # 保存图片记录（收集失败链接，便于只退回失败部分）
-        failed_urls: list[str] = []
-        for url in image_urls:
-            img_ok = await self.mysql_mgr.insert_image_record(
-                group_id=group_id,
-                sender_id=sender_id,
-                image_url=url,
-                sender_name=sender_name,
-            )
-            if img_ok:
-                continue
-            all_ok = False
-            failed_urls.append(url)
-
-        # 写入失败兜底（F5）：仅实时路径把失败部分退回缓冲等待下次补录，
-        # 不再静默丢失。只退回失败部分（文本失败 → 保留文本；图片失败 →
-        # 仅保留失败链接），补录重放时不会重复写入已成功的部分。
-        # 补录路径（rebuffer_on_fail=False）失败仅记日志后丢弃，由下方
-        # 各 insert 的 ERROR 日志与 _flush_pending_records 的计数体现。
-        if not all_ok and rebuffer_on_fail:
-            logger.warning(
-                f"[HistorySave] 消息写入 MySQL 失败，已退回缓冲区等待补录"
-                f"（群 {group_id}，消息 {message_id or '无ID'}）"
-            )
-            self._buffer_message(
-                group_id,
-                sender_id,
-                sender_name,
-                text_parts if not text_ok else [],
-                failed_urls,
-                message_id,
-                at_list=at_list if not text_ok else "",
-                reply_id=reply_id if not text_ok else "",
-                timestamp=timestamp,
-            )
-
-        return all_ok
-
-    async def _flush_pending_records(self):
-        """将初始化窗口内缓冲的消息补录到 MySQL。
-
-        单条失败仅记日志并继续，避免一条坏数据阻塞整批补录。
-        补录失败不再退回缓冲（避免自引用循环）：_persist_message 以
-        rebuffer_on_fail=False 调用，失败记录记日志后丢弃。
-        """
-        if not self._pending_records:
-            return
-        pending = list(self._pending_records)
-        self._pending_records.clear()
-        ok = 0
-        for record in pending:
-            try:
-                flushed = await self._persist_message(
-                    record["group_id"],
-                    record["sender_id"],
-                    record["sender_name"],
-                    record["text_parts"],
-                    record["image_urls"],
-                    record["message_id"],
-                    at_list=record.get("at_list", ""),
-                    reply_id=record.get("reply_id", ""),
-                    # 透传缓冲时记录的到达时刻；旧格式记录无该字段时回退 None
-                    timestamp=record.get("timestamp"),
-                    rebuffer_on_fail=False,
-                )
-                if flushed:
-                    ok += 1
-            except Exception as e:
-                logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
-        logger.info(f"[HistorySave] 启动窗口缓冲消息补录完成: {ok}/{len(pending)} 条")
 
     @filter.command("history_start")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -768,6 +454,11 @@ class GroupHistoryPlugin(Star):
                 await self._init_task
             except asyncio.CancelledError:
                 pass
+        # v0.6.0 停止重载自动补库任务（吞 CancelledError 不阻塞后续清理）
+        try:
+            await self.backfill.stop()
+        except asyncio.CancelledError:
+            pass
         # 停止数据分析调度器（LIFO：最后启动的最先停止；吞 CancelledError 不阻塞后续清理）
         try:
             await self.stats_service.stop()

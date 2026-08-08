@@ -59,7 +59,6 @@ from typing import TYPE_CHECKING
 from astrbot.api import logger
 
 from ..db_mysql import QUERY_TIMEOUT_SECONDS
-
 from .models import (
     ProfileFetchOutcome,
     ProfileMessage,
@@ -422,9 +421,7 @@ class ProfileFetcher:
         )
         async with self._mysql_mgr.pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await asyncio.wait_for(
-                    cur.execute(sql), timeout=QUERY_TIMEOUT_SECONDS
-                )
+                await asyncio.wait_for(cur.execute(sql), timeout=QUERY_TIMEOUT_SECONDS)
                 rows = await cur.fetchall()
         return [
             {
