@@ -66,6 +66,21 @@ def _raw_text_content(raw: dict) -> str:
     return "\n".join(parts)
 
 
+def _raw_has_content(raw: dict) -> bool:
+    """判断 OneBot 原始消息是否含 text/image 段。
+
+    用于区分「正常无内容消息」（视频/表情/语音/转发等，无 text/image 段，
+    是正常历史内容，不算解析失败）与「真有 text/image 但解析失败」。
+    """
+    segments = raw.get("message")
+    if not isinstance(segments, list):
+        return False
+    return any(
+        isinstance(seg, dict) and seg.get("type") in ("text", "image")
+        for seg in segments
+    )
+
+
 class ReloadBackfill:
     """重载自动补库服务：MySQL 就绪后从 OneBot 拉取历史消息补齐窗口缺口。"""
 
@@ -338,13 +353,13 @@ class ReloadBackfill:
             # message_seq 翻页真实生效（F1）
             request_count = min(round_cap, total_cap - len(raw_messages))
             try:
+                # 第 1 轮不传 message_seq（协议端按最新开始）：NapCat 等协议端
+                # 对 message_seq=0 报「消息0不存在」，首轮失败会整群作废
+                params = {"group_id": int(group_id), "count": request_count}
+                if message_seq:
+                    params["message_seq"] = message_seq
                 resp = await asyncio.wait_for(
-                    client.api.call_action(
-                        "get_group_msg_history",
-                        group_id=int(group_id),
-                        message_seq=message_seq,
-                        count=request_count,
-                    ),
+                    client.api.call_action("get_group_msg_history", **params),
                     timeout=DEFAULT_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -455,24 +470,28 @@ class ReloadBackfill:
         parsed: list[dict] = []
         parse_failed = 0
         for raw in raw_messages:
+            # 区分「正常无内容消息」（视频/表情/语音/转发等，无 text/image 段，
+            # 是正常历史内容，不计失败）与「真有 text/image 但解析失败」
+            has_text_image = _raw_has_content(raw)
             try:
                 item = parse_onebot_raw_message(raw, group_id)
             except Exception:
                 item = None
             if item is None:
-                parse_failed += 1
-                logger.debug(
-                    "[HistorySave] 重载自动补库：解析单条消息失败（群 %s），已跳过",
-                    group_id,
-                )
+                if has_text_image:
+                    parse_failed += 1
+                    logger.debug(
+                        "[HistorySave] 重载自动补库：解析单条消息失败（群 %s），已跳过",
+                        group_id,
+                    )
                 continue
             if item["timestamp"] < window_start:
                 continue
             parsed.append(item)
         if parse_failed > 0:
             logger.warning(
-                "[HistorySave] 重载自动补库：群 %s 有 %d 条消息解析失败被跳过，"
-                "需核查协议端消息结构",
+                "[HistorySave] 重载自动补库：群 %s 有 %d 条含文本/图片的消息解析失败"
+                "被跳过，需核查协议端消息结构",
                 group_id,
                 parse_failed,
             )

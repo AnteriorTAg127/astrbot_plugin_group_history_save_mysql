@@ -134,13 +134,13 @@ async def fetch_group_history(
         # 3) 调用协议端 action（每轮独立超时保护；retcode 非 0 时 aiocqhttp
         #    抛 ActionFailed）。第 2 轮起失败只降级返回已有数据，不抛异常。
         try:
+            # 第 1 轮不传 message_seq（协议端按最新开始）：NapCat 等协议端对
+            # message_seq=0 报「消息0不存在」，首轮失败会整批作废
+            params = {"group_id": gid, "count": request_count}
+            if message_seq:
+                params["message_seq"] = message_seq
             resp = await asyncio.wait_for(
-                client.api.call_action(
-                    "get_group_msg_history",
-                    group_id=gid,
-                    message_seq=message_seq,
-                    count=request_count,
-                ),
+                client.api.call_action("get_group_msg_history", **params),
                 timeout=DEFAULT_TIMEOUT,
             )
         except asyncio.TimeoutError:
