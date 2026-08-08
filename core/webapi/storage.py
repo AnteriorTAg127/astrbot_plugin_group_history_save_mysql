@@ -108,6 +108,8 @@ class StorageMixin:
         new_all_mode: str | None = None
         new_backfill_enabled: str | None = None
         new_backfill_hours: str | None = None
+        new_backfill_round_cap: str | None = None
+        new_backfill_max_rounds: str | None = None
 
         # 验证 image_retention_days
         if "image_retention_days" in payload:
@@ -141,15 +143,36 @@ class StorageMixin:
             else:
                 return error_response("backfill_enabled 必须为布尔值", status_code=400)
 
-        # 验证 backfill_hours（窗口夹取 [1,168] 与启动期一致）
+        # 验证 backfill_hours（窗口夹取 [1,168] 与启动期一致）。
+        # int(str(...)) 统一各 JSON 类型行为：浮点/布尔一律拒绝，不再静默截断
         if "backfill_hours" in payload:
             try:
-                hours = int(payload["backfill_hours"])
+                hours = int(str(payload["backfill_hours"]))
             except (ValueError, TypeError):
                 return error_response("补库时长必须为整数", status_code=400)
             if hours < 1 or hours > 168:
                 return error_response("补库时长必须在 1-168 小时之间", status_code=400)
             new_backfill_hours = str(hours)
+
+        # 验证 backfill_round_cap（单轮请求条数上限，夹取 [1,5000] 与启动期一致）
+        if "backfill_round_cap" in payload:
+            try:
+                round_cap = int(str(payload["backfill_round_cap"]))
+            except (ValueError, TypeError):
+                return error_response("单轮补库条数必须为整数", status_code=400)
+            if round_cap < 1 or round_cap > 5000:
+                return error_response("单轮补库条数必须在 1-5000 之间", status_code=400)
+            new_backfill_round_cap = str(round_cap)
+
+        # 验证 backfill_max_rounds（最大翻页轮数，夹取 [1,50] 与启动期一致）
+        if "backfill_max_rounds" in payload:
+            try:
+                max_rounds = int(str(payload["backfill_max_rounds"]))
+            except (ValueError, TypeError):
+                return error_response("补库最大轮数必须为整数", status_code=400)
+            if max_rounds < 1 or max_rounds > 50:
+                return error_response("补库最大轮数必须在 1-50 之间", status_code=400)
+            new_backfill_max_rounds = str(max_rounds)
 
         # 全部校验通过后写入
         if new_retention is not None:
@@ -160,6 +183,14 @@ class StorageMixin:
             await self.config_mgr.set_setting("backfill_enabled", new_backfill_enabled)
         if new_backfill_hours is not None:
             await self.config_mgr.set_setting("backfill_hours", new_backfill_hours)
+        if new_backfill_round_cap is not None:
+            await self.config_mgr.set_setting(
+                "backfill_round_cap", new_backfill_round_cap
+            )
+        if new_backfill_max_rounds is not None:
+            await self.config_mgr.set_setting(
+                "backfill_max_rounds", new_backfill_max_rounds
+            )
 
         settings = await self.config_mgr.get_all_settings()
         return json_response({"saved": True, "settings": settings})

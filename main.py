@@ -6,6 +6,7 @@ v0.6.0 起本文件仅保留框架交互（指令注册 / 事件监听 / 生命�
 """
 
 import asyncio
+import time
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -35,7 +36,7 @@ MAX_INIT_ATTEMPTS = 5
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
-    "0.6.0",
+    "0.6.1",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -100,7 +101,15 @@ class GroupHistoryPlugin(Star):
         # v0.6.0 消息保存逻辑委托（解析/缓冲/落库/补录全部在 core.saver）
         self.saver = MessageSaver(self.mysql_mgr, self.config_mgr, self.stats_service)
         # v0.6.0 重载自动补库服务（MySQL 初始化成功后从 OneBot 拉取历史补齐窗口缺口）
-        self.backfill = ReloadBackfill(context, self.mysql_mgr, self.config_mgr)
+        # v0.6.1 注入 saver / stats_service：补库期间实时消息门控缓冲，收尾后带去重
+        # flush 落库并链式触发快照启动回填（F3/F6）
+        self.backfill = ReloadBackfill(
+            context,
+            self.mysql_mgr,
+            self.config_mgr,
+            saver=self.saver,
+            stats_service=self.stats_service,
+        )
 
         self._init_task: asyncio.Task | None = None
 
@@ -459,6 +468,13 @@ class GroupHistoryPlugin(Star):
             await self.backfill.stop()
         except asyncio.CancelledError:
             pass
+        # v0.6.1 记录上次卸载时间，供下次加载时收窄补库窗口到停机缺口（失败仅记 warning）
+        try:
+            await self.config_mgr.set_setting(
+                "last_terminate_time", str(int(time.time()))
+            )
+        except Exception as e:
+            logger.warning(f"[HistorySave] 记录上次卸载时间失败: {e}")
         # 停止数据分析调度器（LIFO：最后启动的最先停止；吞 CancelledError 不阻塞后续清理）
         try:
             await self.stats_service.stop()

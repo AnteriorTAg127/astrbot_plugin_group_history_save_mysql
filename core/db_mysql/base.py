@@ -1,7 +1,8 @@
 """MySQL 数据库操作层（基础部分）。
 
 负责连接池（DynamicPool）组装、统一 SQL 执行入口、建表与索引创建、
-表结构迁移与必需列校验等核心初始化；模块常量集中定义于此。
+表结构迁移与必需列校验等核心初始化；连接池行为常量定义于 pool.py，
+本文件从其导入（供全库经 core/db_mysql/__init__.py 再导出使用）。
 （v0.6.0 起，由根目录 db_mysql.py 拆分为 core/db_mysql/ 包。）
 """
 
@@ -9,6 +10,23 @@ import asyncio
 import time
 
 from astrbot.api import logger
+
+from .pool import (
+    CREATE_RETRY_BACKOFF_SECONDS,
+    RESET_PENDING_WAIT_SECONDS,
+    DynamicPool,
+)
+
+# 公开导出面：DynamicPool 与两个连接池行为常量为从 pool.py 的再导出
+# （core/db_mysql/__init__.py 经 `from .base import ...` 取用，保持既有导入路径不变）
+__all__ = [
+    "MySQLManagerBase",
+    "DynamicPool",
+    "QUERY_TIMEOUT_SECONDS",
+    "DDL_TIMEOUT_SECONDS",
+    "CREATE_RETRY_BACKOFF_SECONDS",
+    "RESET_PENDING_WAIT_SECONDS",
+]
 
 # 单条 SQL 执行超时兜底（秒）：aiomysql 无可靠的客户端读写超时，
 # 业务查询统一经 asyncio.wait_for 兜底；超时后连接视为协议状态不可信，
@@ -19,18 +37,6 @@ QUERY_TIMEOUT_SECONDS = 30.0
 # 可能耗时数分钟，不能用业务查询超时兜住，否则 DDL 被中途砍断后反复重试
 # 始终无法完成（与外层初始化超时的放宽相配合）
 DDL_TIMEOUT_SECONDS = 300.0
-
-# 建连失败后的退避重试间隔（秒）：可取消的短 sleep，在 acquire_timeout
-# 窗口内换回瞬时故障的重试机会（见 _get_connection create 模式）
-CREATE_RETRY_BACKOFF_SECONDS = 1.0
-
-# initialize() 复位前等待在途操作（_pending）归零的最长秒数：
-# 超时记 warning 并强制复位（见 DynamicPool.initialize）
-RESET_PENDING_WAIT_SECONDS = 20.0
-
-# DynamicPool 定义于 pool.py，其依赖的模块常量已在上方定义；
-# 后置导入化解 base ↔ pool 的循环依赖（包 __init__ 先导入 base 再导入 pool）
-from .pool import DynamicPool  # noqa: E402
 
 
 class MySQLManagerBase:

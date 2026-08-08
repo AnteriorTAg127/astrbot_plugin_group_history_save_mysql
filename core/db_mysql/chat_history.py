@@ -258,3 +258,33 @@ class ChatHistoryMixin:
         except Exception as e:
             self._log_op_error("get_all_group_ids", "查询有数据的群清单", e)
             return []
+
+    async def get_recent_messages(
+        self, group_id: str, limit: int
+    ) -> list[dict]:
+        """按群取最近 limit 条已记录消息的 message_id 与 content（补库重叠边界检测用）。
+
+        按自增 id 倒序取最新记录；content 供无 message_id 的消息做内容比对兜底。
+        limit <= 0 返回空列表；异常记 error 日志后返回空列表（让上层按
+        「无重叠参照」处理，退化为窗口/轮数停止，不阻断补库）。
+        """
+        if limit <= 0:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._execute(
+                        cur,
+                        """SELECT message_id, content FROM chat_history
+                           WHERE group_id = %s ORDER BY id DESC LIMIT %s""",
+                        [group_id, limit],
+                    )
+                    rows = await cur.fetchall()
+                    return [
+                        {"message_id": str(row[0]) if row[0] is not None else "",
+                         "content": str(row[1]) if row[1] is not None else ""}
+                        for row in rows
+                    ]
+        except Exception as e:
+            self._log_op_error("get_recent_messages", "查询最近消息重叠参照", e)
+            return []

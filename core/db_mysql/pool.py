@@ -2,7 +2,8 @@
 
 连接池支持自动扩容（按需创建连接至上限）和自动缩容（回收空闲连接至下限），
 后台 reaper 定期巡检：回收空闲超时连接、健康检查（ping）替换失效连接。
-本模块仅承载 DynamicPool 类，模块常量定义于 base.py。
+本模块仅承载 DynamicPool 类，连接池行为常量定义于此（base.py 从本模块导入，
+供全库经 core/db_mysql/__init__.py 再导出使用）。
 """
 
 import asyncio
@@ -13,9 +14,13 @@ import aiomysql
 
 from astrbot.api import logger
 
-# 模块常量定义于 base.py：本文件依赖其中的 CREATE_RETRY_BACKOFF_SECONDS /
-# RESET_PENDING_WAIT_SECONDS（base.py 先定义常量再导入本模块，化解循环依赖）
-from .base import CREATE_RETRY_BACKOFF_SECONDS, RESET_PENDING_WAIT_SECONDS
+# 建连失败后的退避重试间隔（秒）：可取消的短 sleep，在 acquire_timeout
+# 窗口内换回瞬时故障的重试机会（见 _get_connection create 模式）
+CREATE_RETRY_BACKOFF_SECONDS = 1.0
+
+# initialize() 复位前等待在途操作（_pending）归零的最长秒数：
+# 超时记 warning 并强制复位（见 DynamicPool.initialize）
+RESET_PENDING_WAIT_SECONDS = 20.0
 
 
 class DynamicPool:

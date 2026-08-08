@@ -29,6 +29,9 @@ class MessageSaver:
 
     MySQL 后台初始化窗口内（首次启动/重连）消息先缓冲，初始化成功后统一补录，
     避免该窗口内的消息丢失；重试耗尽（_db_gave_up）后直接丢弃。
+    v0.6.1 补库门控缓冲：补库进行期间（_backfill_running）实时消息同样先缓冲，
+    补库全部写完后再由 end_backfill 带去重 flush（message_id/图片 URL 双维查重），
+    将实时与补库两条写路径由并发改串行，消除竞态重复行。
     """
 
     def __init__(self, mysql_mgr, config_mgr, stats_service=None):
@@ -38,8 +41,10 @@ class MessageSaver:
         self._initialized = False
         # 重试耗尽后置 True：消息直接丢弃（不再缓冲），停止一切存储活动
         self._db_gave_up = False
-        # MySQL 后台初始化窗口内的消息缓冲（FIFO，溢出自动丢弃最旧记录）
-        self._pending_records: deque[dict] = deque(maxlen=2000)
+        # 补库进行中置 True：实时消息先缓冲不落库，补库全部写完后再带去重 flush
+        self._backfill_running = False
+        # 初始化窗口 / 补库门控期间的缓冲（FIFO，溢出自动丢弃最旧记录）
+        self._pending_records: deque[dict] = deque(maxlen=5000)
         self._last_drop_warn = 0.0  # 缓冲区溢出告警节流时间戳（monotonic 秒）
 
     def set_initialized(self):
@@ -63,11 +68,26 @@ class MessageSaver:
         """是否存在待补录的缓冲消息。"""
         return bool(self._pending_records)
 
+    def begin_backfill(self):
+        """标记补库开始：此后实时消息先缓冲不落库，补库全部写完后再 flush。"""
+        self._backfill_running = True
+
+    async def end_backfill(self) -> int:
+        """标记补库结束，带去重 flush 补库期间缓冲的实时消息。
+
+        先清门控（此后新消息恢复实时落库），再以 dedup=True 调用 flush_pending：
+        按群批量查已存在 message_id / 图片 URL，跳过补库已写入的记录后落库，
+        返回落库成功条数。
+        """
+        self._backfill_running = False
+        return await self.flush_pending(dedup=True)
+
     async def handle_group_message(self, event: AstrMessageEvent):
         """监听群消息并保存到 MySQL。
 
         MySQL 后台初始化窗口内（首次启动/重连）消息先缓冲，
         初始化成功后统一补录，避免该窗口内的消息丢失。
+        补库进行中（v0.6.1 门控缓冲）同样先缓冲，补库完成后再带去重 flush。
         重试耗尽（_db_gave_up）后直接丢弃，不再做任何存储动作。
         """
         if self._db_gave_up:
@@ -120,8 +140,9 @@ class MessageSaver:
             if not text_parts and not image_urls:
                 return
 
-            if not self._initialized:
-                # MySQL 尚在后台初始化：缓冲待补录，避免启动窗口丢消息
+            if not self._initialized or self._backfill_running:
+                # MySQL 尚在后台初始化，或补库进行中（v0.6.1 门控缓冲）：
+                # 实时消息先缓冲不落库，待初始化完成 / 补库全部写完后再统一补录
                 self._buffer_message(
                     group_id,
                     sender_id,
@@ -162,9 +183,9 @@ class MessageSaver:
         reply_id: str = "",
         timestamp: datetime | None = None,
     ):
-        """MySQL 初始化窗口内缓冲消息，待初始化成功后补录。
+        """缓冲消息，待初始化完成 / 补库结束（带去重）后统一补录。
 
-        缓冲区为固定容量 deque（maxlen=2000），溢出时自动丢弃最旧记录；
+        缓冲区为固定容量 deque（maxlen=5000），溢出时自动丢弃最旧记录；
         丢弃告警每 60 秒最多输出一次，避免刷屏。
 
         Args:
@@ -275,35 +296,102 @@ class MessageSaver:
 
         return all_ok
 
-    async def flush_pending(self):
-        """将初始化窗口内缓冲的消息补录到 MySQL。
+    async def flush_pending(self, dedup: bool = False):
+        """将缓冲的消息补录到 MySQL。
 
-        单条失败仅记日志并继续，避免一条坏数据阻塞整批补录。
-        补录失败不再退回缓冲（避免自引用循环）：_persist_message 以
-        rebuffer_on_fail=False 调用，失败记录记日志后丢弃。
+        默认路径（dedup=False，MySQL 初始化窗口调用）行为与 v0.6.0 完全一致：
+        逐条落库，单条失败仅记日志并继续，失败不退回缓冲。
+        去重路径（dedup=True，end_backfill 调用）：补库刚写完，按群批量查询已存在
+        message_id / 图片 URL，跳过补库已写入的整条记录、过滤已存在的图片 URL 后
+        再落库，从数据面消除两条写路径的重复行（不建唯一索引）；空 message_id 的
+        记录不去重、正常落库（v0.6.1 设计：空 id 消息只来自实时缓冲单源）。
         """
         if not self._pending_records:
-            return
+            return 0 if dedup else None
         pending = list(self._pending_records)
         self._pending_records.clear()
         ok = 0
+
+        if not dedup:
+            # —— 初始化窗口路径（v0.6.0 既有行为逐字保留）——
+            for record in pending:
+                try:
+                    flushed = await self._persist_message(
+                        record["group_id"],
+                        record["sender_id"],
+                        record["sender_name"],
+                        record["text_parts"],
+                        record["image_urls"],
+                        record["message_id"],
+                        at_list=record.get("at_list", ""),
+                        reply_id=record.get("reply_id", ""),
+                        # 透传缓冲时记录的到达时刻；旧格式记录无该字段时回退 None
+                        timestamp=record.get("timestamp"),
+                        rebuffer_on_fail=False,
+                    )
+                    if flushed:
+                        ok += 1
+                except Exception as e:
+                    logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
+            logger.info(
+                f"[HistorySave] 启动窗口缓冲消息补录完成: {ok}/{len(pending)} 条"
+            )
+            return
+
+        # —— 补库门控去重路径（end_backfill 调用）——
+        # 按群分组，逐组批量查已存在 message_id / 图片 URL；两个查询各自兜底：
+        # 异常记 error 日志并退化为空集（按"全不存在"处理），不阻断 flush
+        by_group: dict[str, list[dict]] = {}
         for record in pending:
+            by_group.setdefault(record["group_id"], []).append(record)
+        for gid, records in by_group.items():
+            existing_ids: set[str] = set()
+            existing_urls: set[str] = set()
+            ids = [r["message_id"] for r in records if r["message_id"]]
+            urls = [url for r in records for url in r["image_urls"] if url]
             try:
-                flushed = await self._persist_message(
-                    record["group_id"],
-                    record["sender_id"],
-                    record["sender_name"],
-                    record["text_parts"],
-                    record["image_urls"],
-                    record["message_id"],
-                    at_list=record.get("at_list", ""),
-                    reply_id=record.get("reply_id", ""),
-                    # 透传缓冲时记录的到达时刻；旧格式记录无该字段时回退 None
-                    timestamp=record.get("timestamp"),
-                    rebuffer_on_fail=False,
-                )
-                if flushed:
-                    ok += 1
+                if ids:
+                    existing_ids = await self.mysql_mgr.get_existing_message_ids(
+                        gid, ids
+                    )
             except Exception as e:
-                logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
-        logger.info(f"[HistorySave] 启动窗口缓冲消息补录完成: {ok}/{len(pending)} 条")
+                logger.error(f"[HistorySave] 查询已存在消息 ID 失败: {e}")
+            try:
+                if urls:
+                    existing_urls = await self.mysql_mgr.get_existing_image_urls(
+                        gid, urls
+                    )
+            except Exception as e:
+                logger.error(f"[HistorySave] 查询已存在图片链接失败: {e}")
+            for record in records:
+                # 空 message_id 不去重、正常落库（v0.6.1 设计：空 id 消息只来自
+                # 实时缓冲单源，补库侧已跳过，无重复源）
+                if not record["message_id"]:
+                    remain_urls = record["image_urls"]
+                # 补库已写入的整条记录：跳过，计数不算成功
+                elif record["message_id"] in existing_ids:
+                    continue
+                else:
+                    # 过滤掉补库已写入的图片 URL，其余链接照常落库
+                    remain_urls = [
+                        url for url in record["image_urls"] if url not in existing_urls
+                    ]
+                try:
+                    flushed = await self._persist_message(
+                        record["group_id"],
+                        record["sender_id"],
+                        record["sender_name"],
+                        record["text_parts"],
+                        remain_urls,
+                        record["message_id"],
+                        at_list=record.get("at_list", ""),
+                        reply_id=record.get("reply_id", ""),
+                        timestamp=record.get("timestamp"),
+                        rebuffer_on_fail=False,
+                    )
+                    if flushed:
+                        ok += 1
+                except Exception as e:
+                    logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
+        logger.info(f"[HistorySave] 补库期间缓冲消息补录完成: {ok}/{len(pending)} 条")
+        return ok

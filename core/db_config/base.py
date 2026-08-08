@@ -210,6 +210,9 @@ class ConfigManagerBase:
             # v0.6.0 重载自动补库：总开关 / 时间窗口（小时，夹取 [1,168]）
             "backfill_enabled": "true",
             "backfill_hours": "12",
+            # v0.6.1 补库翻页参数：单轮请求条数上限（默认 200）/ 最大翻页轮数（默认 5）
+            "backfill_round_cap": "200",
+            "backfill_max_rounds": "5",
         }
         for key, value in defaults.items():
             await self.db.execute(

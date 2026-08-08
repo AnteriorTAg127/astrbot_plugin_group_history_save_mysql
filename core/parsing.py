@@ -112,11 +112,22 @@ def parse_onebot_raw_message(raw: dict, group_id: str) -> dict | None:
         无文本且无图片 URL、或结构异常返回 None（记 debug 日志，不抛异常）。
     """
     try:
-        timestamp = datetime.fromtimestamp(int(raw["time"]))
+        message_id = str(raw.get("message_id") or "")
+        # 防御式读取 time 键（F8）：缺失/非数值记 warning 带 message_id 并跳过，
+        # 不再被外层兜底静默吞掉
+        time_raw = raw.get("time")
+        try:
+            timestamp = datetime.fromtimestamp(int(time_raw))
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "[HistorySave] 解析 OneBot 原始消息缺 time 或非法（群 %s, message_id=%s），已跳过",
+                group_id,
+                message_id,
+            )
+            return None
         sender = raw.get("sender") or {}
         sender_id = str(sender.get("user_id") or "")
         sender_name = str(sender.get("nickname") or "")
-        message_id = str(raw.get("message_id") or "")
 
         segments = raw.get("message")
         text_parts: list[str] = []
@@ -132,7 +143,8 @@ def parse_onebot_raw_message(raw: dict, group_id: str) -> dict | None:
                     continue
                 seg_type = seg.get("type")
                 if seg_type == "text":
-                    # 仅拼接文本段；strip 后 join（与实时入库口径一致）
+                    # 仅拼接文本段；strip 后以 "\n" 拼接（与实时路径
+                    # core/saver.py 的 "\n".join 口径一致，避免两条路径落库内容分叉）
                     text = str(data.get("text") or "").strip()
                     if text:
                         text_parts.append(text)
@@ -156,7 +168,7 @@ def parse_onebot_raw_message(raw: dict, group_id: str) -> dict | None:
                 elif seg_type == "reply":
                     reply_id = str(data.get("id") or "")
 
-        text = "".join(text_parts)
+        text = "\n".join(text_parts)
         at_list = ",".join(at_targets)
         if not text and not image_urls:
             return None

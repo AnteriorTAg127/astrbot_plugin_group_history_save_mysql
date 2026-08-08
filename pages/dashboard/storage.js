@@ -109,6 +109,8 @@ async function loadSettings() {
         document.getElementById("retentionDays").value = settings.image_retention_days || 3;
         document.getElementById("backfillEnabled").checked = settings.backfill_enabled !== "false";
         document.getElementById("backfillHours").value = settings.backfill_hours || 12;
+        document.getElementById("backfillRoundCap").value = settings.backfill_round_cap || 200;
+        document.getElementById("backfillMaxRounds").value = settings.backfill_max_rounds || 5;
     } catch { /* ignore */ }
 }
 
@@ -356,11 +358,17 @@ function bindStorageEvents() {
         if (isNaN(days) || days < 1) { showToast("请输入有效天数", "error"); return; }
         const hours = parseInt(document.getElementById("backfillHours").value);
         if (isNaN(hours) || hours < 1 || hours > 168) { showToast("补库时长需在 1–168 小时之间", "error"); return; }
+        const roundCap = parseInt(document.getElementById("backfillRoundCap").value);
+        if (isNaN(roundCap) || roundCap < 1 || roundCap > 5000) { showToast("单轮补库条数需在 1–5000 之间", "error"); return; }
+        const maxRounds = parseInt(document.getElementById("backfillMaxRounds").value);
+        if (isNaN(maxRounds) || maxRounds < 1 || maxRounds > 50) { showToast("补库最大轮数需在 1–50 之间", "error"); return; }
         try {
             await bridge.apiPost("settings/save", {
                 image_retention_days: days,
                 backfill_enabled: document.getElementById("backfillEnabled").checked,
                 backfill_hours: hours,
+                backfill_round_cap: roundCap,
+                backfill_max_rounds: maxRounds,
             });
             showToast("设置已保存", "success");
         } catch (e) { showToast("保存失败: " + e.message, "error"); }
