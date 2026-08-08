@@ -114,11 +114,12 @@ def parse_onebot_raw_message(raw: dict, group_id: str) -> dict | None:
     try:
         message_id = str(raw.get("message_id") or "")
         # 防御式读取 time 键（F8）：缺失/非数值记 warning 带 message_id 并跳过，
-        # 不再被外层兜底静默吞掉
+        # 不再被外层兜底静默吞掉。OSError 用于 Windows 平台 fromtimestamp 对
+        # 越界时间戳（负数或远未来）的行为，与 backfill._compute_window_start 对齐
         time_raw = raw.get("time")
         try:
             timestamp = datetime.fromtimestamp(int(time_raw))
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError, OSError):
             logger.warning(
                 "[HistorySave] 解析 OneBot 原始消息缺 time 或非法（群 %s, message_id=%s），已跳过",
                 group_id,

@@ -472,7 +472,10 @@ class ReloadBackfill:
                     )
                     if text_ok:
                         inserted_text += 1
-                # 批内 URL 去重收窄为单消息内（F10）；跨消息/跨轮次去重仍由 existing_urls 承担
+                # 批内 URL 去重收窄为单消息内（F10）；跨消息去重靠 existing_urls 实时更新。
+                # existing_urls 入库前是一次性快照，但批内同一 URL 出现在多条消息时，
+                # 第一条插入成功后须追加进 existing_urls，否则第二条会再次通过检查
+                # 并 INSERT，产生重复 image_records 行（无唯一索引兜底时累积）。
                 for url in dict.fromkeys(image_urls):
                     if url in existing_urls:
                         continue
@@ -485,6 +488,8 @@ class ReloadBackfill:
                     )
                     if img_ok:
                         inserted_images += 1
+                        # 实时更新快照，使批内后续消息看到刚写入的 URL
+                        existing_urls.add(url)
 
             if empty_id_count > 0:
                 logger.warning(

@@ -263,11 +263,7 @@ class DynamicPool:
             new_conn = await self._create_connection()
             self._record_destroyed(conn)
             return new_conn
-        if (
-            conn_pinged
-            and conn_pinged > 0
-            and (time.monotonic() - conn_pinged) < self._ping_cooldown
-        ):
+        if conn_pinged > 0 and (time.monotonic() - conn_pinged) < self._ping_cooldown:
             return conn
         if not await self._is_alive(conn):
             new_conn = await self._create_connection()

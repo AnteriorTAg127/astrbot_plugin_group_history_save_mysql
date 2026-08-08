@@ -297,19 +297,24 @@ class MessageSaver:
 
         return all_ok
 
-    async def flush_pending(self, dedup: bool = False, group_id: str | None = None):
+    async def flush_pending(self, dedup: bool = False, group_id: str | None = None) -> int:
         """将缓冲的消息补录到 MySQL。
 
-        默认路径（dedup=False，MySQL 初始化窗口调用）行为与 v0.6.0 完全一致：
-        逐条落库，单条失败仅记日志并继续，失败不退回缓冲。
+        默认路径（dedup=False，MySQL 初始化窗口调用）行为与 v0.6.0 基本一致：
+        逐条落库。与旧实现的差异：单条写入失败时把该条回写 _pending_records 左端，
+        等待下次 flush 重试，避免 MySQL 短暂不可用时整批缓冲被静默清空。
         去重路径（dedup=True，end_backfill 调用）：补库刚写完，按群批量查询已存在
         message_id / 图片 URL，跳过补库已写入的整条记录、过滤已存在的图片 URL 后
         再落库，从数据面消除两条写路径的重复行（不建唯一索引）；空 message_id 的
         记录不去重、正常落库（v0.6.1 设计：空 id 消息只来自实时缓冲单源）。
         group_id: 仅 flush 该群的缓冲记录（v0.6.1 按群门控）；None 全量 flush。
+
+        Returns:
+            int: 成功落库的条数（含跳过的去重条目不计）；空缓冲或全失败返回 0。
+            旧实现 dedup=False 时返回 None，现统一为 int，调用方无需区分类型。
         """
         if not self._pending_records:
-            return 0 if dedup else None
+            return 0
         if group_id is not None:
             pending = [r for r in self._pending_records if r["group_id"] == group_id]
             remaining = [
@@ -321,9 +326,13 @@ class MessageSaver:
             pending = list(self._pending_records)
             self._pending_records.clear()
         ok = 0
+        # 失败回写缓冲的辅助函数：左端追加保序，等待下次 flush 重试。
+        # deque maxlen=5000，回写超出时自动丢弃最旧记录（已有溢出告警机制）。
+        def _rebuffer(record: dict) -> None:
+            self._pending_records.appendleft(record)
 
         if not dedup:
-            # —— 初始化窗口路径（v0.6.0 既有行为逐字保留）——
+            # —— 初始化窗口路径（v0.6.0 既有行为 + 失败回缓冲）——
             for record in pending:
                 try:
                     flushed = await self._persist_message(
@@ -341,12 +350,20 @@ class MessageSaver:
                     )
                     if flushed:
                         ok += 1
+                    else:
+                        # _persist_message 返回 False 表示写入失败但未抛异常
+                        # （insert_xxx 内部已吞错返回 False）；回缓冲等下次重试，
+                        # 避免缓冲被静默清空导致数据丢失
+                        _rebuffer(record)
                 except Exception as e:
                     logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
+                    # 异常路径同样回缓冲：可能是连接临时断开，下次 flush 可恢复
+                    _rebuffer(record)
             logger.info(
                 f"[HistorySave] 启动窗口缓冲消息补录完成: {ok}/{len(pending)} 条"
+                f"（失败 {len(pending) - ok} 条已回缓冲）"
             )
-            return
+            return ok
 
         # —— 补库门控去重路径（end_backfill 调用）——
         # 按群分组，逐组批量查已存在 message_id / 图片 URL；两个查询各自兜底：
@@ -401,7 +418,14 @@ class MessageSaver:
                     )
                     if flushed:
                         ok += 1
+                    else:
+                        _rebuffer(record)
                 except Exception as e:
                     logger.error(f"[HistorySave] 补录缓冲消息失败: {e}")
-        logger.info(f"[HistorySave] 补库期间缓冲消息补录完成: {ok}/{len(pending)} 条")
+                    _rebuffer(record)
+        failed = len(pending) - ok
+        logger.info(
+            f"[HistorySave] 补库期间缓冲消息补录完成: {ok}/{len(pending)} 条"
+            + (f"（失败 {failed} 条已回缓冲）" if failed else "")
+        )
         return ok

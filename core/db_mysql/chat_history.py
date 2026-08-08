@@ -264,7 +264,11 @@ class ChatHistoryMixin:
     ) -> list[dict]:
         """按群取最近 limit 条已记录消息的 message_id 与 content（补库重叠边界检测用）。
 
-        按自增 id 倒序取最新记录；content 供无 message_id 的消息做内容比对兜底。
+        按 timestamp DESC（id DESC 兜底）取最新记录；content 供无 message_id
+        的消息做内容比对兜底。补库路径会向表内插入原始时间戳早于实时记录的消息，
+        自增 id 与 timestamp 不再单调同向，按 id DESC 取出的「最近 N 条」会漏掉
+        真正最新的实时记录导致重叠检测失效；改以 timestamp 为第一排序键，与时间
+        语义对齐（命中 idx_group_time 索引，无额外代价）。
         limit <= 0 返回空列表；异常记 error 日志后返回空列表（让上层按
         「无重叠参照」处理，退化为窗口/轮数停止，不阻断补库）。
         """
@@ -276,7 +280,8 @@ class ChatHistoryMixin:
                     await self._execute(
                         cur,
                         """SELECT message_id, content FROM chat_history
-                           WHERE group_id = %s ORDER BY id DESC LIMIT %s""",
+                           WHERE group_id = %s
+                           ORDER BY timestamp DESC, id DESC LIMIT %s""",
                         [group_id, limit],
                     )
                     rows = await cur.fetchall()
