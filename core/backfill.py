@@ -66,19 +66,33 @@ def _raw_text_content(raw: dict) -> str:
     return "\n".join(parts)
 
 
-def _raw_has_content(raw: dict) -> bool:
-    """判断 OneBot 原始消息是否含 text/image 段。
+def _raw_has_extractable_content(raw: dict) -> bool:
+    """判断消息是否含可入库的文本或 http(s) 图片链接。
 
-    用于区分「正常无内容消息」（视频/表情/语音/转发等，无 text/image 段，
-    是正常历史内容，不算解析失败）与「真有 text/image 但解析失败」。
+    用于区分「正常跳过」与「真解析失败」：图片 URL 非 http（NapCat 等返回本地
+    路径）、视频/表情/语音等无文本无 http 图片的消息是正常历史内容，不算失败；
+    有非空文本或 http 图片 URL 却解析失败（如 time 非法/结构异常）才算真失败。
     """
     segments = raw.get("message")
     if not isinstance(segments, list):
         return False
-    return any(
-        isinstance(seg, dict) and seg.get("type") in ("text", "image")
-        for seg in segments
-    )
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        data = seg.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        seg_type = seg.get("type")
+        if seg_type == "text" and str(data.get("text") or "").strip():
+            return True
+        if seg_type == "image":
+            url = data.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return True
+            file = data.get("file")
+            if isinstance(file, str) and file.startswith(("http://", "https://")):
+                return True
+    return False
 
 
 class ReloadBackfill:
@@ -353,8 +367,10 @@ class ReloadBackfill:
             # message_seq 翻页真实生效（F1）
             request_count = min(round_cap, total_cap - len(raw_messages))
             try:
-                # 第 1 轮不传 message_seq（协议端按最新开始）：NapCat 等协议端
-                # 对 message_seq=0 报「消息0不存在」，首轮失败会整群作废
+                # 第 1 轮不传 message_seq：标准 OneBot 省略即从最新开始；NapCat 系
+                # （go-cqhttp 兼容）源码中省略与传 0 等效——都走「最新消息视图」
+                # getAioFirstViewLatestMsgs，若群缓存为空返回空列表并报「消息不存在」，
+                # 属正常现象由下方首轮失败降级跳过该群，故省略更兼容标准协议端
                 params = {"group_id": int(group_id), "count": request_count}
                 if message_seq:
                     params["message_seq"] = message_seq
@@ -373,9 +389,9 @@ class ReloadBackfill:
                     message_seq,
                     exc_info=True,
                 )
-                if round_no == 1:
-                    raise  # 首轮失败整组作废（由 _run_all 捕获该群）
-                break  # 第 2 轮起失败降级：用已拉到的部分
+                # 首轮失败也降级跳过该群：NapCat 等协议端从最新拉取时若群缓存为空
+                # 会报「消息不存在」，属正常现象（群无新消息/缓存未就绪），不整群作废
+                break
             except Exception:
                 logger.warning(
                     "[HistorySave] 重载自动补库：群 %s 第 %d 轮拉取失败，"
@@ -386,8 +402,6 @@ class ReloadBackfill:
                     message_seq,
                     exc_info=True,
                 )
-                if round_no == 1:
-                    raise
                 break
 
             messages = resp.get("messages") if isinstance(resp, dict) else None
@@ -470,9 +484,9 @@ class ReloadBackfill:
         parsed: list[dict] = []
         parse_failed = 0
         for raw in raw_messages:
-            # 区分「正常无内容消息」（视频/表情/语音/转发等，无 text/image 段，
-            # 是正常历史内容，不计失败）与「真有 text/image 但解析失败」
-            has_text_image = _raw_has_content(raw)
+            # 区分「正常跳过」（图片本地路径/视频/表情等无可提取内容）与
+            # 「真有文本或 http 图片但解析失败」
+            has_text_image = _raw_has_extractable_content(raw)
             try:
                 item = parse_onebot_raw_message(raw, group_id)
             except Exception:
