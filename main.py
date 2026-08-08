@@ -100,9 +100,9 @@ class GroupHistoryPlugin(Star):
 
         # v0.6.0 消息保存逻辑委托（解析/缓冲/落库/补录全部在 core.saver）
         self.saver = MessageSaver(self.mysql_mgr, self.config_mgr, self.stats_service)
-        # v0.6.0 重载自动补库服务（MySQL 初始化成功后从 OneBot 拉取历史补齐窗口缺口）
-        # v0.6.1 注入 saver / stats_service：补库期间实时消息门控缓冲，收尾后带去重
-        # flush 落库并链式触发快照启动回填（F3/F6）
+        # v0.6.1 按群消息触发的自动补库：插件重启后某群首条消息到达时触发该群补库
+        # （用消息真实 message_seq 作起点往前翻停机缺口），补库期间该群实时消息
+        # 门控缓冲、收尾后带去重 flush；注入 saver / stats_service（快照回填收尾链）
         self.backfill = ReloadBackfill(
             context,
             self.mysql_mgr,
@@ -172,11 +172,8 @@ class GroupHistoryPlugin(Star):
                         await self.stats_service.startup_backfill()
                     except Exception as e:
                         logger.error(f"[HistorySave] 快照启动回填发起失败: {e}")
-                    # v0.6.0 重载自动补库：MySQL 就绪后后台拉取历史补齐（失败仅记日志）
-                    try:
-                        await self.backfill.start()
-                    except Exception as e:
-                        logger.error(f"[HistorySave] 重载自动补库启动失败: {e}")
+                    # v0.6.1 重载自动补库改为按群消息触发：插件重启后某群首条消息到达时，
+                    # on_group_message → ReloadBackfill.maybe_trigger 触发该群补库（每群一次）
                     logger.info(
                         "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
                     )
@@ -222,8 +219,14 @@ class GroupHistoryPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_group_message(self, event: AstrMessageEvent):
-        """监听群消息并保存到 MySQL（委托给 core.saver.MessageSaver）。"""
+        """监听群消息：按群触发自动补库（重启后首条消息）并保存到 MySQL。
+
+        先交给 ReloadBackfill.maybe_trigger（每群一次、幂等；若该群补库进行中，
+        其消息经 saver 门控缓冲、补库完成后带去重 flush），再委托 MessageSaver
+        处理实时消息。
+        """
         try:
+            await self.backfill.maybe_trigger(event)
             await self.saver.handle_group_message(event)
         except Exception as e:
             logger.error(f"[HistorySave] 处理群消息时出错: {e}", exc_info=True)

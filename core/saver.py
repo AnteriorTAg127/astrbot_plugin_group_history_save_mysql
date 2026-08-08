@@ -41,8 +41,9 @@ class MessageSaver:
         self._initialized = False
         # 重试耗尽后置 True：消息直接丢弃（不再缓冲），停止一切存储活动
         self._db_gave_up = False
-        # 补库进行中置 True：实时消息先缓冲不落库，补库全部写完后再带去重 flush
-        self._backfill_running = False
+        # 补库进行中的群集合（v0.6.1 消息触发式补库）：这些群的实时消息先缓冲
+        # 不落库，该群补库全部写完后再带去重 flush（其余群正常实时落库）
+        self._backfill_groups: set[str] = set()
         # 初始化窗口 / 补库门控期间的缓冲（FIFO，溢出自动丢弃最旧记录）
         self._pending_records: deque[dict] = deque(maxlen=5000)
         self._last_drop_warn = 0.0  # 缓冲区溢出告警节流时间戳（monotonic 秒）
@@ -68,19 +69,19 @@ class MessageSaver:
         """是否存在待补录的缓冲消息。"""
         return bool(self._pending_records)
 
-    def begin_backfill(self):
-        """标记补库开始：此后实时消息先缓冲不落库，补库全部写完后再 flush。"""
-        self._backfill_running = True
+    def begin_backfill(self, group_id: str):
+        """标记某群补库开始：此后该群实时消息先缓冲不落库，补库写完后再 flush。"""
+        self._backfill_groups.add(group_id)
 
-    async def end_backfill(self) -> int:
-        """标记补库结束，带去重 flush 补库期间缓冲的实时消息。
+    async def end_backfill(self, group_id: str) -> int:
+        """标记某群补库结束，带去重 flush 该群补库期间缓冲的实时消息。
 
-        先清门控（此后新消息恢复实时落库），再以 dedup=True 调用 flush_pending：
-        按群批量查已存在 message_id / 图片 URL，跳过补库已写入的记录后落库，
-        返回落库成功条数。
+        先从门控集合移除该群（此后该群新消息恢复实时落库），再以 dedup=True
+        按群调用 flush_pending：批量查已存在 message_id / 图片 URL，跳过补库
+        已写入的记录后落库，返回落库成功条数。
         """
-        self._backfill_running = False
-        return await self.flush_pending(dedup=True)
+        self._backfill_groups.discard(group_id)
+        return await self.flush_pending(dedup=True, group_id=group_id)
 
     async def handle_group_message(self, event: AstrMessageEvent):
         """监听群消息并保存到 MySQL。
@@ -140,9 +141,9 @@ class MessageSaver:
             if not text_parts and not image_urls:
                 return
 
-            if not self._initialized or self._backfill_running:
-                # MySQL 尚在后台初始化，或补库进行中（v0.6.1 门控缓冲）：
-                # 实时消息先缓冲不落库，待初始化完成 / 补库全部写完后再统一补录
+            if not self._initialized or group_id in self._backfill_groups:
+                # MySQL 尚在后台初始化，或该群补库进行中（v0.6.1 消息触发式门控）：
+                # 实时消息先缓冲不落库，待初始化完成 / 该群补库全部写完后再统一补录
                 self._buffer_message(
                     group_id,
                     sender_id,
@@ -296,7 +297,7 @@ class MessageSaver:
 
         return all_ok
 
-    async def flush_pending(self, dedup: bool = False):
+    async def flush_pending(self, dedup: bool = False, group_id: str | None = None):
         """将缓冲的消息补录到 MySQL。
 
         默认路径（dedup=False，MySQL 初始化窗口调用）行为与 v0.6.0 完全一致：
@@ -305,11 +306,20 @@ class MessageSaver:
         message_id / 图片 URL，跳过补库已写入的整条记录、过滤已存在的图片 URL 后
         再落库，从数据面消除两条写路径的重复行（不建唯一索引）；空 message_id 的
         记录不去重、正常落库（v0.6.1 设计：空 id 消息只来自实时缓冲单源）。
+        group_id: 仅 flush 该群的缓冲记录（v0.6.1 按群门控）；None 全量 flush。
         """
         if not self._pending_records:
             return 0 if dedup else None
-        pending = list(self._pending_records)
-        self._pending_records.clear()
+        if group_id is not None:
+            pending = [r for r in self._pending_records if r["group_id"] == group_id]
+            remaining = [
+                r for r in self._pending_records if r["group_id"] != group_id
+            ]
+            self._pending_records.clear()
+            self._pending_records.extend(remaining)
+        else:
+            pending = list(self._pending_records)
+            self._pending_records.clear()
         ok = 0
 
         if not dedup:
