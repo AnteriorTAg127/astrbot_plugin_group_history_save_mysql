@@ -123,6 +123,7 @@ class ReloadBackfill:
                 return  # 无群号或该群本周期已补库（后续消息不重复触发）
             # 取这条消息的真实 message_seq 作补库起点
             seq = None
+            anchor_ts = None
             raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
             # 撤回/戳一戳等 notice 事件被适配器包装成群消息事件到达，非真实消息；
             # 忽略且不标记已补库，留待后续真实消息触发补库
@@ -130,6 +131,8 @@ class ReloadBackfill:
                 return
             if isinstance(raw, dict):
                 seq = raw.get("message_seq") or raw.get("seq")
+                # 激活消息时间戳：方向探测参照（判定协议端返回更旧还是更新消息）
+                anchor_ts = raw.get("time")
             if not isinstance(seq, int):
                 logger.warning(
                     "[HistorySave] 重载自动补库：群 %s 消息无 message_seq，"
@@ -152,7 +155,9 @@ class ReloadBackfill:
             )
             window_start = await self._compute_window_start()
             task = asyncio.create_task(
-                self._backfill_group(group_id, seq, window_start, round_cap, max_rounds)
+                self._backfill_group(
+                    group_id, seq, window_start, round_cap, max_rounds, anchor_ts
+                )
             )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -217,12 +222,23 @@ class ReloadBackfill:
         window_start,
         round_cap: int,
         max_rounds: int,
+        anchor_ts: int | float | None = None,
     ) -> dict:
         """对单个群执行补库：从 start_seq 往前翻页 → 解析 + 窗口过滤 → 排序 → 双去重 → 入库。
+
+        ``get_group_msg_history`` 的方向语义因协议端而异：NapCat 默认返回比锚点
+        seq 更新的消息，需 ``reverse_order=true`` 才返回更旧消息；go-cqhttp/
+        Lagrange 默认即返回更旧消息。round 1 先按标准语义（不传 reverse_order）
+        请求，用 ``anchor_ts`` 探测方向并固定 ``reverse_order``，此后按「更旧」
+        方向多轮翻页。每轮翻页锚点取本轮最旧（最小 time）消息的 seq——NapCat 的
+        message_seq 是 msgId 的哈希短 ID，不随消息时间单调，不能取最小值当最旧锚点。
 
         收尾链：外层 try/finally——翻页/入库写完后，finally 中
         ``saver.end_backfill(group_id)``（带去重 flush 该群缓冲新消息）→
         节流触发快照回填；取消/异常时 finally 仍执行（数据保全）。
+        Args:
+            anchor_ts: 触发补库的激活消息时间戳（unix 秒），方向探测参照；
+                None 时跳过探测（按标准语义不传 reverse_order）。
         Returns:
             dict: {"pulled", "inserted_text", "inserted_images", "skipped"}；
             pulled = 该群拉取并进入去重流程的总条数。
@@ -271,23 +287,34 @@ class ReloadBackfill:
                 return dict(_ZERO_COUNTS)
 
             # 2) 多轮翻页拉取原始消息（范式同 core/summary/onebot.py，内联实现）。
-            #    第 1 轮从触发消息的真实 seq 开始（NapCat 走 getMsgHistory 正式历史），
-            #    返回该 seq 之前的更旧消息；后续轮用本轮最旧 seq 继续往前翻。
+            #    第 1 轮从触发消息的真实 seq 开始，后续轮用本轮最旧（最小 time）消息的
+            #    seq 继续往前翻。方向语义：NapCat 的 get_group_msg_history 默认返回比
+            #    锚点更新的消息，需 reverse_order=true 才返回更旧消息；go-cqhttp/
+            #    Lagrange 默认即返回更旧消息。round 1 先按标准语义（不传 reverse_order）
+            #    请求，探测到取回的消息全部不早于激活消息时，切换 reverse_order=true
+            #    并重试本轮，此后方向固定。
             raw_messages: list = []
             seen_ids: set[str] = set()  # 跨轮 message_id 去重（翻页边界可能重叠）
             message_seq = start_seq
+            use_reverse_order: bool | None = None  # 方向语义；round 1 探测后固定
             window_start_unix = window_start.timestamp()  # 窗口提前终止判定用 unix 秒
-            for round_no in range(1, max_rounds + 1):
+            round_no = 0
+            while round_no < max_rounds:
+                round_no += 1
                 # 每轮请求条数 = min(单轮上限, 剩余上限)：总上限 = 单轮上限 × 最大轮数
                 request_count = min(round_cap, total_cap - len(raw_messages))
                 try:
+                    params = {
+                        "group_id": int(group_id),
+                        "message_seq": message_seq,
+                        "count": request_count,
+                    }
+                    # 标准语义（探测得 False）不显式传参，与旧版请求完全一致；
+                    # 仅 NapCat 语义（探测得 True）才需显式 reverse_order=true
+                    if use_reverse_order is True:
+                        params["reverse_order"] = True
                     resp = await asyncio.wait_for(
-                        client.api.call_action(
-                            "get_group_msg_history",
-                            group_id=int(group_id),
-                            message_seq=message_seq,
-                            count=request_count,
-                        ),
+                        client.api.call_action("get_group_msg_history", **params),
                         timeout=DEFAULT_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
@@ -318,8 +345,34 @@ class ReloadBackfill:
                 if not isinstance(messages, list) or not messages:
                     break
 
-                # 逐条收录原始消息 + 记录本轮最早 seq 供翻页 + 本轮最旧 time 供窗口提前终止
-                next_seq: int | None = None
+                # 方向语义探测（仅 round 1，未固定时）：标准协议端（go-cqhttp/
+                # Lagrange）默认返回比锚点更旧的消息；NapCat 默认返回更新的消息。
+                # 取回的消息全部不早于激活消息（anchor_ts）时，判定该端需
+                # reverse_order=true 才能取到旧消息，翻转后重试本轮（不收录消息）。
+                if use_reverse_order is None:
+                    if isinstance(anchor_ts, (int, float)) and not isinstance(
+                        anchor_ts, bool
+                    ):
+                        comparable_times = [
+                            m["time"]
+                            for m in messages
+                            if isinstance(m, dict)
+                            and isinstance(m.get("time"), (int, float))
+                            and not isinstance(m.get("time"), bool)
+                        ]
+                        if comparable_times and not any(
+                            t < anchor_ts for t in comparable_times
+                        ):
+                            use_reverse_order = True
+                            round_no -= 1  # 以修正后的方向重试本轮，不消耗轮次
+                            continue
+                    use_reverse_order = False
+
+                # 逐条收录原始消息 + 记录本轮最旧（最小 time）消息的 seq 供翻页 +
+                # 本轮最旧 time 供窗口提前终止。NapCat 的 message_seq 是 msgId 的
+                # 哈希短 ID，不随消息时间单调，不能取最小值当「最旧」锚点。
+                next_seq: int | None = None  # 本轮最旧（最小 time）消息的 seq
+                next_seq_fallback: int | None = None  # time 缺失时退化为最小 seq
                 round_min_time: float | None = None
                 round_raw: list[dict] = []  # 本轮新增消息（重叠边界比对用）
                 for raw in messages:
@@ -328,23 +381,28 @@ class ReloadBackfill:
                     seq = raw.get("message_seq")
                     if not isinstance(seq, int):
                         seq = raw.get("seq")
-                    if isinstance(seq, int) and (next_seq is None or seq < next_seq):
-                        next_seq = seq
+                    if isinstance(seq, int) and (
+                        next_seq_fallback is None or seq < next_seq_fallback
+                    ):
+                        next_seq_fallback = seq
                     t_raw = raw.get("time")
                     if isinstance(t_raw, (int, float)) and not isinstance(t_raw, bool):
                         if round_min_time is None or t_raw < round_min_time:
                             round_min_time = t_raw
+                            next_seq = seq if isinstance(seq, int) else None
                     msg_id = str(raw.get("message_id") or "")
                     if msg_id and msg_id in seen_ids:
                         continue
                     seen_ids.add(msg_id)
                     raw_messages.append(raw)
                     round_raw.append(raw)
+                if next_seq is None:
+                    next_seq = next_seq_fallback
 
                 # 终止条件：窗口提前终止 / 重叠边界停止 / 已凑满上限 / 短页（缓存到头）/
                 # 无 seq 无法翻页
                 if round_min_time is not None and round_min_time < window_start_unix:
-                    # 本轮最旧消息已在窗口外；页面按 seq 从新到旧，更旧的轮次必然也在窗口外
+                    # 本轮最旧消息已在窗口外；按时间向更旧翻页，更旧的轮次必然也在窗口外
                     break
                 if existing_ids or existing_contents:
                     # 重叠边界停止：本轮拉取的消息与已记录消息多数相同（按 message_id，

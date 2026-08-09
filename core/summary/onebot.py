@@ -15,6 +15,11 @@ action ``get_group_msg_history``，拉取指定群的近期历史消息，并逐
   ~200 条），故按 ``message_seq`` 从新到旧多轮翻页累计，直到凑满请求量 /
   协议端返回不足一轮（缓存到头）/ 达到轮数上限；每轮超量请求补偿下游过滤
   损耗。支持大 count 的协议端第一轮即因短页终止，行为等价单次调用。
+- **方向适配**：``get_group_msg_history`` 传入 ``message_seq`` 后的方向语义因
+  协议端而异——NapCat 默认返回比锚点**更新**的消息（翻页会退回同一页），仅
+  ``reverse_order=true`` 才返回更旧；go-cqhttp/Lagrange 默认即返回更旧。首个
+  ``message_seq`` 轮次先按标准语义请求，以第 1 轮最旧消息时间探测方向并固定
+  ``reverse_order``，确保多轮翻页真正向更旧方向累计。
 - **失败降级**：本模块不吞错也不崩溃插件——任何异常（超时、协议端 retcode
   非 0 抛出的 ActionFailed、连接异常、返回结构异常等）统一记录
   ``logger.warning("[HistorySummary] ...", exc_info=True)`` 后抛出
@@ -120,11 +125,18 @@ async def fetch_group_history(
     #    返回不足一轮（缓存到头）/ 达到轮数上限。各协议端对单次 count 上限的
     #    实现不一（有的支持一次返回上千条，有的硬限 ~200），翻页对两者皆兼容：
     #    支持大 count 的协议端第一轮即因短页终止，行为等价单次调用。
+    #    方向语义：NapCat 的 get_group_msg_history 传入 message_seq 后默认返回
+    #    比锚点更新的消息（翻页退回同一页），需 reverse_order=true 才返回更旧；
+    #    go-cqhttp/Lagrange 默认即返回更旧。首个 message_seq 轮次先按标准语义
+    #    请求，以 round 1 最旧消息 time 为参照探测方向并固定 reverse_order。
     result: list[ChatMessage] = []
     seen_ids: set[str] = set()  # 跨轮 message_id 去重（翻页边界可能返回重叠消息）
     message_seq = 0  # 0 = 从最新消息开始
-
-    for round_no in range(1, MAX_ROUNDS + 1):
+    use_reverse_order: bool | None = None  # 方向语义；首个 message_seq 轮次探测后固定
+    round1_oldest_time: float | None = None  # round 1 最旧消息 time，方向探测参照
+    round_no = 0
+    while round_no < MAX_ROUNDS:
+        round_no += 1
         remaining = target - len(result)
         if remaining <= 0:
             break
@@ -139,6 +151,10 @@ async def fetch_group_history(
             params = {"group_id": gid, "count": request_count}
             if message_seq:
                 params["message_seq"] = message_seq
+            # 标准语义（探测得 False）不显式传参；NapCat 语义（探测得 True）
+            # 才需 reverse_order=true 才能继续向更旧翻页
+            if use_reverse_order is True:
+                params["reverse_order"] = True
             resp = await asyncio.wait_for(
                 client.api.call_action("get_group_msg_history", **params),
                 timeout=DEFAULT_TIMEOUT,
@@ -190,17 +206,48 @@ async def fetch_group_history(
         if not isinstance(messages, list) or not messages:
             break
 
-        # 5) 逐条归一化 + 跨轮去重；同时记录本轮最早 message_seq 供翻页
-        #    （next_seq 基于含非文本消息的整轮计算，而非仅保留的文本消息）。
-        next_seq: int | None = None
+        # 方向语义探测（首个带 message_seq 的轮次）：标准协议端（go-cqhttp/
+        # Lagrange）默认返回比锚点更旧的消息；NapCat 默认返回更新的消息（翻页
+        # 退回同一页）。以 round 1 最旧消息 time 为参照——取回的消息含更旧 →
+        # 标准；仅含更新（无更旧）→ NapCat，翻转 reverse_order=true 重试本轮。
+        if use_reverse_order is None and message_seq and round1_oldest_time is not None:
+            comparable_times = [
+                m["time"]
+                for m in messages
+                if isinstance(m, dict)
+                and isinstance(m.get("time"), (int, float))
+                and not isinstance(m.get("time"), bool)
+            ]
+            if comparable_times:
+                if any(t > round1_oldest_time for t in comparable_times) and not any(
+                    t < round1_oldest_time for t in comparable_times
+                ):
+                    use_reverse_order = True
+                    round_no -= 1  # 以修正后的方向重试本轮，不消耗轮次
+                    continue
+                use_reverse_order = False
+
+        # 5) 逐条归一化 + 跨轮去重；同时记录本轮最旧（最小 time）消息的 seq 供
+        #    翻页（next_seq 基于含非文本消息的整轮计算，而非仅保留的文本消息）。
+        #    NapCat 的 message_seq 是 msgId 哈希短 ID，不随 time 单调，不能取最小值。
+        next_seq: int | None = None  # 本轮最旧（最小 time）消息的 seq
+        next_seq_fallback: int | None = None  # time 缺失时退化为最小 seq
+        round_oldest_time: float | None = None
         for raw in messages:
             if not isinstance(raw, dict):
                 continue
             seq = raw.get("message_seq")
             if not isinstance(seq, int):
                 seq = raw.get("seq")
-            if isinstance(seq, int) and (next_seq is None or seq < next_seq):
-                next_seq = seq
+            if isinstance(seq, int) and (
+                next_seq_fallback is None or seq < next_seq_fallback
+            ):
+                next_seq_fallback = seq
+            t_raw = raw.get("time")
+            if isinstance(t_raw, (int, float)) and not isinstance(t_raw, bool):
+                if round_oldest_time is None or t_raw < round_oldest_time:
+                    round_oldest_time = t_raw
+                    next_seq = seq if isinstance(seq, int) else None
             msg_id = str(raw.get("message_id") or "")
             if msg_id and msg_id in seen_ids:
                 continue
@@ -218,6 +265,10 @@ async def fetch_group_history(
             if msg_id:
                 seen_ids.add(msg_id)
             result.append(msg)
+        if next_seq is None:
+            next_seq = next_seq_fallback
+        if round_no == 1:
+            round1_oldest_time = round_oldest_time
 
         # 6) 终止条件：短页（到头）/ 已凑满 / 协议端未回 seq 无法翻页
         if len(messages) < request_count or len(result) >= target:
