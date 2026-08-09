@@ -124,6 +124,10 @@ class ReloadBackfill:
             # 取这条消息的真实 message_seq 作补库起点
             seq = None
             raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            # 撤回/戳一戳等 notice 事件被适配器包装成群消息事件到达，非真实消息；
+            # 忽略且不标记已补库，留待后续真实消息触发补库
+            if isinstance(raw, dict) and raw.get("post_type") not in (None, "message"):
+                return
             if isinstance(raw, dict):
                 seq = raw.get("message_seq") or raw.get("seq")
             if not isinstance(seq, int):
