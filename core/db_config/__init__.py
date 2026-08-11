@@ -8,6 +8,7 @@ groups/summary_settings/profile_settings/stats_settings/snapshots。
 from .base import ConfigManagerBase
 from .groups import GroupMixin
 from .profile_settings import ProfileSettingsMixin
+from .query_log import QueryLogMixin
 from .snapshots import SnapshotMixin
 from .stats_settings import StatsSettingsMixin
 from .summary_settings import SummarySettingsMixin
@@ -20,8 +21,9 @@ class ConfigManager(
     ProfileSettingsMixin,
     StatsSettingsMixin,
     SnapshotMixin,
+    QueryLogMixin,
 ):
-    """本地配置管理器（组装门面）：白名单 + 总结/人物/统计配置 + 快照。"""
+    """本地配置管理器（组装门面）：白名单 + 总结/人物/统计配置 + 快照 + 查询日志。"""
 
 
 __all__ = ["ConfigManager"]

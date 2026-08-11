@@ -1,7 +1,7 @@
 """MySQL 数据库操作层（v0.6.0 包化拆分）。
 
 主文件（base.py）负责连接池管理与最终访问；子功能文件按功能拆分
-chat_history/images/stats/maintenance。组装范式：Mixin 多继承出单一
+chat_history/images/stats/maintenance/query_log。组装范式：Mixin 多继承出单一
 公开类名 MySQLManager，对外调用零改动。
 """
 
@@ -20,7 +20,11 @@ from .stats import StatsMixin
 
 
 class MySQLManager(
-    MySQLManagerBase, ChatHistoryMixin, ImagesMixin, StatsMixin, MaintenanceMixin
+    MySQLManagerBase,
+    ChatHistoryMixin,
+    ImagesMixin,
+    StatsMixin,
+    MaintenanceMixin,
 ):
     """MySQL 操作门面（组装）：连接池 + 聊天记录 + 图片 + 统计 + 维护。"""
 

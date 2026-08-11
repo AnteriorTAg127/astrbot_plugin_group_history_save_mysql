@@ -1,4 +1,4 @@
-// 存储库分区：状态 / 群管理 / 设置 / 每日统计 / 查询 / 清空（加减法验证）
+// 存储库分区：状态 / 群管理 / 设置 / 每日统计 / 查询 / 查询日志（v0.7.0） / 清空（加减法验证）
 import { bridge, showToast, el, confirmDialog } from "./common.js";
 
 let currentPage = 1;
@@ -325,6 +325,147 @@ async function confirmPurge() {
     }
 }
 
+// ========== 查询日志（v0.7.0） ==========
+// 对外公共 API 的调用日志（core/db_config/query_log.py，内置 SQLite config.db），
+// 端点 GET query_log/list；默认最近 100 条（后端 page_size 默认 100，上限 200），
+// 分页 + 调用方/方法/时间筛选；保留天数经 query_log/settings 读写。
+let queryLogPage = 1;
+const queryLogPageSize = 100;
+// 渲染序号：快速切换筛选/分页时丢弃过期响应，防止旧数据覆盖新界面（data-analysis renderSeq 范式）
+let queryLogSeq = 0;
+
+// 加载保留天数设置（进入 tab 首次请求时顺带填充；失败静默，不阻断日志列表）
+async function loadQueryLogSettings() {
+    try {
+        const data = await bridge.apiGet("query_log/settings", { _t: Date.now() });
+        const input = document.getElementById("qlRetentionDays");
+        if (data && data.retention_days != null) input.value = data.retention_days;
+    } catch (e) {
+        document.getElementById("qlSettingsInfo").textContent = "读取设置失败: " + e.message;
+    }
+}
+
+// 保存保留天数设置：夹取 [1, 3650]（后端兜底夹取），成功后提示并刷新列表
+async function saveQueryLogSettings() {
+    const input = document.getElementById("qlRetentionDays");
+    const raw = parseInt(input.value, 10);
+    if (Number.isNaN(raw) || raw < 1) {
+        document.getElementById("qlSettingsInfo").textContent = "保留天数必须为 1–3650 的整数";
+        return;
+    }
+    const info = document.getElementById("qlSettingsInfo");
+    try {
+        const data = await bridge.apiPost("query_log/settings/save", { retention_days: raw });
+        if (data && data.success) {
+            info.textContent = `已保存：日志保留 ${data.retention_days} 天（新日志写入时按 5% 概率顺带清理）`;
+            loadQueryLog(queryLogPage); // 保留天数变化不影响列表，但刷新保持数据新鲜
+        } else {
+            info.textContent = "保存失败: " + (data && data.message ? data.message : "未知错误");
+        }
+    } catch (e) {
+        info.textContent = "保存失败: " + e.message;
+    }
+}
+
+async function loadQueryLog(page = 1) {
+    queryLogPage = page;
+    const seq = ++queryLogSeq;
+    // _t 时间戳：破除浏览器对 GET 查询响应的缓存（同 doQuery 范式）
+    const params = { page, page_size: queryLogPageSize, _t: Date.now() };
+
+    const caller = document.getElementById("qlCaller").value.trim();
+    const method = document.getElementById("qlMethod").value.trim();
+    const timeStart = document.getElementById("qlTimeStart").value;
+    const timeEnd = document.getElementById("qlTimeEnd").value;
+
+    // 空串不传（后端空串归一 None）；datetime-local 无秒，起止补秒对齐整分钟
+    if (caller) params.caller = caller;
+    if (method) params.method = method;
+    if (timeStart) params.time_start = timeStart.replace("T", " ") + ":00";
+    if (timeEnd) params.time_end = timeEnd.replace("T", " ") + ":59";
+
+    try {
+        // v0.2 教训：响应顶层 data 键会被插件页桥接解包剥层，列表键 records 直接可用
+        const data = await bridge.apiGet("query_log/list", params);
+        if (seq !== queryLogSeq) return; // 已有更新的查询，丢弃过期结果
+        // 首次进入（page=1）顺带加载保留天数设置（幂等，失败静默）
+        if (page === 1) await loadQueryLogSettings();
+        const total = data.total || 0;
+        const rows = data.records || [];
+
+        document.getElementById("qlInfo").textContent = `共 ${total} 条记录`;
+
+        const table = document.getElementById("qlTable");
+        const empty = document.getElementById("qlEmpty");
+        const tbody = document.getElementById("qlTableBody");
+
+        if (rows.length === 0) {
+            table.style.display = "none";
+            empty.style.display = "block";
+            document.getElementById("qlPagination").style.display = "none";
+            return;
+        }
+
+        empty.style.display = "none";
+        table.style.display = "table";
+        tbody.textContent = ""; // 清空旧行（textContent 而非 innerHTML，防注入一致）
+        for (const r of rows) tbody.appendChild(renderQueryLogRow(r));
+
+        const totalPages = Math.ceil(total / queryLogPageSize);
+        const pagination = document.getElementById("qlPagination");
+        pagination.style.display = totalPages > 1 ? "flex" : "none";
+        document.getElementById("qlPageInfo").textContent = `${page} / ${totalPages}`;
+        document.getElementById("qlPrevPage").disabled = page <= 1;
+        document.getElementById("qlNextPage").disabled = page >= totalPages;
+    } catch (e) {
+        if (seq !== queryLogSeq) return;
+        document.getElementById("qlInfo").textContent = "查询失败: " + e.message;
+    }
+}
+
+// 参数 JSON 摘要：截断约 80 字符（title 属性带全文，悬浮可见）
+function summarizeParams(raw) {
+    if (raw == null || raw === "") return "-";
+    const s = String(raw);
+    return s.length > 80 ? s.slice(0, 80) + "…" : s;
+}
+
+// 渲染单行：全部动态文本走 textContent / title 属性，杜绝 HTML 注入（XSS 防护）
+function renderQueryLogRow(r) {
+    const tr = document.createElement("tr");
+
+    const tdTime = document.createElement("td");
+    tdTime.textContent = r.created_at || "-";
+
+    const tdCaller = document.createElement("td");
+    tdCaller.textContent = r.caller || "-";
+
+    const tdMethod = document.createElement("td");
+    tdMethod.textContent = r.method || "-";
+
+    const paramsFull = r.params == null ? "" : String(r.params);
+    const tdParams = document.createElement("td");
+    tdParams.className = "ql-params-cell";
+    tdParams.textContent = summarizeParams(paramsFull);
+    tdParams.title = paramsFull; // 全文悬浮可见（title 由浏览器按纯文本渲染）
+
+    const tdCount = document.createElement("td");
+    tdCount.textContent = r.result_count ?? 0;
+
+    const tdCost = document.createElement("td");
+    tdCost.textContent = r.cost_ms != null ? `${r.cost_ms} ms` : "-";
+
+    // 状态：后端 success 存 TINYINT(1)，序列化后可能是 1/0 或 true/false
+    const ok = r.success === true || r.success === 1;
+    const tdStatus = document.createElement("td");
+    tdStatus.textContent = ok ? "✅" : "❌";
+    tdStatus.className = ok ? "ql-status-ok" : "ql-status-fail";
+    if (!ok && r.error_msg) tdStatus.title = String(r.error_msg); // 失败原因悬浮可见
+
+    tr.append(tdTime, tdCaller, tdMethod, tdParams, tdCount, tdCost, tdStatus);
+    return tr;
+}
+
 // ========== 事件绑定 ==========
 function bindStorageEvents() {
     document.getElementById("addGroupBtn").addEventListener("click", async () => {
@@ -401,6 +542,28 @@ function bindStorageEvents() {
     });
     document.getElementById("nextPage").addEventListener("click", () => doQuery(currentPage + 1));
 
+    // 查询日志（v0.7.0）：筛选提交 / 重置 / 分页，输入框 Enter 快捷提交
+    document.getElementById("qlQueryBtn").addEventListener("click", () => loadQueryLog(1));
+    document.getElementById("qlSaveSettingsBtn").addEventListener("click", () => saveQueryLogSettings());
+    document.getElementById("qlRetentionDays").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") saveQueryLogSettings();
+    });
+    document.getElementById("qlResetBtn").addEventListener("click", () => {
+        for (const id of ["qlCaller", "qlMethod", "qlTimeStart", "qlTimeEnd"]) {
+            document.getElementById(id).value = "";
+        }
+        loadQueryLog(1);
+    });
+    document.getElementById("qlPrevPage").addEventListener("click", () => {
+        if (queryLogPage > 1) loadQueryLog(queryLogPage - 1);
+    });
+    document.getElementById("qlNextPage").addEventListener("click", () => loadQueryLog(queryLogPage + 1));
+    for (const id of ["qlCaller", "qlMethod"]) {
+        document.getElementById(id).addEventListener("keydown", (e) => {
+            if (e.key === "Enter") loadQueryLog(1);
+        });
+    }
+
     // @ / 回复关联弹层关闭（关闭按钮 + 点击遮罩）
     const relatedMask = document.getElementById("relatedModal");
     if (relatedMask) {
@@ -417,6 +580,7 @@ export {
     loadSettings,
     loadDailyStats,
     doQuery,
+    loadQueryLog,
     openPurgeModal,
     confirmPurge,
     bindStorageEvents,

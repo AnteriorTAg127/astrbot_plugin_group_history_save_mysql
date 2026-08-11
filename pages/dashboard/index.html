@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.6.1">
+    <link rel="stylesheet" href="./style.css?v=0.7.0">
 </head>
 <body>
     <div class="app">
@@ -41,6 +41,7 @@
             <button class="tab active" data-tab="overview">概览</button>
             <button class="tab" data-tab="groups">群管理</button>
             <button class="tab" data-tab="query">查询</button>
+            <button class="tab" data-tab="query-log">查询日志</button>
             <button class="tab" data-tab="data-analysis">数据分析</button>
             <button class="tab" data-tab="settings">设置</button>
         </nav>
@@ -209,6 +210,82 @@
                     <button id="prevPage" class="btn btn-ghost">← 上一页</button>
                     <span id="pageInfo" class="page-info">1 / 1</span>
                     <button id="nextPage" class="btn btn-ghost">下一页 →</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 查询日志页（v0.7.0）：对外查询接口调用日志（公共 API 每次查询一条）。
+             筛选行 + 表格 + 分页，数据由 storage.js loadQueryLog 渲染（纯 textContent 防 XSS） -->
+        <section class="page" id="page-query-log">
+            <div class="section-card">
+                <div class="section-title"><span>📋 查询日志</span></div>
+                <!-- v0.7.0 保留天数设置：日志保留天数（天），保存后生效；
+                     过期日志在写入时按 5% 概率顺带清理 -->
+                <div class="query-filters ql-settings">
+                    <div class="filter-group">
+                        <label>保留天数</label>
+                        <input type="number" id="qlRetentionDays" min="1" max="3650" class="input input-sm">
+                    </div>
+                    <div class="filter-group filter-action">
+                        <div class="ql-actions">
+                            <button id="qlSaveSettingsBtn" class="btn btn-primary">保存</button>
+                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <span id="qlSettingsInfo" class="hint"></span>
+                    </div>
+                </div>
+                <div class="query-filters">
+                    <div class="filter-group">
+                        <label>调用方</label>
+                        <input type="text" id="qlCaller" placeholder="模糊匹配，留空全部" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>方法</label>
+                        <input type="text" id="qlMethod" placeholder="精确匹配，留空全部" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>开始时间</label>
+                        <input type="datetime-local" id="qlTimeStart" class="input">
+                    </div>
+                    <div class="filter-group">
+                        <label>结束时间</label>
+                        <input type="datetime-local" id="qlTimeEnd" class="input">
+                    </div>
+                    <div class="filter-group filter-action">
+                        <div class="ql-actions">
+                            <button id="qlQueryBtn" class="btn btn-primary">查询</button>
+                            <button id="qlResetBtn" class="btn btn-ghost">重置</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="query-meta">
+                    <span id="qlInfo"></span>
+                </div>
+                <div class="table-wrap">
+                    <table id="qlTable" class="table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>调用方</th>
+                                <th>方法</th>
+                                <th>参数</th>
+                                <th>结果条数</th>
+                                <th>耗时</th>
+                                <th>状态</th>
+                            </tr>
+                        </thead>
+                        <tbody id="qlTableBody"></tbody>
+                    </table>
+                    <div id="qlEmpty" class="empty-state" style="display:none;">
+                        <span class="empty-icon">📭</span>
+                        <p>暂无查询日志</p>
+                    </div>
+                </div>
+                <div class="pagination" id="qlPagination" style="display:none;">
+                    <button id="qlPrevPage" class="btn btn-ghost">← 上一页</button>
+                    <span id="qlPageInfo" class="page-info">1 / 1</span>
+                    <button id="qlNextPage" class="btn btn-ghost">下一页 →</button>
                 </div>
             </div>
         </section>
@@ -817,9 +894,9 @@
     <!-- marked 锁定主版本 @15（对齐 echarts@5 写法；v16 起包内不再提供根目录 marked.min.js） -->
     <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="./app.js?v=0.6.1"></script>
+    <script type="module" src="./app.js?v=0.7.0"></script>
     <!-- v0.5.0 数据分析 tab 模块（type=module 默认 defer，加载顺序与既有脚本一致；
          实际接线由 app.js import 驱动，重复引用按 ES Module 同 URL 去重、仅执行一次） -->
-    <script type="module" src="./data-analysis.js?v=0.6.1"></script>
+    <script type="module" src="./data-analysis.js?v=0.7.0"></script>
 </body>
 </html>

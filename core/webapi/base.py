@@ -213,6 +213,24 @@ class WebAPIBase:
             (f"/{PLUGIN_NAME}/clean", self.api_clean, ["POST"], "手动清理"),
             (f"/{PLUGIN_NAME}/query", self.api_query, ["GET"], "查询聊天记录"),
             (
+                f"/{PLUGIN_NAME}/query_log/list",
+                self.api_query_log_list,
+                ["GET"],
+                "查询日志列表",
+            ),
+            (
+                f"/{PLUGIN_NAME}/query_log/settings",
+                self.api_query_log_settings_get,
+                ["GET"],
+                "查询日志设置",
+            ),
+            (
+                f"/{PLUGIN_NAME}/query_log/settings/save",
+                self.api_query_log_settings_save,
+                ["POST"],
+                "保存查询日志设置",
+            ),
+            (
                 f"/{PLUGIN_NAME}/purge/challenge",
                 self.api_purge_challenge,
                 ["GET"],

@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.7.0] - 2026-08-11
+
+对外能力扩展版：新增**对外查询接口**——其他 AstrBot 插件可经
+`data.plugins.astrbot_plugin_group_history_save_mysql.core.public_api` 导入调用
+`query_records()` 查询聊天记录（多条件分页 + 回复关联，纯数据返回）；每次对外查询
+写入内置 SQLite `query_log` 表（调用方/方法/参数/结果条数/成败/耗时），保留天数
+Web 可调，Web 管理后台存储库分区新增「查询日志」tab 审计。无新增用户配置、无新增
+指令、无新增 pip 依赖。
+
+### Added
+
+- **对外查询接口**：`core/public_api.py` 提供 `query_records()`（group_id/sender_id/
+  时间/关键词多条件分页 + 回复目标消息关联）、`PublicAPIError` 受控异常、调用方标识
+  自动栈推断（也可显式传入）；导入无副作用、不暴露内部连接池等对象，参数化查询，
+  返回纯数据（timestamp 已字符串化）
+- **查询日志**：对外查询每次写入内置 SQLite `query_log` 表（caller/method/params JSON/
+  result_count/success/error_msg/cost_ms/created_at），成功与失败都记录；**保留天数 Web 可调**
+  （默认 30 天、范围 1–3650），写入时 5% 概率顺带清理过期行；`query_messages` 新增
+  `raise_on_error` 参数（默认行为不变，供对外接口精确感知失败）
+- **查询日志迁内置 SQLite**：查询日志与 MySQL 聊天记录存储解耦（`config.db` 的
+  `query_log`/`query_log_settings` 表，由 `ConfigManager` 管理）——MySQL 不可用时审计
+  仍可用；MySQL 侧旧 `query_log` 代码移除，残留表无害可手动 DROP
+- **Web「查询日志」tab**：存储库分区新增第 6 个子 tab——默认最近 100 条 + 分页 +
+  调用方模糊/方法精确/时间范围筛选，失败记录显示错误原因；仅记录对外接口发起的查询，
+  Web 后台自身与内部模块（总结/统计/补库）的查询不写日志
+
+### Added (v0.7.0 增量：消息统计接口)
+
+- **`count_messages()` 消息统计接口**：其他插件可导入调用获取文本消息计数——群总计
+  （`group_total`）+ 批量人统计（`senders[].{in_group, total}`，单群内发言数 + 跨群总数），
+  实时聚合 `chat_history` 表；支持单人（str）或批量（list ≤500）查询，时间区间过滤
+- **批量 + 高并发优化**：批量聚合为单条 `GROUP BY sender_id` SQL（无 N+1 循环查询），
+  群总计/群内/跨群三组计数 `asyncio.gather` 并行，COUNT 走复合索引
+  （idx_group_time / idx_group_sender_time / idx_sender_time）
+- **统计接口约定**：`group_id` 与 `sender_ids` 至少提供其一（避免全表扫描）；不含图片
+  统计；每次调用写查询日志（method=`count_messages`）；失败返回 `_error` 键与
+  `query_records` 同口径
+
+### Changed
+
+- `query_messages` 新增可选参数 `raise_on_error`（默认 `False`，既有调用方零改动）
+- MySQL 新增 `query_log` 表（幂等建表，无需迁移）
+
+### Fixed
+
+- 无（本版为功能新增）
+
 ## [0.6.1] - 2026-08-08
 
 v0.6.0 重载自动补库的缺陷修复版：修复补库多轮翻页死代码、插入顺序破坏 id 单调性、

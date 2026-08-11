@@ -184,7 +184,7 @@ class MySQLManagerBase:
         )
 
     async def _create_tables(self):
-        """创建聊天记录表和图片记录表（含索引）。"""
+        """创建聊天记录表、图片记录表和查询日志表（含索引）。"""
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
                 # 聊天记录表
@@ -228,6 +228,10 @@ class MySQLManagerBase:
                 """,
                     timeout=DDL_TIMEOUT_SECONDS,
                 )
+                # 查询日志表（v0.7.0 曾建于 MySQL，随后迁移至内置 SQLite
+                # config.db——查询日志属插件自身审计数据，与聊天记录存储
+                # 解耦，MySQL 不可用时审计仍可用；此表不再创建，旧库残留
+                # 的 query_log 表无害，可手动 DROP）
 
     async def _migrate_schema(self):
         """将旧表结构迁移到当前版本。

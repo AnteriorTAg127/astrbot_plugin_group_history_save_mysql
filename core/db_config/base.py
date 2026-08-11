@@ -123,6 +123,28 @@ class ConfigManagerBase:
                 enabled INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # v0.7.0：查询日志表（对外查询接口每次调用记录一条，供 Web 后台
+        # 「查询日志」tab 审计；由 db_config/query_log.py QueryLogMixin
+        # 读写，保留天数经 query_log_settings 配置、5% 概率顺带清理）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS query_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL DEFAULT '',
+                params TEXT,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 1,
+                error_msg TEXT,
+                cost_ms INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS query_log_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         # v0.5.0：图片统计小时级快照（群级全量），主键 (date, hour, group_id)。
         # 定时 UPSERT 覆盖写，解决 image_records 滚动清理后无法回溯统计
         await self.db.execute("""
@@ -236,6 +258,12 @@ class ConfigManagerBase:
         for key, value in self.STATS_DEFAULTS.items():
             await self.db.execute(
                 "INSERT OR IGNORE INTO stats_settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        # v0.7.0：查询日志保留天数配置播种（范式同上）
+        for key, value in self.QUERY_LOG_DEFAULTS.items():
+            await self.db.execute(
+                "INSERT OR IGNORE INTO query_log_settings (key, value) VALUES (?, ?)",
                 (key, value),
             )
         await self.db.commit()

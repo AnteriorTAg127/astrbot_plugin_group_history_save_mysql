@@ -5,6 +5,7 @@ get_messages_by_ids 逐字迁移；新增 get_existing_message_ids
 （供 v0.6.0 重载自动补库按 message_id 去重）。
 """
 
+import asyncio
 from datetime import datetime
 
 import aiomysql
@@ -88,6 +89,7 @@ class ChatHistoryMixin:
         keyword: str | None = None,
         page: int = 1,
         page_size: int = 50,
+        raise_on_error: bool = False,
     ) -> dict:
         """查询聊天记录（支持多条件过滤和分页）。
 
@@ -99,6 +101,9 @@ class ChatHistoryMixin:
             keyword: 关键词，模糊匹配 content 与 sender_name（可选）
             page: 页码（从 1 开始）
             page_size: 每页条数
+            raise_on_error: True 时查询异常直接向上抛出（v0.7.0 供对外
+                公共 API 精确感知失败并写失败日志）；默认 False 行为
+                不变（异常记日志后返回空结果）
 
         Returns:
             dict: {"total": int, "records": list[dict]}
@@ -162,6 +167,10 @@ class ChatHistoryMixin:
                         row["timestamp"] = str(row["timestamp"])
                     result["records"] = rows
         except Exception as e:
+            if raise_on_error:
+                # v0.7.0：对外公共 API 需要精确感知失败（写失败日志），
+                # 由调用方负责捕获；内部模块调用默认 False 行为不变
+                raise
             self._log_op_error("query_messages", "查询聊天记录", e)
         return result
 
@@ -259,9 +268,7 @@ class ChatHistoryMixin:
             self._log_op_error("get_all_group_ids", "查询有数据的群清单", e)
             return []
 
-    async def get_recent_messages(
-        self, group_id: str, limit: int
-    ) -> list[dict]:
+    async def get_recent_messages(self, group_id: str, limit: int) -> list[dict]:
         """按群取最近 limit 条已记录消息的 message_id 与 content（补库重叠边界检测用）。
 
         按 timestamp DESC（id DESC 兜底）取最新记录；content 供无 message_id
@@ -286,10 +293,130 @@ class ChatHistoryMixin:
                     )
                     rows = await cur.fetchall()
                     return [
-                        {"message_id": str(row[0]) if row[0] is not None else "",
-                         "content": str(row[1]) if row[1] is not None else ""}
+                        {
+                            "message_id": str(row[0]) if row[0] is not None else "",
+                            "content": str(row[1]) if row[1] is not None else "",
+                        }
                         for row in rows
                     ]
         except Exception as e:
             self._log_op_error("get_recent_messages", "查询最近消息重叠参照", e)
             return []
+
+    async def count_messages(
+        self,
+        group_id: str | None = None,
+        sender_ids: list[str] | None = None,
+        time_start: str | None = None,
+        time_end: str | None = None,
+    ) -> dict:
+        """文本消息计数（v0.7.0 对外统计接口数据层，批量 + 高并发优化）。
+
+        群总计（COUNT）+ 批量群内（GROUP BY sender_id）+ 批量跨群
+        （GROUP BY sender_id）三组计数并行执行；批量聚合为**单条 SQL**
+        （禁止 N+1 循环查询），IN 列表 ≤500 单块（对齐 get_existing_message_ids
+        范式），全参数化绑定；时间条件同 query_messages 范式。
+        索引利用：群总计走 idx_group_time、群内走 idx_group_sender_time、
+        跨群走 idx_sender_time。
+
+        注意：本方法异常**直接向上抛**（不吞）——仅对外公共 API
+        （public_api.count_messages）调用，由其统一捕获写失败日志。
+
+        Args:
+            group_id: 限定单群（可选，字符串形式）
+            sender_ids: 批量 QQ 号（可选，≤500；调用方已做上限校验）
+            time_start: 开始时间（格式 YYYY-MM-DD HH:MM:SS，闭区间）
+            time_end: 结束时间
+
+        Returns:
+            dict: {
+                "group_total": int,      # group_id 给定时该群文本消息总数
+                "senders": {             # sender_ids 给定时每人计数
+                    sid: {"in_group": int, "total": int},
+                    # in_group：该人在群内发言数（group_id 也给定时才有）；
+                    # total：该人跨群总发言数
+                },
+            }
+        """
+        # 时间条件（公共 WHERE 片段，参数化）
+        time_conds = []
+        time_params: list = []
+        if time_start:
+            time_conds.append("timestamp >= %s")
+            time_params.append(time_start)
+        if time_end:
+            time_conds.append("timestamp <= %s")
+            time_params.append(time_end)
+        time_where = " AND ".join(time_conds)
+        time_clause = f" AND {time_where}" if time_where else ""
+
+        # IN 占位符（sender_ids ≤500 单块；防御性分块对齐既有范式）
+        ids = [sid for sid in (sender_ids or []) if sid]
+        in_placeholders = ",".join(["%s"] * len(ids)) if ids else ""
+
+        async def _count_group_total() -> int:
+            """群总计：COUNT 走 idx_group_time。"""
+            sql = f"SELECT COUNT(*) FROM chat_history WHERE group_id = %s{time_clause}"
+            params = [group_id] + time_params
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._execute(cur, sql, params)
+                    row = await cur.fetchone()
+                    # 防御性 int 转换：不同驱动/游标类型可能返回 int/Decimal/str
+                    return int(row[0]) if row and row[0] is not None else 0
+
+        async def _count_senders_in_group() -> dict[str, int]:
+            """批量群内计数：GROUP BY 单条 SQL，走 idx_group_sender_time。"""
+            result: dict[str, int] = {}
+            sql = (
+                "SELECT sender_id, COUNT(*) FROM chat_history"
+                f" WHERE group_id = %s AND sender_id IN ({in_placeholders}){time_clause}"
+                " GROUP BY sender_id"
+            )
+            params = [group_id] + ids + time_params
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._execute(cur, sql, params)
+                    for row in await cur.fetchall():
+                        result[str(row[0])] = int(row[1])
+            return result
+
+        async def _count_senders_total() -> dict[str, int]:
+            """批量跨群计数：GROUP BY 单条 SQL，走 idx_sender_time。"""
+            result: dict[str, int] = {}
+            sql = (
+                "SELECT sender_id, COUNT(*) FROM chat_history"
+                f" WHERE sender_id IN ({in_placeholders}){time_clause}"
+                " GROUP BY sender_id"
+            )
+            params = ids + time_params
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._execute(cur, sql, params)
+                    for row in await cur.fetchall():
+                        result[str(row[0])] = int(row[1])
+            return result
+
+        # 三组计数并行执行（高并发下减少串行等待）
+        tasks = []
+        if group_id:
+            tasks.append(_count_group_total())
+        if ids:
+            tasks.append(_count_senders_in_group())
+            tasks.append(_count_senders_total())
+        results = await asyncio.gather(*tasks) if tasks else []
+
+        out: dict = {}
+        if group_id:
+            out["group_total"] = results.pop(0)
+        if ids:
+            in_group_map = results.pop(0)
+            total_map = results.pop(0)
+            out["senders"] = {
+                sid: {
+                    "in_group": in_group_map.get(sid, 0),
+                    "total": total_map.get(sid, 0),
+                }
+                for sid in ids
+            }
+        return out

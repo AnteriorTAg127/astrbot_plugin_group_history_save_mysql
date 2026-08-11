@@ -525,6 +525,20 @@ body {
 
 .page-info { font-size: 0.8rem; color: var(--text-3); }
 
+/* ===== 查询日志（v0.7.0） ===== */
+/* 筛选行动作区：查询 + 重置两按钮并排 */
+.ql-actions { display: flex; align-items: center; gap: 8px; }
+/* 参数列 JSON 摘要：超长截断 + title 全文悬浮（纯文本渲染，无注入面） */
+.ql-params-cell {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* 状态列 ✅/❌ 着色（走设计系统变量，深浅色自适应） */
+.ql-status-ok { color: var(--success); font-weight: 600; }
+.ql-status-fail { color: var(--danger); font-weight: 600; }
+
 /* ===== 设置 ===== */
 .settings-form { display: flex; flex-direction: column; gap: 20px; }
 
@@ -1856,3 +1870,7 @@ body {
 .da-time-input { width: 120px; font-variant-numeric: tabular-nums; }
 
 .da-weekday-select { min-width: 110px; }
+
+/* --- 查询日志（v0.7.0）：保留天数设置行 --- */
+.ql-settings { margin-bottom: 4px; }
+.ql-settings .hint { font-size: 0.85rem; color: var(--muted, #888); line-height: 32px; }

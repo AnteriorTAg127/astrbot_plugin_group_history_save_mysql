@@ -297,7 +297,9 @@ class MessageSaver:
 
         return all_ok
 
-    async def flush_pending(self, dedup: bool = False, group_id: str | None = None) -> int:
+    async def flush_pending(
+        self, dedup: bool = False, group_id: str | None = None
+    ) -> int:
         """将缓冲的消息补录到 MySQL。
 
         默认路径（dedup=False，MySQL 初始化窗口调用）行为与 v0.6.0 基本一致：
@@ -317,15 +319,14 @@ class MessageSaver:
             return 0
         if group_id is not None:
             pending = [r for r in self._pending_records if r["group_id"] == group_id]
-            remaining = [
-                r for r in self._pending_records if r["group_id"] != group_id
-            ]
+            remaining = [r for r in self._pending_records if r["group_id"] != group_id]
             self._pending_records.clear()
             self._pending_records.extend(remaining)
         else:
             pending = list(self._pending_records)
             self._pending_records.clear()
         ok = 0
+
         # 失败回写缓冲的辅助函数：左端追加保序，等待下次 flush 重试。
         # deque maxlen=5000，回写超出时自动丢弃最旧记录（已有溢出告警机制）。
         def _rebuffer(record: dict) -> None:

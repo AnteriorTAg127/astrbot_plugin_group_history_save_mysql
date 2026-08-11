@@ -8,15 +8,22 @@ storage/query/summary/profile/stats。组装范式：Mixin 多继承出单一
 from .base import WebAPIBase, _to_jsonable, make_challenge
 from .profile import ProfileMixin
 from .query import QueryMixin
+from .query_log import QueryLogMixin
 from .stats import StatsMixin
 from .storage import StorageMixin
 from .summary import SummaryMixin
 
 
 class WebAPI(
-    WebAPIBase, StorageMixin, QueryMixin, SummaryMixin, ProfileMixin, StatsMixin
+    WebAPIBase,
+    StorageMixin,
+    QueryMixin,
+    QueryLogMixin,
+    SummaryMixin,
+    ProfileMixin,
+    StatsMixin,
 ):
-    """Web API 门面（组装）：存储库 + 查询 + 总结 + 人物 + 统计。"""
+    """Web API 门面（组装）：存储库 + 查询 + 查询日志 + 总结 + 人物 + 统计。"""
 
 
 __all__ = ["WebAPI", "make_challenge", "_to_jsonable"]

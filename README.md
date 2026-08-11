@@ -1,6 +1,6 @@
 # astrbot_plugin_group_history_save_mysql
 
-将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构。
+将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构；v0.7 新增对外查询接口（其他插件可导入调用本插件查询聊天记录）与查询日志（Web 后台可审计所有对外查询）。
 
 ## 功能
 
@@ -22,6 +22,8 @@
 - 🔀 备用模型列表弹窗（v0.3.2 新增）：原长复选框改为点击弹窗，降级顺序可拖拽排序、可选模型滚动勾选，点遮罩不关闭
 - 👤 人物分析（v0.4.0 新增）：聊天指令 `/人物分析 [@成员 或 QQ号]`（别名 `/人物画像`、`/分析TA`），分析群成员发言习惯、活动时间、性格、爱好与人物关系
 - 🌐 跨群分析（v0.4.0 新增）：仅 Web 后台「人物分析」分区提供（按全体已保存群分析），聊天指令仅分析当前群
+- 🔌 对外查询接口（v0.7.0 新增）：其他插件经 `data.plugins.astrbot_plugin_group_history_save_mysql.core.public_api` 导入调用 `query_records()` 查询聊天记录（多条件分页 + 回复关联，纯数据返回）与 `count_messages()` 消息统计（群总计 + 批量人统计，GROUP BY 聚合支持高并发）；导入无副作用、不暴露内部对象
+- 📋 查询日志（v0.7.0 新增）：每次对外查询写入内置 SQLite（config.db 的 `query_log` 表，与 MySQL 解耦，MySQL 不可用时审计仍可用）；保留天数 Web 可调（默认 30 天）；Web 后台存储库分区新增「查询日志」tab 审计
 - 🧩 分析触发（v0.4.0 新增）：支持 @ 成员或直接输入 QQ 号触发；默认仅管理员可用（可配置）；分析报告含「本报告基于公开群聊记录由 AI 生成，仅为推测，仅供参考」免责声明
 - 💾 存储扩展（v0.4.0 新增）：`chat_history` 表新增 `at_list` / `reply_id` 列（自动迁移），记录 @ 对象与回复目标，供人物关系分析使用
 - 📈 数据分析（v0.5.0 新增）：Web 后台存储库分区新增「数据分析」tab，实时 SQL 聚合（不调 LLM、不缓存、不落盘）——统计卡片、每日趋势、发言人/群排行、24h·星期发言规律、个人 × 群交叉查询，支持「全部群」汇总与自定义日期区间
@@ -142,6 +144,7 @@ SHOW TABLES;
 - **设置**：图片保留天数配置；重载自动补库开关与时长（v0.6.0 新增）
 - **统计**：最近 7 天每日存储量（v0.5.5 起改由快照供数，图片表滚动清理不再影响趋势）
 - **查询**：按关键词（内容/昵称）、群号、QQ号、时间组合查询聊天记录
+- **查询日志**（v0.7.0 新增）：对外查询接口的调用审计（存内置 SQLite），默认最近 100 条，可按调用方/方法/时间筛选、分页查看；顶部可调整保留天数（默认 30 天，范围 1–3650）
 - **数据维护**：手动清理过期图片；一键清空所有数据（需通过随机加减法验证，题目由后端生成、一次性有效）
 - **总结设置**（v0.3 新增）：总结功能全部 24 项配置的分组表单（基础与白名单 / 参数上限 / 总结行为 / 存储 / 图片渲染）、总结专用 LLM 提供商下拉、提示词模板多行编辑与一键恢复默认
 - **忽略管理**（v0.3 新增）：按群增删查忽略发送者，被忽略者的消息不参与总结
@@ -155,6 +158,38 @@ SHOW TABLES;
   - **统计卡片**：总消息数、活跃成员数、图片数（来自快照表）、活跃时段峰值
   - **图表与排行**：每日趋势、发言人排行（Top N 附图片数，点击成员进入个人 × 群交叉视图）、群排行（仅「全部群」视图展示）、24h·星期发言规律图表（群 / 选定个人双维度）
   - **推送设置区**：各白名单群的群级推送开关 + 日报/周报全局配置（开关 / 推送时间 / 周报星期）
+
+## 其他插件调用（v0.7.0 新增）
+
+> 完整使用文档见 **[PUBLIC_API.md](PUBLIC_API.md)**（函数签名、返回值结构、示例代码、异常处理、常见问题）。
+
+本插件向同实例内的其他 AstrBot 插件提供聊天记录查询接口，供其编程调用（如统计、检索、自动化等场景）：
+
+```python
+from data.plugins.astrbot_plugin_group_history_save_mysql.core.public_api import query_records
+
+result = await query_records(
+    caller="my_plugin",      # 可选：调用方标识；缺省自动从调用栈推断
+    group_id="123456789",    # 可选：群号过滤
+    sender_id=None,          # 可选：QQ 号过滤
+    time_start=None,         # 可选：开始时间 YYYY-MM-DD HH:MM:SS
+    time_end=None,           # 可选：结束时间
+    keyword=None,            # 可选：关键词（匹配内容与昵称）
+    page=1,
+    page_size=50,            # 夹取 [1, 200]
+)
+# result = {"total": int, "records": [...]}
+# records 每条含 id/timestamp/group_id/sender_id/sender_name/message_type/
+# content/message_id/at_list/reply_id/reply_message（回复目标消息，取不到为 None）
+```
+
+注意事项：
+
+- **每次调用都会写入查询日志**（Web 后台「查询日志」tab 可查看），请勿高频无意义调用
+- 本插件 **MySQL 尚未初始化完成**或**时间参数格式非法**时调用会抛 `PublicAPIError`，调用方应捕获处理；查询本身失败不抛异常，返回 `{"total": 0, "records": [], "_error": "..."}`（`"_error" in result` 可区分失败与真实无数据，失败细节见查询日志）
+- 返回为**纯数据**（timestamp 已字符串化），无数据库行对象/连接对象
+- 调用方需与本插件**同进程**（AstrBot 单进程运行，天然满足）；通过 PEP 420 namespace package 导入，无需安装额外依赖
+- 仅聊天记录查询（多条件分页 + 回复关联）；统计/人物分析等能力不在此接口范围内
 
 ## 总结功能配置说明（v0.3 新增）
 
@@ -336,8 +371,10 @@ core/
 │   ├── base.py                  #   MySQLManagerBase 核心初始化/执行/迁移
 │   ├── chat_history.py          #   消息表读写 + message_id 批量查重
 │   ├── images.py                #   图片表读写 + 图片 URL 批量查重
+│   ├── query_log.py             #   查询日志读写（v0.7.0）
 │   ├── stats.py                 #   统计聚合查询
 │   └── maintenance.py           #   清空数据维护
+├── public_api.py                #   对外查询接口（v0.7.0，其他插件导入调用）
 ├── db_config/                   # 本地配置包（SQLite config.db）
 │   ├── base.py                  #   ConfigManagerBase 建表/默认值/读写
 │   ├── groups.py                #   群白名单管理
@@ -349,6 +386,7 @@ core/
 │   ├── base.py                  #   WebAPIBase 路由表注册 + 公共 helper
 │   ├── storage.py               #   状态/群管理/设置/清空
 │   ├── query.py                 #   消息查询
+│   ├── query_log.py             #   查询日志列表（v0.7.0）
 │   ├── summary.py               #   总结设置/忽略/历史
 │   ├── profile.py               #   人物分析设置/发起/历史
 │   └── stats.py                 #   数据分析数据/设置/推送
@@ -418,6 +456,27 @@ core/
 
 > 群号与 QQ 号均以文本（`VARCHAR(32)`）存储。从 v0.1 升级时插件会自动检测旧表并执行
 > `ALTER TABLE` 迁移（数字自动转字符串、`image_records` 自动补 `sender_name` 列），无需手动操作。
+
+### config.db 新增表（v0.7.0 新增）：query_log（查询日志，内置 SQLite）
+
+> 查询日志存于本地 SQLite（`data/plugin_data/astrbot_plugin_group_history_save_mysql/config.db`），
+> 与 MySQL 聊天记录存储解耦——MySQL 不可用时审计仍可用。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER | 主键（自增） |
+| caller | TEXT | 调用方标识（显式传入或自动推断） |
+| method | TEXT | 调用的方法名（如 query_records） |
+| params | TEXT | 查询参数 JSON（不含消息内容全文与密钥） |
+| result_count | INTEGER | 返回记录条数 |
+| success | INTEGER | 1=成功 0=失败 |
+| error_msg | TEXT | 失败原因（成功为 NULL，无堆栈） |
+| cost_ms | INTEGER | 查询耗时（毫秒） |
+| created_at | TEXT | 调用时间（ISO 文本 YYYY-MM-DD HH:MM:SS） |
+
+> 仅记录**经对外接口（`core/public_api.py`）**发起的查询；Web 后台自身与内部模块（总结/统计/补库）的查询不记录。
+> 保留天数经 `query_log_settings` 表配置（Web 可调，默认 30 天、范围 1–3650），写入时按 5% 概率顺带清理过期行。
+> 早期 v0.7.0 曾建于 MySQL 的 `query_log` 表已废弃，旧库残留表无害，可手动 DROP。
 
 ### chat_history（聊天记录）
 

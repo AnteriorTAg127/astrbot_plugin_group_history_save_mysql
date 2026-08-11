@@ -3,7 +3,7 @@
 // summary-ignore.js（忽略管理）/ summary-history.js（历史总结）/
 // profile-settings.js / profile-launch.js / profile-history.js（v0.4.0 人物分析）/
 // data-analysis.js（v0.5.0 数据分析）
-import { loadStatus, loadGroups, loadSettings, loadDailyStats, bindStorageEvents } from "./storage.js";
+import { loadStatus, loadGroups, loadSettings, loadDailyStats, loadQueryLog, bindStorageEvents } from "./storage.js";
 import { loadSummarySettings, bindSummarySettingsEvents } from "./summary-settings.js";
 import { loadIgnoreGroups, bindIgnoreEvents } from "./summary-ignore.js";
 import { loadSummaryHistory, bindHistoryEvents } from "./summary-history.js";
@@ -24,6 +24,8 @@ const TAB_LAZY_LOAD = {
     "profile-history": () => loadProfileHistory(1),
     // v0.5.0：数据分析 tab 惰性加载（进入才首次请求 stats/data 与推送设置）
     "data-analysis": () => loadDataAnalysis(),
+    // v0.7.0：查询日志 tab 惰性加载（进入才首次请求 query_log/list，默认最近 100 条）
+    "query-log": () => loadQueryLog(1),
 };
 
 // v0.5.0：每次进入 tab 都会触发的钩子（区别于上方仅首次的惰性加载）；

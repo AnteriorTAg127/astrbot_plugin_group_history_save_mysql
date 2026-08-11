@@ -215,6 +215,7 @@ __marimo__/
 /.trae 
 CLAUDE.md
 /.reasonix
+reasonix.toml
 
 # OS files
 .DS_Store

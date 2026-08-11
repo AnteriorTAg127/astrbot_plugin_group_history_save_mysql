@@ -20,6 +20,7 @@ from .core.db_mysql import MySQLManager
 from .core.parsing import stats_fallback_text
 from .core.profile.capture import extract_at_targets
 from .core.profile.service import ProfileService
+from .core.public_api import register_config_manager, register_mysql_manager
 from .core.saver import MessageSaver
 from .core.stats import StatsBuildError, StatsService
 from .core.stats.models import StatsQuery
@@ -36,7 +37,7 @@ MAX_INIT_ATTEMPTS = 5
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
-    "0.6.1",
+    "0.7.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -62,8 +63,15 @@ class GroupHistoryPlugin(Star):
             pool_ping_cooldown=cfg.get("pool_ping_cooldown", 5),
         )
 
+        # v0.7.0 对外公共 API 注册：构造 MySQLManager 后立即注册（构造无 I/O，
+        # 注册即时生效；MySQL 未连接时对外查询自然失败并记查询日志）
+        register_mysql_manager(self.mysql_mgr)
+
         # 初始化本地配置管理器
         self.config_mgr = ConfigManager()
+        # v0.7.0 查询日志存储注册：查询日志写内置 SQLite（config.db），
+        # 由 ConfigManager 管理；构造后立即注册（未注册时日志仅 warning 降级）
+        register_config_manager(self.config_mgr)
 
         # 初始化图片清理器
         self.cleaner = ImageCleaner(self.mysql_mgr, self.config_mgr)
@@ -459,6 +467,11 @@ class GroupHistoryPlugin(Star):
 
     async def terminate(self):
         """插件卸载/停用时清理资源。"""
+        # v0.7.0 对外公共 API 先注销：插件开始终止后，调用方（含持有旧函数
+        # 引用的插件）的对外查询立即抛 PublicAPIError，而非访问已关闭连接池
+        # 静默失败（详见 PUBLIC_API.md FAQ）；MySQL 与查询日志存储一并注销
+        register_mysql_manager(None)
+        register_config_manager(None)
         # 取消后台初始化任务（若仍在重试中）
         if self._init_task and not self._init_task.done():
             self._init_task.cancel()
