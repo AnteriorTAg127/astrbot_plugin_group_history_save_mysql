@@ -1,4 +1,4 @@
-"""按群消息触发的自动补库服务（v0.6.1 重构）。
+"""按群消息触发的自动补库服务（v0.8.0 重构窗口）。
 
 插件重启后，某个群的第一条新消息到达时触发该群补库：用这条消息自带的真实
 ``message_seq`` 作 ``get_group_msg_history`` 起点，从它往前拉停机窗口的缺口
@@ -9,7 +9,13 @@
 - **触发**：``maybe_trigger(event)`` 由主插件 ``on_group_message`` 调用，
   幂等（每群一次）；MySQL 未就绪时不触发（后续消息再试）。
 - **起点 seq**：用触发消息的真实 message_seq，协议端返回该 seq 之前的正式历史，
-  正好覆盖停机窗口缺口（该消息本身由实时路径经缓冲 flush 入库）。
+  正好覆盖窗口缺口（该消息本身由实时路径经缓冲 flush 入库）。
+- **窗口**：以该群**最后一条已记录消息的时间 − 5 分钟重叠**为起点，只补
+  已记录边界之后的缺口；群无记录回退 ``now - backfill_hours``。比 v0.6.1 用
+  ``last_terminate_time``（插件卸载时刻）更贴近真实数据缺口——卸载时间并不代表
+  该群数据完整性到该时刻（曾导致快速重载把窗口压到近零、真实大缺口补不上）。
+  ``force_backfill()`` 供 ``/补库`` 管理员指令调用：可指定 hours 用 ``now - hours``，
+  绕过「每群每重启一次」限制。
 - **去重**：message_id / 图片 URL 双维；重叠边界停止（预加载最近已记录消息比对）。
 - **取消安全**：``stop()`` 取消所有在跑任务，各任务 finally 仍执行
   ``saver.end_backfill(group_id)`` 带去重 flush（数据保全）。
@@ -35,9 +41,10 @@ BACKFILL_OVERLAP_THRESHOLD = (
 )
 ROUND_DELAY_SECONDS = 0.3  # 轮间延迟（秒），规避协议端限频
 DEFAULT_TIMEOUT = 15  # 协议端调用超时（秒）
-BACKFILL_HOURS_DEFAULT = 12  # 默认窗口小时数
+BACKFILL_HOURS_DEFAULT = 12  # 默认窗口小时数（无记录群回退用 / force 指令不传 hours 时）
 BACKFILL_HOURS_MIN = 1  # 窗口下限
 BACKFILL_HOURS_MAX = 168  # 窗口上限（7 天）
+BACKFILL_OVERLAP_MINUTES = 5  # 最后记录时间往前偏移的重叠量（分钟），兜住时间口径小偏差与边界漏拉
 SNAPSHOT_BACKFILL_THROTTLE = 60  # 快照回填节流秒数（连续多群补库只触发一次）
 
 _ZERO_COUNTS = {
@@ -117,7 +124,8 @@ def _fmt_round_max_time(messages: list) -> str:
 
 
 class ReloadBackfill:
-    """按群消息触发的自动补库服务：MySQL 就绪后，群首条消息到达时补该群停机缺口。"""
+    """按群消息触发的自动补库服务：MySQL 就绪后，群首条消息到达时补该群
+    已记录边界之后的缺口（窗口起点 = 最后记录时间 − 5 分钟）。"""
 
     def __init__(self, context, mysql_mgr, config_mgr, saver=None, stats_service=None):
         self.context = context
@@ -126,6 +134,7 @@ class ReloadBackfill:
         self.saver = saver  # MessageSaver（补库门控缓冲；None 时 begin/end 防御性跳过）
         self.stats_service = stats_service  # StatsService（快照回填收尾链）
         self._backfilled_groups: set[str] = set()  # 本重启周期已补库的群（每群一次）
+        self._active_groups: set[str] = set()  # 正在跑补库的群（防自动触发与 force 指令并发重复跑）
         self._tasks: set[asyncio.Task] = set()  # 在跑补库任务
         self._last_snapshot_ts = 0.0  # 快照回填节流时间戳（monotonic 秒）
 
@@ -135,7 +144,8 @@ class ReloadBackfill:
         触发后该群进入 MessageSaver 门控（新消息缓冲），补库完成后带去重 flush
         并节流触发快照回填。MySQL 未就绪时跳过本次（后续消息再试，不标记已补库）。
         补库 round 1 走协议端最新视图（不传 message_seq），天然覆盖激活消息与其前
-        的停机缺口；``message_seq`` 仅在最新视图为空时回退作翻页起点。
+        的窗口缺口；``message_seq`` 仅在最新视图为空时回退作翻页起点。
+        窗口起点取该群最后一条已记录消息时间 − 重叠量（无记录回退 backfill_hours）。
         """
         if self.saver is None or not self.saver.is_initialized:
             return
@@ -161,6 +171,8 @@ class ReloadBackfill:
                 self._backfilled_groups.add(group_id)  # 标记避免每次消息都尝试
                 return
             self._backfilled_groups.add(group_id)  # 防重入
+            if group_id in self._active_groups:
+                return  # 该群已有补库任务在跑（force 指令等），本次不再重复触发
             if self.saver is not None:
                 self.saver.begin_backfill(group_id)
             round_cap = await self._read_int_setting(
@@ -172,12 +184,18 @@ class ReloadBackfill:
                 MAX_ROUNDS_MIN,
                 MAX_ROUNDS_MAX,
             )
-            window_start = await self._compute_window_start()
+            window_start = await self._compute_window_start(group_id)
+            self._active_groups.add(group_id)
             task = asyncio.create_task(
                 self._backfill_group(group_id, seq, window_start, round_cap, max_rounds)
             )
             self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+
+            def _on_done(t: asyncio.Task):
+                self._tasks.discard(t)
+                self._active_groups.discard(group_id)
+
+            task.add_done_callback(_on_done)
             logger.info(
                 "[HistorySave] 重载自动补库：群 %s 首条消息触发（起点 seq=%s，"
                 "窗口 %s，单轮 %d 条，最多 %d 轮）",
@@ -192,24 +210,102 @@ class ReloadBackfill:
         except Exception:
             logger.error("[HistorySave] 重载自动补库触发失败", exc_info=True)
 
-    async def _compute_window_start(self) -> datetime:
-        """计算补库窗口起点：max(上次卸载时间, now - backfill_hours)，无记录回退 hours。"""
+    async def _compute_window_start(
+        self, group_id: str | None = None, hours: int | None = None
+    ) -> datetime:
+        """计算补库窗口起点（补该群已记录边界之后的缺口）。
+
+        优先级：
+        1. force 指令显式传 ``hours``：``now - hours``（强制回补指定时长）；
+        2. 该群有已记录消息：``最后一条已记录时间 - BACKFILL_OVERLAP_MINUTES``
+           （只补最后一条已知记录之后的缺口，重叠量兜住时间口径小偏差）；
+        3. 群无记录 / 读取失败：回退 ``now - backfill_hours``（品牌新群尽量多拉）。
+        不再依赖 v0.6.1 的 ``last_terminate_time``（插件卸载时刻 ≠ 该群数据完整
+        到该时刻，快速重载会把窗口压到近零导致真实大缺口补不上）。
+        """
+        if hours is not None:
+            hours = max(BACKFILL_HOURS_MIN, min(BACKFILL_HOURS_MAX, hours))
+            return datetime.now() - timedelta(hours=hours)
+        if group_id:
+            try:
+                last_rec = await self.mysql_mgr.get_last_message_time(group_id)
+            except Exception:
+                last_rec = None  # 读取失败按无记录回退，不阻断补库
+            if last_rec is not None:
+                window_start = last_rec - timedelta(minutes=BACKFILL_OVERLAP_MINUTES)
+                # 防御：异常未来时间戳（时钟偏移）不应把窗口推到未来
+                if window_start > datetime.now():
+                    window_start = datetime.now()
+                return window_start
         try:
             hours = int(await self.config_mgr.get_setting("backfill_hours", "12"))
         except (ValueError, TypeError):
             hours = BACKFILL_HOURS_DEFAULT
         hours = max(BACKFILL_HOURS_MIN, min(BACKFILL_HOURS_MAX, hours))
-        window_start = datetime.now() - timedelta(hours=hours)
+        return datetime.now() - timedelta(hours=hours)
+
+    async def force_backfill(self, group_id, hours: int | None = None) -> bool:
+        """管理员指令触发的强制补库：对指定群立即补一次，绕过「每群每重启一次」。
+
+        与自动触发共用同一补库流程：门控缓冲 → 多轮拉取 → 窗口过滤 → 双去重 →
+        入库 → 收尾链（带去重 flush + 节流快照回填）。窗口默认按「该群最后记录
+        时间 − 5 分钟」（无记录回退 backfill_hours）；显式传 ``hours`` 用
+        ``now - hours`` 强制回补指定时长。
+
+        Args:
+            group_id: 目标群号（int/str 均可）
+            hours: 可选强制窗口小时数（夹取 [1,168]）；None 用默认窗口逻辑
+
+        Returns:
+            bool: True=任务已创建；False=存储未就绪或该群补库已在跑（不重复）
+        """
+        group_id = str(group_id)
+        if self.saver is None or not self.saver.is_initialized:
+            return False
+        if group_id in self._active_groups:
+            logger.warning(
+                "[HistorySave] 强制补库：群 %s 补库已在执行，跳过本次",
+                group_id,
+            )
+            return False
         try:
-            last_ts_raw = (
-                await self.config_mgr.get_setting("last_terminate_time", "")
-            ).strip()
-            if last_ts_raw:
-                last_dt = datetime.fromtimestamp(int(float(last_ts_raw)))
-                window_start = max(window_start, last_dt)
-        except (ValueError, TypeError, OSError, OverflowError):
-            pass
-        return window_start
+            if self.saver is not None:
+                self.saver.begin_backfill(group_id)
+            round_cap = await self._read_int_setting(
+                "backfill_round_cap", DEFAULT_ROUND_CAP, ROUND_CAP_MIN, ROUND_CAP_MAX
+            )
+            max_rounds = await self._read_int_setting(
+                "backfill_max_rounds",
+                DEFAULT_MAX_ROUNDS,
+                MAX_ROUNDS_MIN,
+                MAX_ROUNDS_MAX,
+            )
+            window_start = await self._compute_window_start(group_id, hours=hours)
+            self._active_groups.add(group_id)
+            task = asyncio.create_task(
+                self._backfill_group(group_id, 0, window_start, round_cap, max_rounds)
+            )
+            self._tasks.add(task)
+
+            def _on_done(t: asyncio.Task):
+                self._tasks.discard(t)
+                self._active_groups.discard(group_id)
+
+            task.add_done_callback(_on_done)
+            logger.info(
+                "[HistorySave] 强制补库：群 %s 已启动（窗口 %s%s，单轮 %d 条，最多 %d 轮）",
+                group_id,
+                window_start.strftime("%Y-%m-%d %H:%M:%S"),
+                f"，回首 {hours}h" if hours is not None else "（按最后记录-5min）",
+                round_cap,
+                max_rounds,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("[HistorySave] 强制补库启动失败", exc_info=True)
+            return False
 
     async def _read_int_setting(self, key: str, default: int, lo: int, hi: int) -> int:
         """读取整数插件设置并夹取到 [lo, hi]；读取/转换失败回退 default。"""
@@ -227,18 +323,24 @@ class ReloadBackfill:
         """
         tasks = list(self._tasks)
         self._tasks.clear()
+        if not tasks:
+            return
+        # 先让尚未被事件循环调度过的任务跑起来：直接 cancel 一个从未启动的 Task 会
+        # 丢弃整条协程、其 try/finally 不执行（该群门控不解除、缓冲不 flush → 数据
+        # 丢失）。yield 一次事件循环后，每个任务至少已运行到首个真实 await（收尾链
+        # finally 已武装），此时再 cancel 才能触发 finally 走 end_backfill。
+        await asyncio.sleep(0)
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _backfill_group(
         self,
         group_id: str,
-        start_seq: int,
-        window_start,
-        round_cap: int,
-        max_rounds: int,
+        start_seq: int | None = None,
+        window_start=None,
+        round_cap: int = DEFAULT_ROUND_CAP,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
     ) -> dict:
         """对单个群执行补库：多轮翻页拉取 → 解析 + 窗口过滤 → 排序 → 双去重 → 入库。
 
@@ -246,7 +348,7 @@ class ReloadBackfill:
         默认返回比锚点**更新**的消息（曾导致只拉到激活消息 1 条），需
         ``reverse_order=true`` 才返回更旧；go-cqhttp/Lagrange 默认即返回更旧。为规避
         该偏差，round 1 不传 message_seq（协议端按最新视图返回最新 count 条，天然包含
-        激活消息与停机缺口）；后续轮用本轮最旧（最小 time）消息的 seq 向更旧翻页，
+        激活消息与窗口缺口）；后续轮用本轮最旧（最小 time）消息的 seq 向更旧翻页，
         首个 message_seq 轮次以 round 1 最旧消息 time 为参照探测方向并固定
         ``reverse_order``。每轮翻页锚点取本轮最旧（最小 time）消息的 seq——NapCat 的
         message_seq 是 msgId 的哈希短 ID，不随消息时间单调，不能取最小值当最旧锚点。
@@ -255,8 +357,12 @@ class ReloadBackfill:
         ``saver.end_backfill(group_id)``（带去重 flush 该群缓冲新消息）→
         节流触发快照回填；取消/异常时 finally 仍执行（数据保全）。
         Args:
-            start_seq: 激活消息的 message_seq；round 1 最新视图为空（冷缓存）时
-                回退作翻页起点。
+            start_seq: 激活消息的 message_seq（自动触发传入）；round 1 最新视图为空
+                （冷缓存）时回退作翻页起点。强制补库（force_backfill）传 None/0，
+                最新视图为空则止步不翻页。
+            window_start: 窗口起点（datetime，含 = 需补的最早消息边界）。
+            round_cap: 单轮请求条数上限。
+            max_rounds: 最大翻页轮数。
         Returns:
             dict: {"pulled", "inserted_text", "inserted_images", "skipped"}；
             pulled = 该群拉取并进入去重流程的总条数。
@@ -584,10 +690,11 @@ class ReloadBackfill:
                     )
                     if text_ok:
                         inserted_text += 1
-                # 批内 URL 去重收窄为单消息内（F10）；跨消息去重靠 existing_urls 实时更新。
-                # existing_urls 入库前是一次性快照，但批内同一 URL 出现在多条消息时，
-                # 第一条插入成功后须追加进 existing_urls，否则第二条会再次通过检查
-                # 并 INSERT，产生重复 image_records 行（无唯一索引兜底时累积）。
+                # 图片 URL 去重收窄为单消息内（F10）：同一条消息内重复 URL 只入一次
+                # （dict.fromkeys）；不同消息共用同一 URL 各写一行，与实时路径口径对齐
+                # （实时路径每消息逐条 insert_image_record，不因 URL 已被其他消息写入
+                # 而跳过）。existing_urls 是一次性快照，只兜「批次开始前库中已存在」的
+                # URL（跨批次/历史去重）；批内新写入不回填 existing_urls。
                 for url in dict.fromkeys(image_urls):
                     if url in existing_urls:
                         continue
@@ -600,8 +707,6 @@ class ReloadBackfill:
                     )
                     if img_ok:
                         inserted_images += 1
-                        # 实时更新快照，使批内后续消息看到刚写入的 URL
-                        existing_urls.add(url)
 
             if empty_id_count > 0:
                 logger.warning(

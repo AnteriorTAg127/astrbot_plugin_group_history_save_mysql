@@ -303,6 +303,37 @@ class ChatHistoryMixin:
             self._log_op_error("get_recent_messages", "查询最近消息重叠参照", e)
             return []
 
+    async def get_last_message_time(self, group_id: str):
+        """按群取最后一条已记录消息的时间（补库窗口起点用）。
+
+        返回该群 chat_history 中最大的 `timestamp`（datetime）或 None（群无记录）；
+        补库以此时间往前偏移固定重叠量作为窗口起点，保证把「最后一条已知记录之后」
+        的缺口拉取补齐（比 v0.6.1 用 `last_terminate_time` 停机时间更贴近真实缺口——
+        插件卸载时刻并不代表该群数据完整性到该时刻）。异常记 error 日志后返回 None
+        （让上层按「无记录」回退 `backfill_hours` 窗口，不阻断补库）。
+
+        Args:
+            group_id: 群号（字符串形式）
+
+        Returns:
+            datetime | None: 该群最后一条已记录消息时间；无记录/异常返回 None
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._execute(
+                        cur,
+                        "SELECT MAX(timestamp) FROM chat_history WHERE group_id = %s",
+                        [group_id],
+                    )
+                    row = await cur.fetchone()
+            if not row or row[0] is None:
+                return None
+            return row[0]
+        except Exception as e:
+            self._log_op_error("get_last_message_time", "查询群最后消息时间", e)
+            return None
+
     async def count_messages(
         self,
         group_id: str | None = None,

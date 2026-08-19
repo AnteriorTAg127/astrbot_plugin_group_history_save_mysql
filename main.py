@@ -6,7 +6,6 @@ v0.6.0 起本文件仅保留框架交互（指令注册 / 事件监听 / 生命�
 """
 
 import asyncio
-import time
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -37,7 +36,7 @@ MAX_INIT_ATTEMPTS = 5
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
     "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
-    "0.7.0",
+    "0.8.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -360,6 +359,48 @@ class GroupHistoryPlugin(Star):
         else:
             yield event.plain_result("清理失败，请检查数据库连接。")
 
+    @filter.command("补库")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def force_backfill(
+        self, event: AstrMessageEvent, group_id: str = "", hours: str = ""
+    ):
+        """强制对指定群补库（管理员，可随时触发一次，绕过「每群每重启一次」限制）。
+
+        用法: /补库 [群号] [小时数]
+        不填群号默认当前群；不填小时数按「该群最后记录时间 − 5 分钟」窗口补，
+        填小时数则强制回补最近 N 小时（如 /补库 123456 24）。
+        """
+        target_group = self._resolve_group_id(event, group_id)
+        if target_group is None:
+            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
+            return
+        hours_val = None
+        if hours.strip():
+            try:
+                hours_val = int(hours)
+                if hours_val < 1:
+                    yield event.plain_result("小时数必须为正整数（1~168）。")
+                    return
+            except ValueError:
+                yield event.plain_result("小时数必须为正整数。")
+                return
+        try:
+            started = await self.backfill.force_backfill(
+                str(target_group), hours=hours_val
+            )
+        except Exception as e:
+            logger.error(f"[HistorySave] 强制补库失败: {e}", exc_info=True)
+            yield event.plain_result("强制补库启动失败，请查看日志。")
+            return
+        if started:
+            yield event.plain_result(
+                f"已开始对群 {target_group} 强制补库，进度请查看日志。"
+            )
+        else:
+            yield event.plain_result(
+                "补库未启动：该群补库可能正在执行，或存储尚未就绪。"
+            )
+
     @filter.command("消息总结", alias={"总结"})
     async def summary_count(self, event: AstrMessageEvent, arg: str = ""):
         """按条数总结群聊记录。用法: /消息总结 <数量>，如 /消息总结 512"""
@@ -484,13 +525,6 @@ class GroupHistoryPlugin(Star):
             await self.backfill.stop()
         except asyncio.CancelledError:
             pass
-        # v0.6.1 记录上次卸载时间，供下次加载时收窄补库窗口到停机缺口（失败仅记 warning）
-        try:
-            await self.config_mgr.set_setting(
-                "last_terminate_time", str(int(time.time()))
-            )
-        except Exception as e:
-            logger.warning(f"[HistorySave] 记录上次卸载时间失败: {e}")
         # 停止数据分析调度器（LIFO：最后启动的最先停止；吞 CancelledError 不阻塞后续清理）
         try:
             await self.stats_service.stop()
