@@ -1,6 +1,6 @@
 # astrbot_plugin_group_history_save_mysql
 
-将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构；v0.7 新增对外查询接口（其他插件可导入调用本插件查询聊天记录）与查询日志（Web 后台可审计所有对外查询）。
+将 QQ 群聊天记录自动保存到 MySQL 数据库，支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构；v0.7 新增对外查询接口（其他插件可导入调用本插件查询聊天记录）与查询日志（Web 后台可审计所有对外查询）；v0.8 重做补库窗口规则并新增 `/补库` 强制补库指令；v0.8 结构进一步下沉（`main.py` 只保留注册与薄 handler，实例装配/生命周期迁至 `core/bootstrap.py`、指令体迁至 `core/commands.py`）。
 
 ## 功能
 
@@ -373,6 +373,8 @@ result = await query_records(
 ```
 main.py                          # 入口：仅框架交互（@register、指令 handler、事件委托）
 core/
+├── bootstrap.py                 # 实例装配 + 后台 MySQL 初始化 + 生命周期停机（v0.8.1）
+├── commands.py                  # 指令体执行器：history_*/补库（v0.8.1 自 main.py 迁出）
 ├── db_mysql/                    # MySQL 操作包（主文件只负责连接池管理与最终访问）
 │   ├── pool.py                  #   DynamicPool 连接池管理
 │   ├── base.py                  #   MySQLManagerBase 核心初始化/执行/迁移
@@ -400,7 +402,7 @@ core/
 ├── summary/                     # 总结功能（service/fetcher/onebot/summarizer/formatter/t2i_render/storage/scheduler/templates）
 ├── profile/                     # 人物分析（service/fetcher/stats/analyzer/formatter/t2i_render/storage/scheduler/templates）
 ├── stats/                       # 数据分析（repository/models/parser/service/snapshot/scheduler/t2i_render/templates）
-├── parsing.py                   # 消息解析纯函数（extract_image_urls / parse_onebot_raw_message / stats_fallback_text）
+├── parsing.py                   # 消息解析纯函数（extract_image_urls / parse_onebot_raw_message / stats_fallback_text / resolve_group_id）
 ├── saver.py                     # MessageSaver 消息缓冲/落库逻辑（原 main.py 内逻辑迁出）
 ├── cleaner.py                   # ImageCleaner 图片过期清理
 └── backfill.py                  # ReloadBackfill 重载自动补库（v0.6.0 新增）

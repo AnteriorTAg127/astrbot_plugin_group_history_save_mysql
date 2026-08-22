@@ -1,8 +1,15 @@
 """群聊记录存储插件主入口。
 
 监听 QQ 群消息，将文本和图片分别存入 MySQL，提供管理指令和 Web 管理后台。
-v0.6.0 起本文件仅保留框架交互（指令注册 / 事件监听 / 生命周期），
-消息保存逻辑（解析/缓冲/落库/补录）全部委托给 core.saver.MessageSaver。
+本文件仅保留框架交互（指令注册 / 事件监听 / 生命周期）与薄 handler：
+
+- v0.6.0 起消息保存逻辑（解析/缓冲/落库/补录）全部委托给 core.saver.MessageSaver
+- v0.8.1 起实例装配 / 后台 MySQL 初始化 / 生命周期停机全部委托给
+  core.bootstrap.PluginBootstrap（各服务经 self.* 透出保持访问路径不变）
+- v0.8.1 起历史管理类指令体（history_*/补库）委托给 core.commands.GroupCommands
+
+注册性内容（@register 类装饰、@filter.* 指令/事件装饰与签名、terminate 直接
+定义于类体）一律不迁移——加载器在 main.py 指定读取。
 """
 
 import asyncio
@@ -12,24 +19,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
-from .core.backfill import ReloadBackfill
-from .core.cleaner import ImageCleaner
-from .core.db_config import ConfigManager
-from .core.db_mysql import MySQLManager
+from .core.bootstrap import PluginBootstrap
 from .core.parsing import stats_fallback_text
 from .core.profile.capture import extract_at_targets
-from .core.profile.service import ProfileService
-from .core.public_api import register_config_manager, register_mysql_manager
-from .core.saver import MessageSaver
-from .core.stats import StatsBuildError, StatsService
+from .core.stats import StatsBuildError
 from .core.stats.models import StatsQuery
 from .core.stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args
-from .core.summary import SummaryService
-from .core.webapi import WebAPI
-
-# 后台 MySQL 初始化的最大连续失败次数：超过后放弃重试并停用存储功能，
-# 避免数据库长期不可用时无限刷日志。恢复方式：修正配置后在插件管理重启插件。
-MAX_INIT_ATTEMPTS = 5
 
 
 @register(
@@ -44,184 +39,27 @@ class GroupHistoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config
-
-        # 初始化 MySQL 管理器（动态连接池）
-        # config 可能为 None（框架在 _conf_schema.json 缺失时以 config=None 实例化插件），
-        # 统一用空 dict 兜底，保证默认值生效
-        cfg = config or {}
-        self.mysql_mgr = MySQLManager(
-            host=cfg.get("mysql_host", "127.0.0.1"),
-            port=cfg.get("mysql_port", 3306),
-            user=cfg.get("mysql_user", "root"),
-            password=cfg.get("mysql_password", ""),
-            database=cfg.get("mysql_database", "astrbot_history"),
-            pool_min_size=cfg.get("pool_min_size", 1),
-            pool_max_size=cfg.get("pool_max_size", 10),
-            pool_idle_timeout=cfg.get("pool_idle_timeout", 120),
-            pool_timeout=cfg.get("pool_timeout", 30),
-            pool_ping_cooldown=cfg.get("pool_ping_cooldown", 5),
-        )
-
-        # v0.7.0 对外公共 API 注册：构造 MySQLManager 后立即注册（构造无 I/O，
-        # 注册即时生效；MySQL 未连接时对外查询自然失败并记查询日志）
-        register_mysql_manager(self.mysql_mgr)
-
-        # 初始化本地配置管理器
-        self.config_mgr = ConfigManager()
-        # v0.7.0 查询日志存储注册：查询日志写内置 SQLite（config.db），
-        # 由 ConfigManager 管理；构造后立即注册（未注册时日志仅 warning 降级）
-        register_config_manager(self.config_mgr)
-
-        # 初始化图片清理器
-        self.cleaner = ImageCleaner(self.mysql_mgr, self.config_mgr)
-
-        # 初始化总结服务（v0.3，须在 WebAPI 之前构造，以便注入其存储实例）
-        self.summary_service = SummaryService(
-            context, self.config_mgr, self.mysql_mgr, self
-        )
-
-        # 初始化人物分析服务（v0.4，须在 WebAPI 之前构造，以便注入服务与其存储实例）
-        self.profile_service = ProfileService(
-            context, self.config_mgr, self.mysql_mgr, self
-        )
-
-        # 初始化数据分析服务（v0.5.0，须在 WebAPI 之前构造，以便注入服务实例；
-        # 构造仅组装上游模块引用无 I/O，调度器在 MySQL 初始化成功后才 start）
-        self.stats_service = StatsService(
-            context, self.mysql_mgr, self.config_mgr, self
-        )
-
-        # 初始化 Web API（注入总结存储实例供总结历史端点使用，注入人物分析服务与存储实例）
-        self.web_api = WebAPI(
-            context,
-            self.mysql_mgr,
-            self.config_mgr,
-            self.cleaner,
-            summary_storage=self.summary_service.storage,
-            summary_renderer=self.summary_service.renderer,
-            profile_service=self.profile_service,
-            profile_storage=self.profile_service.storage,
-            profile_renderer=self.profile_service.renderer,
-            stats_service=self.stats_service,
-        )
-
-        # v0.6.0 消息保存逻辑委托（解析/缓冲/落库/补录全部在 core.saver）
-        self.saver = MessageSaver(self.mysql_mgr, self.config_mgr, self.stats_service)
-        # v0.6.1 按群消息触发的自动补库：插件重启后某群首条消息到达时触发该群补库
-        # （用消息真实 message_seq 作起点往前翻停机缺口），补库期间该群实时消息
-        # 门控缓冲、收尾后带去重 flush；注入 saver / stats_service（快照回填收尾链）
-        self.backfill = ReloadBackfill(
-            context,
-            self.mysql_mgr,
-            self.config_mgr,
-            saver=self.saver,
-            stats_service=self.stats_service,
-        )
+        # v0.8.1 实例装配全部下沉 core.bootstrap；本类仅保存 bootstrap 并把
+        # 各服务透出到同名属性（self.mysql_mgr 等），保持既有 handler 与
+        # 外部访问路径不变
+        self.bootstrap = PluginBootstrap(self, context, config)
+        self.mysql_mgr = self.bootstrap.mysql_mgr
+        self.config_mgr = self.bootstrap.config_mgr
+        self.cleaner = self.bootstrap.cleaner
+        self.summary_service = self.bootstrap.summary_service
+        self.profile_service = self.bootstrap.profile_service
+        self.stats_service = self.bootstrap.stats_service
+        self.web_api = self.bootstrap.web_api
+        self.saver = self.bootstrap.saver
+        self.backfill = self.bootstrap.backfill
+        self.commands = self.bootstrap.commands
 
         self._init_task: asyncio.Task | None = None
 
     async def initialize(self):
-        """异步初始化：连接数据库、启动定时任务。
-
-        MySQL 连接放入后台任务执行，避免数据库不可达时阻塞 AstrBot 启动。
-        """
-        # 初始化本地配置（aiosqlite 本地文件，极快，不会阻塞）
-        config_ok = await self.config_mgr.initialize()
-        if not config_ok:
-            logger.error("[HistorySave] 本地配置初始化失败，插件功能受限")
-
-        # MySQL 初始化放入后台，不阻塞框架启动
-        self._init_task = asyncio.create_task(self._background_mysql_init())
-        logger.info("[HistorySave] 插件已加载，MySQL 连接在后台初始化中")
-
-    async def _background_mysql_init(self):
-        """后台初始化 MySQL，失败时每 60 秒重试一次。
-
-        连续失败 MAX_INIT_ATTEMPTS 次后放弃重试：关闭连接池、停用存储功能，
-        避免数据库长期不可用时无限刷日志。每次尝试用 120 秒强制兜底。
-        """
-        retry_interval = 60
-        # initialize() 内含 schema 迁移 DDL（大表 ADD INDEX 可能远超 10s），
-        # 原 10s 超时会把 DDL 中途 cancel，导致连续 5 次失败后永久放弃存储；
-        # 本任务为后台任务，放长超时不阻塞框架启动（F8）
-        init_timeout = 120
-        attempt = 0
-        while not self.saver.is_initialized:
-            attempt += 1
-            try:
-                mysql_ok = await asyncio.wait_for(
-                    self.mysql_mgr.initialize(), timeout=init_timeout
-                )
-                if mysql_ok:
-                    self.saver.set_initialized()
-                    # 先补录初始化窗口内缓冲的消息，再启动定时清理
-                    await self.saver.flush_pending()
-                    await self.cleaner.start()
-                    # 启动总结清理调度器（失败仅记日志，不阻断插件启动）
-                    try:
-                        await self.summary_service.start()
-                    except Exception as e:
-                        logger.error(f"[HistorySummary] 启动总结服务失败: {e}")
-                    # 启动人物分析清理调度器（失败仅记日志，不阻断插件启动）
-                    try:
-                        await self.profile_service.start()
-                    except Exception as e:
-                        logger.error(f"[Profile] 启动人物分析服务失败: {e}")
-                    # 启动数据分析调度器（失败仅记日志，不阻断插件启动）
-                    try:
-                        await self.stats_service.start()
-                    except Exception as e:
-                        logger.error(f"[Stats] 启动数据分析服务失败: {e}")
-                    # v0.5.5 快照启动回填：MySQL 可用且 stats 服务已启动后发起后台
-                    # 批量回填（服务层 create_task 自持句柄、terminate 自行取消，
-                    # 幂等可重入）；失败仅记日志，不阻断插件加载
-                    try:
-                        await self.stats_service.startup_backfill()
-                    except Exception as e:
-                        logger.error(f"[HistorySave] 快照启动回填发起失败: {e}")
-                    # v0.6.1 重载自动补库改为按群消息触发：插件重启后某群首条消息到达时，
-                    # on_group_message → ReloadBackfill.maybe_trigger 触发该群补库（每群一次）
-                    logger.info(
-                        "[HistorySave] MySQL 连接成功，插件初始化完成，开始监听群消息"
-                    )
-                    return
-                else:
-                    logger.warning(
-                        f"[HistorySave] MySQL 连接失败（第 {attempt} 次尝试），"
-                        f"{retry_interval}s 后重试..."
-                    )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[HistorySave] MySQL 初始化超时（第 {attempt} 次尝试），"
-                    f"{retry_interval}s 后重试..."
-                )
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.warning(
-                    f"[HistorySave] MySQL 初始化异常（第 {attempt} 次尝试）: {e}，"
-                    f"{retry_interval}s 后重试..."
-                )
-            # 重试耗尽：放弃并停用存储功能（关闭连接池使后续操作快速失败）
-            if attempt >= MAX_INIT_ATTEMPTS:
-                # 明确记录被丢弃的缓冲消息条数，避免静默丢失无迹可查（F6）
-                dropped = self.saver.mark_gave_up()
-                logger.error(
-                    f"[HistorySave] MySQL 连续 {attempt} 次连接失败，停止重试，"
-                    f"消息存储功能已停用，同时丢弃启动窗口缓冲消息 {dropped} 条。"
-                    f"请检查数据库配置与连通性，"
-                    f"然后在插件管理中重启本插件以恢复。"
-                )
-                try:
-                    await self.mysql_mgr.close()
-                except Exception:
-                    pass
-                return
-            # 等待后重试
-            try:
-                await asyncio.sleep(retry_interval)
-            except asyncio.CancelledError:
-                return
+        """异步初始化：连接数据库、启动定时任务（委托 bootstrap 后台执行）。"""
+        await self.bootstrap.initialize()
+        self._init_task = self.bootstrap._init_task
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -246,16 +84,7 @@ class GroupHistoryPlugin(Star):
         用法: /history_start [群号]
         不填群号则默认为当前群。
         """
-        target_group = self._resolve_group_id(event, group_id)
-        if target_group is None:
-            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
-            return
-
-        success = await self.config_mgr.add_group(target_group)
-        if success:
-            yield event.plain_result(f"已开启群 {target_group} 的聊天记录保存。")
-        else:
-            yield event.plain_result(f"开启群 {target_group} 记录失败，请检查日志。")
+        yield event.plain_result(await self.commands.group_start(event, group_id))
 
     @filter.command("history_stop")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -265,59 +94,13 @@ class GroupHistoryPlugin(Star):
         用法: /history_stop [群号]
         不填群号则默认为当前群。
         """
-        target_group = self._resolve_group_id(event, group_id)
-        if target_group is None:
-            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
-            return
-
-        success = await self.config_mgr.remove_group(target_group)
-        if success:
-            yield event.plain_result(f"已关闭群 {target_group} 的聊天记录保存。")
-        else:
-            yield event.plain_result(f"关闭群 {target_group} 记录失败，请检查日志。")
+        yield event.plain_result(await self.commands.group_stop(event, group_id))
 
     @filter.command("history_status")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def history_status(self, event: AstrMessageEvent):
         """查询聊天记录保存的状态。"""
-        # 数据库连接状态
-        ping = await self.mysql_mgr.ping()
-        db_status = "✅ 已连接" if ping["connected"] else "❌ 未连接"
-        latency = f"{ping['latency_ms']}ms" if ping["connected"] else "-"
-        pool_info = ping.get("pool", {})
-        pool_str = (
-            f"{pool_info.get('used', 0)}活跃/"
-            f"{pool_info.get('current_size', 0)}总计 "
-            f"(范围 {pool_info.get('min_size', 1)}~{pool_info.get('max_size', 10)})"
-        )
-
-        # 统计信息
-        stats = await self.mysql_mgr.get_stats()
-
-        # 群列表
-        groups = await self.config_mgr.get_groups()
-        settings = await self.config_mgr.get_all_settings()
-        all_mode = settings.get("all_mode", "false") == "true"
-
-        enabled_groups = [g for g in groups if g["enabled"]]
-        group_list = ", ".join(str(g["group_id"]) for g in enabled_groups) or "无"
-
-        text = (
-            f"📊 群聊记录存储状态\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"数据库: {db_status} ({latency})\n"
-            f"连接池: {pool_str}\n"
-            f"ALL 模式: {'开启' if all_mode else '关闭'}\n"
-            f"记录中的群: {group_list}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"今日消息: {stats.get('today_messages', 0)} 条\n"
-            f"今日图片: {stats.get('today_images', 0)} 条\n"
-            f"总消息: {stats.get('total_messages', 0)} 条\n"
-            f"总图片: {stats.get('total_images', 0)} 条\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"图片保留: {settings.get('image_retention_days', '3')} 天"
-        )
-        yield event.plain_result(text)
+        yield event.plain_result(await self.commands.group_status(event))
 
     @filter.command("history_clean")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -327,37 +110,7 @@ class GroupHistoryPlugin(Star):
         用法: /history_clean [天数]
         不填天数则使用配置的默认值。
         """
-        clean_days = None
-        if days:
-            try:
-                clean_days = int(days)
-                if clean_days < 1:
-                    yield event.plain_result("天数不能小于 1。")
-                    return
-                if clean_days > 36500:
-                    yield event.plain_result("天数过大（上限 36500 天）。")
-                    return
-            except ValueError:
-                yield event.plain_result("请提供有效的天数（正整数）。")
-                return
-
-        deleted = await self.cleaner.manual_clean(clean_days)
-        if deleted >= 0:
-            if clean_days is not None:
-                actual_days = clean_days
-            else:
-                # 配置值可能被篡改为非数字，兜底默认 3 天，避免指令抛异常
-                try:
-                    actual_days = int(
-                        await self.config_mgr.get_setting("image_retention_days", "3")
-                    )
-                except (ValueError, TypeError):
-                    actual_days = 3
-            yield event.plain_result(
-                f"清理完成：删除了 {deleted} 条 {actual_days} 天前的图片记录。"
-            )
-        else:
-            yield event.plain_result("清理失败，请检查数据库连接。")
+        yield event.plain_result(await self.commands.group_clean(event, days))
 
     @filter.command("补库")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -370,36 +123,9 @@ class GroupHistoryPlugin(Star):
         不填群号默认当前群；不填小时数按「该群最后记录时间 − 5 分钟」窗口补，
         填小时数则强制回补最近 N 小时（如 /补库 123456 24）。
         """
-        target_group = self._resolve_group_id(event, group_id)
-        if target_group is None:
-            yield event.plain_result("请提供有效的群号，或在群内使用此指令。")
-            return
-        hours_val = None
-        if hours.strip():
-            try:
-                hours_val = int(hours)
-                if hours_val < 1:
-                    yield event.plain_result("小时数必须为正整数（1~168）。")
-                    return
-            except ValueError:
-                yield event.plain_result("小时数必须为正整数。")
-                return
-        try:
-            started = await self.backfill.force_backfill(
-                str(target_group), hours=hours_val
-            )
-        except Exception as e:
-            logger.error(f"[HistorySave] 强制补库失败: {e}", exc_info=True)
-            yield event.plain_result("强制补库启动失败，请查看日志。")
-            return
-        if started:
-            yield event.plain_result(
-                f"已开始对群 {target_group} 强制补库，进度请查看日志。"
-            )
-        else:
-            yield event.plain_result(
-                "补库未启动：该群补库可能正在执行，或存储尚未就绪。"
-            )
+        yield event.plain_result(
+            await self.commands.group_backfill(event, group_id, hours)
+        )
 
     @filter.command("消息总结", alias={"总结"})
     async def summary_count(self, event: AstrMessageEvent, arg: str = ""):
@@ -488,59 +214,8 @@ class GroupHistoryPlugin(Star):
             # 指令消息一律终止传播（含冷却静默路径），避免指令文本继续流入 LLM
             event.stop_event()
 
-    def _resolve_group_id(
-        self, event: AstrMessageEvent, group_id_str: str
-    ) -> int | None:
-        """解析目标群号：优先使用参数，否则使用当前群。"""
-        if group_id_str:
-            try:
-                return int(group_id_str)
-            except ValueError:
-                return None
-        # 尝试获取当前群号
-        try:
-            gid = event.get_group_id()
-            if gid:
-                return int(gid)
-        except (ValueError, TypeError):
-            pass
-        return None
-
     async def terminate(self):
-        """插件卸载/停用时清理资源。"""
-        # v0.7.0 对外公共 API 先注销：插件开始终止后，调用方（含持有旧函数
-        # 引用的插件）的对外查询立即抛 PublicAPIError，而非访问已关闭连接池
-        # 静默失败（详见 PUBLIC_API.md FAQ）；MySQL 与查询日志存储一并注销
-        register_mysql_manager(None)
-        register_config_manager(None)
-        # 取消后台初始化任务（若仍在重试中）
-        if self._init_task and not self._init_task.done():
-            self._init_task.cancel()
-            try:
-                await self._init_task
-            except asyncio.CancelledError:
-                pass
-        # v0.6.0 停止重载自动补库任务（吞 CancelledError 不阻塞后续清理）
-        try:
-            await self.backfill.stop()
-        except asyncio.CancelledError:
-            pass
-        # 停止数据分析调度器（LIFO：最后启动的最先停止；吞 CancelledError 不阻塞后续清理）
-        try:
-            await self.stats_service.stop()
-        except asyncio.CancelledError:
-            pass
-        # 停止总结清理调度器（与 cleaner 停止并列，吞 CancelledError 不阻塞后续清理）
-        try:
-            await self.summary_service.stop()
-        except asyncio.CancelledError:
-            pass
-        # 停止人物分析清理调度器（与总结停止并列，吞 CancelledError 不阻塞后续清理）
-        try:
-            await self.profile_service.stop()
-        except asyncio.CancelledError:
-            pass
-        await self.cleaner.stop()
-        await self.mysql_mgr.close()
-        await self.config_mgr.close()
-        logger.info("[HistorySave] 插件已安全停止")
+        """插件卸载/停用时清理资源（委托 bootstrap，LIFO 停机）。"""
+        # 注意：terminate 必须直接定义于本类体（加载器按 star_cls_type.__dict__
+        # 查找）；函数体委托 bootstrap.shutdown
+        await self.bootstrap.shutdown()

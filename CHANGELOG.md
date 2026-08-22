@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.8.1] - 2026-08-20
+
+main.py 职责下沉重构（版本号保持不变 0.8.0，注册性内容零改动）：
+
+### Changed
+
+- **实例装配 / 生命周期迁至 `core/bootstrap.py`**：服务构建（MySQL 管理器、配置管理器、
+  清理器、总结/人物/统计三服务、Web API、消息保存器、补库器）、后台 MySQL 初始化
+  重试循环（原 `_background_mysql_init`）与 `terminate` 函数体整体迁往新模块
+  `PluginBootstrap`；`main.py` 的 `__init__`/`initialize`/`terminate` 变薄壳委托，
+  `terminate` 仍直接定义于类体（满足加载器 `star_cls_type.__dict__` 查找约束）
+- **指令体迁至 `core/commands.py`**：`history_start/stop/status/clean` 与 `force_backfill`
+  五个 handler 的函数体迁往 `GroupCommands`，`main.py` 保留 `@filter.command` 装饰与签名，
+  handler 统一 `yield event.plain_result(await self.commands.xxx(...))`
+- **`_resolve_group_id` 迁至 `core/parsing.py`**：更名 `resolve_group_id`，`GroupCommands`
+  与需解析群号的指令复用
+
+> 说明：所有注册性内容（`@register` 类装饰、`@filter.*` 指令/事件装饰与签名、加载器读取的
+> `main.py` 路径）保持原样，插件版本号不随本次纯结构重构变动。
+
 ## [0.8.0] - 2026-08-19
 
 重载自动补库窗口规则重做版：修复「拉到了数据却只补回 1 条」——补库窗口起点不再参考

@@ -9,6 +9,10 @@ v0.6.0 新增：
 
 - :func:`parse_onebot_raw_message`：解析 OneBot ``get_group_msg_history`` 返回的
   单条原始消息（重载自动补库用，文本 + 图片 URL 双内容入库）。
+
+v0.8.1 迁入：
+
+- :func:`resolve_group_id`：解析目标群号（管理员指令参数群号或当前群）。
 """
 
 from datetime import datetime
@@ -186,3 +190,28 @@ def parse_onebot_raw_message(raw: dict, group_id: str) -> dict | None:
     except Exception as e:
         logger.debug(f"[HistorySave] 解析 OneBot 原始消息失败（群 {group_id}）: {e}")
         return None
+
+
+def resolve_group_id(event, group_id_str: str) -> int | None:
+    """解析目标群号：优先使用参数，否则使用当前群。
+
+    Args:
+        event: AstrMessageEvent，参数缺省时取当前群号。
+        group_id_str: 指令参数传入的群号字符串（可能为空）。
+
+    Returns:
+        int | None: 解析成功的群号；参数非法或当前群号不可用时返回 None。
+    """
+    if group_id_str:
+        try:
+            return int(group_id_str)
+        except ValueError:
+            return None
+    # 尝试获取当前群号
+    try:
+        gid = event.get_group_id()
+        if gid:
+            return int(gid)
+    except (ValueError, TypeError):
+        pass
+    return None
