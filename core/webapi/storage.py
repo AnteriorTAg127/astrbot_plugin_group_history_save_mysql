@@ -32,6 +32,24 @@ class StorageMixin:
             }
         )
 
+    async def api_storage_info(self):
+        """获取存储后端信息（v0.9.0，Web 面板顶部危险横幅数据源）。
+
+        数据来自 bootstrap 注入的 storage_info_provider（async callable），
+        返回 {backend, locked, config_backend, lock_mismatch,
+        history_db_path(仅 sqlite), stats_available}。
+        provider 未注入（异常装配路径）返回 503；provider 抛出异常返回 500，
+        绝不向 Web 层冒泡。
+        """
+        if self.storage_info_provider is None:
+            return error_response("存储信息不可用", status_code=503)
+        try:
+            info = await self.storage_info_provider()
+            return json_response(info)
+        except Exception:
+            logger.error("[HistorySave] 获取存储后端信息失败", exc_info=True)
+            return error_response("获取存储信息失败", status_code=500)
+
     async def api_get_groups(self):
         """获取群白名单列表。"""
         groups = await self.config_mgr.get_groups()

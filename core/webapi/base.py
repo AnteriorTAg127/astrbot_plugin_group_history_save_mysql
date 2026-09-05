@@ -160,11 +160,16 @@ class WebAPIBase:
         profile_storage: "ProfileStorage | None" = None,
         profile_renderer: "ProfileT2IRenderer | None" = None,
         stats_service: "StatsService | None" = None,
+        storage_info_provider=None,
     ):
         self.context = context
         self.mysql_mgr = mysql_mgr
         self.config_mgr = config_mgr
         self.cleaner = cleaner
+        # v0.9.0 存储信息 provider（async callable，返回 dict）：由 bootstrap
+        # 注入 _storage_info；storage/info 端点消费（Web 面板顶部横幅数据源），
+        # 未注入时该端点返回 503
+        self.storage_info_provider = storage_info_provider
         # v0.3 总结功能存储层，由 main.py 注入（模块 K）；
         # 未注入时总结历史相关端点返回 503
         self.summary_storage = summary_storage
@@ -237,6 +242,12 @@ class WebAPIBase:
                 "获取清空验证题目",
             ),
             (f"/{PLUGIN_NAME}/purge", self.api_purge, ["POST"], "清空所有数据"),
+            (
+                f"/{PLUGIN_NAME}/storage/info",
+                self.api_storage_info,
+                ["GET"],
+                "存储后端信息",
+            ),
             # ---- 总结功能（v0.3） ----
             (
                 f"/{PLUGIN_NAME}/summary/settings",

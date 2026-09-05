@@ -41,10 +41,14 @@ BACKFILL_OVERLAP_THRESHOLD = (
 )
 ROUND_DELAY_SECONDS = 0.3  # 轮间延迟（秒），规避协议端限频
 DEFAULT_TIMEOUT = 15  # 协议端调用超时（秒）
-BACKFILL_HOURS_DEFAULT = 12  # 默认窗口小时数（无记录群回退用 / force 指令不传 hours 时）
+BACKFILL_HOURS_DEFAULT = (
+    12  # 默认窗口小时数（无记录群回退用 / force 指令不传 hours 时）
+)
 BACKFILL_HOURS_MIN = 1  # 窗口下限
 BACKFILL_HOURS_MAX = 168  # 窗口上限（7 天）
-BACKFILL_OVERLAP_MINUTES = 5  # 最后记录时间往前偏移的重叠量（分钟），兜住时间口径小偏差与边界漏拉
+BACKFILL_OVERLAP_MINUTES = (
+    5  # 最后记录时间往前偏移的重叠量（分钟），兜住时间口径小偏差与边界漏拉
+)
 SNAPSHOT_BACKFILL_THROTTLE = 60  # 快照回填节流秒数（连续多群补库只触发一次）
 
 _ZERO_COUNTS = {
@@ -134,7 +138,9 @@ class ReloadBackfill:
         self.saver = saver  # MessageSaver（补库门控缓冲；None 时 begin/end 防御性跳过）
         self.stats_service = stats_service  # StatsService（快照回填收尾链）
         self._backfilled_groups: set[str] = set()  # 本重启周期已补库的群（每群一次）
-        self._active_groups: set[str] = set()  # 正在跑补库的群（防自动触发与 force 指令并发重复跑）
+        self._active_groups: set[str] = (
+            set()
+        )  # 正在跑补库的群（防自动触发与 force 指令并发重复跑）
         self._tasks: set[asyncio.Task] = set()  # 在跑补库任务
         self._last_snapshot_ts = 0.0  # 快照回填节流时间戳（monotonic 秒）
 

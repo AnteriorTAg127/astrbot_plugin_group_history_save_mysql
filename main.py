@@ -7,6 +7,8 @@
 - v0.8.1 起实例装配 / 后台 MySQL 初始化 / 生命周期停机全部委托给
   core.bootstrap.PluginBootstrap（各服务经 self.* 透出保持访问路径不变）
 - v0.8.1 起历史管理类指令体（history_*/补库）委托给 core.commands.GroupCommands
+- v0.9.0 新增 /导出聊天记录 一次性迁移指令（MySQL → 本地 SQLite，仅 sqlite
+  存储模式可用）；/群统计 在 sqlite 模式下明确回复不可用
 
 注册性内容（@register 类装饰、@filter.* 指令/事件装饰与签名、terminate 直接
 定义于类体）一律不迁移——加载器在 main.py 指定读取。
@@ -30,8 +32,8 @@ from .core.stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args
 @register(
     "astrbot_plugin_group_history_save_mysql",
     "AnteriorTAg127",
-    "将 QQ 群聊天记录保存到 MySQL，支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
-    "0.8.1",
+    "将 QQ 群聊天记录保存到 MySQL（Windows 部署可选 SQLite 备用存储后端：危险选项，配置页手动开启，一经启用即锁定），支持 Web 管理后台与群聊历史自动总结（MySQL 优先 + 协议端补齐）；人物分析支持群成员发言习惯与画像分析（@ 或 QQ 触发，Web 可跨群）；数据分析支持 Web 实时统计面板与 /群统计 指令报告卡（定时日报/周报推送 + 分段快照统计）",
+    "0.9.0",
 )
 class GroupHistoryPlugin(Star):
     """群聊记录存储插件。"""
@@ -127,6 +129,17 @@ class GroupHistoryPlugin(Star):
             await self.commands.group_backfill(event, group_id, hours)
         )
 
+    @filter.command("导出聊天记录")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def export_history(self, event: AstrMessageEvent, hours: str = ""):
+        """把 MySQL 历史聊天记录一次性导入本地 SQLite（仅 SQLite 模式可用）。
+
+        用法: /导出聊天记录 [小时数]
+        不填小时数为全量导入；填 N 仅导入最近 N 小时（如 /导出聊天记录 24）。
+        幂等可重跑，重复数据自动跳过；迁移期间实时消息不受影响。
+        """
+        yield event.plain_result(await self.commands.group_migrate(event, hours))
+
     @filter.command("消息总结", alias={"总结"})
     async def summary_count(self, event: AstrMessageEvent, arg: str = ""):
         """按条数总结群聊记录。用法: /消息总结 <数量>，如 /消息总结 512"""
@@ -162,7 +175,11 @@ class GroupHistoryPlugin(Star):
 
             service = self.stats_service
             if service is None:
-                yield event.plain_result("统计模块尚未就绪")
+                # v0.9.0：SQLite 存储后端不构造数据分析服务（依赖 MySQL 聚合）
+                yield event.plain_result(
+                    "数据分析模块在 SQLite 存储模式下不可用（需要 MySQL 聚合性能）。"
+                    "如需使用请切换回 MySQL 后端（见插件配置页警告说明）。"
+                )
                 return
 
             # 每群冷却（async，时长读 stats_cooldown）：冷却期内静默忽略——

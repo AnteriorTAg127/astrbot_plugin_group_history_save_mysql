@@ -58,7 +58,6 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
-from ..db_mysql import QUERY_TIMEOUT_SECONDS
 from .models import (
     ProfileFetchOutcome,
     ProfileMessage,
@@ -407,6 +406,10 @@ class ProfileFetcher:
         口径：按 group_id 分组，COUNT(*) 计消息数、MAX(timestamp) 记最近
         活跃时刻；排序 COUNT(*) DESC、同数 group_id ASC（输出确定性）。
 
+        v0.9.0 起委托存储管理器同名方法（MySQLManager / SQLiteManager 均
+        提供，语义一致），消除对 ``pool.acquire()`` 直连的依赖以兼容
+        SQLite 备用后端。
+
         Returns:
             list[dict]: [{"group_id": str, "count": int,
                 "last_active": datetime | None}]
@@ -414,23 +417,7 @@ class ProfileFetcher:
         Raises:
             Exception: 查询失败（由 service 层兜底为空列表）。
         """
-        sql = (
-            "SELECT group_id, COUNT(*) AS cnt, MAX(timestamp) "
-            "FROM chat_history GROUP BY group_id "
-            "ORDER BY cnt DESC, group_id ASC"
-        )
-        async with self._mysql_mgr.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await asyncio.wait_for(cur.execute(sql), timeout=QUERY_TIMEOUT_SECONDS)
-                rows = await cur.fetchall()
-        return [
-            {
-                "group_id": str(row[0]),
-                "count": int(row[1] or 0),
-                "last_active": row[2],
-            }
-            for row in rows
-        ]
+        return await self._mysql_mgr.get_all_groups_summary()
 
     # ------------------------------------------------------------------
     # 目标消息

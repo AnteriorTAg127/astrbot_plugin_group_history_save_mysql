@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>群聊记录管理</title>
-    <link rel="stylesheet" href="./style.css?v=0.8.1">
+    <link rel="stylesheet" href="./style.css?v=0.9.0">
 </head>
 <body>
     <div class="app">
@@ -18,6 +18,12 @@
                 <span class="db-badge" id="dbBadge">检测中</span>
             </div>
         </header>
+
+        <!-- 存储后端危险横幅（v0.9.0）：由 app.js renderStorageBanner 按
+             storage/info 端点结果渲染，初始隐藏。sqlite=红色常驻（无关闭钮）、
+             mysql 且配置与锁不一致=黄色可关闭、正常 mysql 不渲染。
+             全部文案走 textContent，零 HTML 注入面 -->
+        <div class="storage-banner hidden" id="storageBanner" role="alert"></div>
 
         <!-- 顶层功能分区：存储库 / 消息总结 / 人物分析（滑动高光分段控件） -->
         <div class="scope-switch" role="tablist" aria-label="功能分区">
@@ -646,7 +652,7 @@
                 <div class="danger-zone">
                     <div class="setting-info">
                         <div class="setting-name">清空所有数据</div>
-                        <div class="setting-desc">清空 MySQL 中全部聊天记录与图片记录，不可恢复。需要通过随机加减法验证</div>
+                        <div class="setting-desc" id="purgeZoneDesc">清空 MySQL 中全部聊天记录与图片记录，不可恢复。需要通过随机加减法验证</div>
                     </div>
                     <button id="purgeBtn" class="btn btn-danger">清空所有数据</button>
                 </div>
@@ -821,7 +827,7 @@
     <div class="modal-mask" id="purgeModal" style="display:none;">
         <div class="modal-card">
             <div class="modal-title">⚠️ 清空所有数据</div>
-            <div class="modal-desc">此操作将清空两张数据表（聊天记录 + 图片记录）的全部内容，且不可恢复。请完成下面的验证：</div>
+            <div class="modal-desc" id="purgeModalDesc">此操作将清空两张数据表（聊天记录 + 图片记录）的全部内容，且不可恢复。请完成下面的验证：</div>
             <div class="modal-question" id="purgeQuestion">加载中...</div>
             <input type="number" id="purgeAnswer" class="input" placeholder="输入计算结果" autocomplete="off">
             <div class="modal-actions">
@@ -894,9 +900,9 @@
     <!-- marked 锁定主版本 @15（对齐 echarts@5 写法；v16 起包内不再提供根目录 marked.min.js） -->
     <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="./app.js?v=0.7.0"></script>
+    <script type="module" src="./app.js?v=0.9.0"></script>
     <!-- v0.5.0 数据分析 tab 模块（type=module 默认 defer，加载顺序与既有脚本一致；
          实际接线由 app.js import 驱动，重复引用按 ES Module 同 URL 去重、仅执行一次） -->
-    <script type="module" src="./data-analysis.js?v=0.7.0"></script>
+    <script type="module" src="./data-analysis.js?v=0.9.0"></script>
 </body>
 </html>

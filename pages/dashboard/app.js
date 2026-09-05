@@ -11,9 +11,98 @@ import { loadProfileSettings, bindProfileSettingsEvents } from "./profile-settin
 import { loadProfileGroups, bindProfileLaunchEvents } from "./profile-launch.js";
 import { loadProfileHistory, bindProfileHistoryEvents } from "./profile-history.js";
 import { loadDataAnalysis, bindDataAnalysisEvents, enterDataAnalysis } from "./data-analysis.js";
+import { el, showToast } from "./common.js";
 
 const bridge = window.AstrBotPluginPage;
 await bridge.ready();
+
+// ========== v0.9.0 存储后端信息（顶部危险横幅 / 功能可用性判定） ==========
+// storage/info 由 app.js 启动时拉取一次；provider 数据源在 bootstrap（纯内存
+// dict，无 I/O 阻塞）。拉取失败保持 null：不渲染横幅、不做可用性拦截，
+// 面板其余功能与改动前完全一致（横幅不阻塞主功能）。
+let storageInfo = null;
+
+// 清空弹窗静态说明原文（首次读取后作为追加基底，避免重复拼接）
+const PURGE_DESC_BASE = (document.getElementById("purgeModalDesc") || {}).textContent || "";
+
+async function loadStorageInfo() {
+    try {
+        const info = await bridge.apiGet("storage/info");
+        storageInfo = info && typeof info === "object" ? info : null;
+    } catch {
+        storageInfo = null; // 静默：旧版本后端无该端点也不影响面板使用
+        return;
+    }
+    renderStorageBanner(storageInfo);
+    applySqlitePurgeHints(storageInfo);
+}
+
+// 三分支渲染（PRD F2 三重提醒③）：
+// ① backend=sqlite → 红色常驻横幅（无关闭按钮），history_db_path 非空时小字第二行显示路径；
+// ② backend=mysql 且 lock_mismatch → 黄色可关闭横幅；
+// ③ 其余（mysql 正常）→ 不渲染（容器保持隐藏）。
+// 全部文本走 textContent / el()，零 HTML 注入面。
+function renderStorageBanner(info) {
+    const banner = document.getElementById("storageBanner");
+    if (!banner) return;
+    banner.textContent = "";
+    banner.className = "storage-banner hidden";
+    if (!info) return;
+
+    if (info.backend === "sqlite") {
+        banner.appendChild(
+            el(
+                "div",
+                "storage-banner-text",
+                "⚠️ 当前为 SQLite 备用存储（危险选项已锁定）。数据分析与 /群统计 不可用；" +
+                    "请勿随意切换存储后端，MySQL / SQLite 两侧数据完全独立、互不迁移。",
+            ),
+        );
+        const path = typeof info.history_db_path === "string" ? info.history_db_path : "";
+        if (path) banner.appendChild(el("div", "storage-banner-sub", `数据文件：${path}`));
+        banner.classList.add("danger");
+        banner.classList.remove("hidden");
+        return;
+    }
+
+    if (info.backend === "mysql" && info.lock_mismatch) {
+        const cfg = info.config_backend == null ? "?" : String(info.config_backend);
+        banner.appendChild(
+            el(
+                "div",
+                "storage-banner-text",
+                `⚠️ 检测到 storage_backend=${cfg} 配置被更改但未生效，已锁定为 MySQL 继续运行；` +
+                    "切换存储后端请按插件配置页警告说明操作。",
+            ),
+        );
+        const closeBtn = el("button", "storage-banner-close", "✕");
+        closeBtn.type = "button";
+        closeBtn.title = "关闭提示";
+        closeBtn.addEventListener("click", () => banner.classList.add("hidden"));
+        banner.appendChild(closeBtn);
+        banner.classList.add("warn");
+        banner.classList.remove("hidden");
+    }
+}
+
+// SQLite 模式下的清空类文案补充（数据表同名，但目标库是本地 history.db）
+function applySqlitePurgeHints(info) {
+    if (!info || info.backend !== "sqlite") return;
+    const desc = document.getElementById("purgeModalDesc");
+    if (desc) {
+        desc.textContent = `${PURGE_DESC_BASE}目标：SQLite history.db 全部聊天记录。`;
+    }
+    const zone = document.getElementById("purgeZoneDesc");
+    if (zone) {
+        zone.textContent =
+            "清空 SQLite（history.db）中全部聊天记录与图片记录，不可恢复。需要通过随机加减法验证";
+    }
+}
+
+// 数据分析在 SQLite 模式不可用（bootstrap 不构造 stats_service，stats/* 端点 503）
+function statsUnavailable() {
+    return !!storageInfo && storageInfo.stats_available === false;
+}
 
 // ========== 分区 / Tab 切换 ==========
 const lazyLoadedTabs = new Set();
@@ -36,6 +125,12 @@ const TAB_ENTER_HOOKS = {
 
 // 统一激活某个子 tab：切换高亮、显示对应页面、首次进入触发惰性加载
 function activateTab(name) {
+    // v0.9.0：SQLite 后端下数据分析不可用（stats_service 未构造，stats/* 全 503），
+    // 在激活入口拦截：仅提示，不切页也不发任何数据请求
+    if (name === "data-analysis" && statsUnavailable()) {
+        showToast("数据分析在 SQLite 存储模式下不可用（需要 MySQL 聚合性能）", "error");
+        return;
+    }
     document.querySelectorAll(".tab").forEach((t) =>
         t.classList.toggle("active", t.dataset.tab === name),
     );
@@ -127,6 +222,8 @@ async function init() {
     bindDataAnalysisEvents(); // v0.5.0 数据分析（过滤栏 / 排行交互 / 推送设置表单）
     // 默认进入存储库分区并点亮高光；总结/人物分析数据延迟到进入对应分区时加载
     switchScope("storage");
+    // v0.9.0 存储后端横幅：与首屏数据并行拉取，失败静默（不阻塞其余初始化）
+    loadStorageInfo();
     await Promise.all([loadStatus(), loadGroups(), loadSettings(), loadDailyStats()]);
 }
 

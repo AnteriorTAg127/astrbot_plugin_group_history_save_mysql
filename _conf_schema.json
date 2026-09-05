@@ -58,5 +58,25 @@
         "type": "int",
         "default": 5,
         "hint": "连接在冷却秒数内再次被取出时跳过 ping 检查，降低 CPU 与 MySQL 往返开销"
+    },
+    "storage_backend": {
+        "description": "存储后端（危险选项）",
+        "type": "string",
+        "default": "mysql",
+        "options": ["mysql", "sqlite"],
+        "hint": "⚠️ 危险选项：一经启用即锁定，请不要随意更改！\nsqlite 模式无需安装 MySQL，聊天记录保存到本地 history.db（Windows 部署友好）。\nmysql / sqlite 两侧数据完全独立、互不迁移：切换后看不到另一侧历史记录，如需迁移请用 /导出聊天记录 指令一次性导入。\n更改本项后必须重启插件才能生效；运行中修改不会热切换。插件首次启动成功后会把生效后端锁定到 data/plugin_data/astrbot_plugin_group_history_save_mysql/backend.lock——如确需切换：停用插件、删除该文件、改好本项后重启。再次强调：一旦选定就不要随便更改！",
+        "obvious_hint": true
+    },
+    "sqlite_wal_mode": {
+        "description": "SQLite WAL 模式（仅 sqlite 后端生效）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后并发读写性能更好（推荐保持开启）"
+    },
+    "sqlite_busy_timeout_ms": {
+        "description": "SQLite 忙等超时（毫秒，仅 sqlite 后端生效）",
+        "type": "int",
+        "default": 5000,
+        "hint": "写冲突时等待的毫秒数，范围 0-60000"
     }
 }

@@ -26,11 +26,14 @@ class GroupCommands:
     委托后 ``yield event.plain_result(reply)``。
     """
 
-    def __init__(self, mysql_mgr, config_mgr, cleaner, backfill):
+    def __init__(self, mysql_mgr, config_mgr, cleaner, backfill, migrator=None):
         self.mysql_mgr = mysql_mgr
         self.config_mgr = config_mgr
         self.cleaner = cleaner
         self.backfill = backfill
+        # v0.9.0 一次性迁移器（SQLiteMigrator，仅 sqlite 后端注入；
+        # None = mysql 模式，/导出聊天记录 指令回复「无需导入」）
+        self.migrator = migrator
 
     async def group_start(self, event, group_id: str = "") -> str:
         """开启指定群的聊天记录保存。返回回复文案。"""
@@ -60,12 +63,20 @@ class GroupCommands:
         ping = await self.mysql_mgr.ping()
         db_status = "✅ 已连接" if ping["connected"] else "❌ 未连接"
         latency = f"{ping['latency_ms']}ms" if ping["connected"] else "-"
-        pool_info = ping.get("pool", {})
-        pool_str = (
-            f"{pool_info.get('used', 0)}活跃/"
-            f"{pool_info.get('current_size', 0)}总计 "
-            f"(范围 {pool_info.get('min_size', 1)}~{pool_info.get('max_size', 10)})"
-        )
+        # v0.9.0：SQLite 后端无连接池概念（单连接+锁串行），文案区分展示
+        is_sqlite = getattr(self.mysql_mgr, "is_sqlite_backend", False)
+        if is_sqlite:
+            backend_str = "存储后端: SQLite（本地 history.db）\n"
+            pool_line = ""
+        else:
+            backend_str = "存储后端: MySQL\n"
+            pool_info = ping.get("pool", {})
+            pool_line = (
+                f"连接池: {pool_info.get('used', 0)}活跃/"
+                f"{pool_info.get('current_size', 0)}总计 "
+                f"(范围 {pool_info.get('min_size', 1)}~"
+                f"{pool_info.get('max_size', 10)})\n"
+            )
 
         # 统计信息
         stats = await self.mysql_mgr.get_stats()
@@ -81,8 +92,9 @@ class GroupCommands:
         text = (
             f"📊 群聊记录存储状态\n"
             f"━━━━━━━━━━━━━━\n"
+            f"{backend_str}"
             f"数据库: {db_status} ({latency})\n"
-            f"连接池: {pool_str}\n"
+            f"{pool_line}"
             f"ALL 模式: {'开启' if all_mode else '关闭'}\n"
             f"记录中的群: {group_list}\n"
             f"━━━━━━━━━━━━━━\n"
@@ -123,9 +135,7 @@ class GroupCommands:
             return f"清理完成：删除了 {deleted} 条 {actual_days} 天前的图片记录。"
         return "清理失败，请检查数据库连接。"
 
-    async def group_backfill(
-        self, event, group_id: str = "", hours: str = ""
-    ) -> str:
+    async def group_backfill(self, event, group_id: str = "", hours: str = "") -> str:
         """强制对指定群补库（管理员，可随时触发一次）。返回回复文案。
 
         用法: /补库 [群号] [小时数]
@@ -153,6 +163,23 @@ class GroupCommands:
         if started:
             return f"已开始对群 {target_group} 强制补库，进度请查看日志。"
         return "补库未启动：该群补库可能正在执行，或存储尚未就绪。"
+
+    async def group_migrate(self, event, hours: str = "") -> str:
+        """把 MySQL 历史聊天记录一次性导入本地 SQLite（v0.9.0）。
+
+        用法: /导出聊天记录 [小时数]
+        仅 SQLite 存储模式可用（migrator 由 bootstrap 在该模式注入）；
+        MySQL 模式下 migrator 为 None，回复「无需导入」。
+        返回迁移结果文案（migrate 内部已全兜底不抛，此处再套一层
+        防御任何未预期异常，保证指令不炸）。
+        """
+        if self.migrator is None:
+            return "当前为 MySQL 存储模式，无需导入。"
+        try:
+            return await self.migrator.migrate(hours)
+        except Exception as e:
+            logger.error(f"[HistorySave] 聊天记录迁移异常: {e}", exc_info=True)
+            return f"迁移异常：{e}"
 
 
 __all__ = ["GroupCommands"]

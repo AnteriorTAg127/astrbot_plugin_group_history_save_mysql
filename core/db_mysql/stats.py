@@ -112,3 +112,36 @@ class StatsMixin:
         except Exception as e:
             self._log_op_error("get_daily_stats", "获取每日统计", e)
         return result
+
+    async def get_all_groups_summary(self) -> list[dict]:
+        """全量群清单：chat_history 中实际有数据的群（v0.9.0 自 profile.fetcher 内联 SQL 下沉）。
+
+        口径：按 group_id 分组，COUNT(*) 计消息数、MAX(timestamp) 记最近
+        活跃时刻；排序 COUNT(*) DESC、同数 group_id ASC（输出确定性）。
+        SQLite 后端在 core/db_sqlite.py 提供同名方法（语义一致），
+        供 core/profile/fetcher.py 委托调用以兼容双后端。
+
+        Returns:
+            list[dict]: [{"group_id": str, "count": int,
+                "last_active": datetime | None}]
+
+        Raises:
+            Exception: 查询失败（由调用方 service 层兜底为空列表）。
+        """
+        sql = (
+            "SELECT group_id, COUNT(*) AS cnt, MAX(timestamp) "
+            "FROM chat_history GROUP BY group_id "
+            "ORDER BY cnt DESC, group_id ASC"
+        )
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._execute(cur, sql)
+                rows = await cur.fetchall()
+        return [
+            {
+                "group_id": str(row[0]),
+                "count": int(row[1] or 0),
+                "last_active": row[2],
+            }
+            for row in rows
+        ]

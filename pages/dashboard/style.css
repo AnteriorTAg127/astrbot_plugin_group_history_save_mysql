@@ -1874,3 +1874,69 @@ body {
 /* --- 查询日志（v0.7.0）：保留天数设置行 --- */
 .ql-settings { margin-bottom: 4px; }
 .ql-settings .hint { font-size: 0.85rem; color: var(--muted, #888); line-height: 32px; }
+
+/* =====================================================================
+   v0.9.0 存储后端危险横幅（三重提醒③，顶部常驻；storage-banner 前缀）
+   ===================================================================== */
+
+.storage-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    border-radius: var(--radius-sm);
+    font-size: 0.84rem;
+    font-weight: 500;
+    line-height: 1.6;
+    animation: fadeIn 0.25s ease;
+}
+
+.storage-banner.hidden { display: none; }
+
+/* SQLite 备用存储：红色警示横幅（常驻，无关闭按钮） */
+.storage-banner.danger {
+    background: var(--danger-light);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+}
+
+/* MySQL 模式下检测到配置被更改但未生效：黄色横幅（可关闭） */
+.storage-banner.warn {
+    background: #fff7e6;
+    border: 1px solid #d48806;
+    color: #ad6800;
+}
+
+[data-theme="dark"] .storage-banner.warn {
+    background: #3a2c12;
+    border-color: #d48806;
+    color: #f0c060;
+}
+
+.storage-banner-text { flex: 1; min-width: 0; word-break: break-word; }
+
+/* 第二行小字（如 SQLite 数据文件路径），取正文次级色 */
+.storage-banner-sub {
+    margin-top: 2px;
+    font-size: 0.74rem;
+    font-weight: 400;
+    color: var(--text-3);
+    word-break: break-all;
+}
+
+.storage-banner-close {
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 0.9rem;
+    line-height: 1;
+    padding: 4px 6px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: var(--transition);
+}
+
+.storage-banner-close:hover { background: rgba(0, 0, 0, 0.08); }
+

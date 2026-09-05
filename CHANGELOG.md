@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.9.0] - 2026-08-20
+
+SQLite 备用存储后端（Windows 部署友好，**危险选项**）：聊天记录可选存入本地
+`history.db`，无需安装 MySQL；配置页手动开启，一经启用即由启动锁文件锁定并
+三重提醒；数据分析与 `/群统计` 在 SQLite 模式下明确不可用；新增
+`/导出聊天记录` 一次性迁移指令（MySQL → SQLite，幂等可重跑）。
+MySQL 默认路径行为与 v0.8.1 完全一致。
+
+### Added
+
+- **SQLite 存储后端（`core/db_sqlite.py` SQLiteManager）**：aiosqlite 单连接 +
+  锁串行，数据文件 `data/plugin_data/<插件>/history.db`（与 config.db 分文件）；
+  WAL/busy_timeout 可配；断线自愈重连；与 MySQLManager 同名同签名同返回语义
+  （鸭子类型透传全部下游模块：保存/补库/查询/白名单/对外 API/总结/人物分析），
+  `chat_history.message_id` 建唯一索引使三条写路径天然幂等
+- **配置项 3 个（插件配置页）**：`storage_backend`（mysql/sqlite，默认 mysql，
+  多行醒目危险警告 hint）、`sqlite_wal_mode`（默认开）、`sqlite_busy_timeout_ms`
+  （默认 5000，0–60000）
+- **启动锁与三重提醒**：后端首次初始化成功后把生效后端写入锁文件
+  `backend.lock`；此后配置页改动不热切换、重启也被挡回——①配置页警告 hint、
+  ②检测到「配置≠锁」时连续 3 条 ERROR 日志（含解锁步骤与数据独立警告）、
+  ③Web 面板顶部横幅（sqlite 红色常驻 / 误改配置黄色可关闭）；新端点
+  `GET /{plugin}/storage/info` 供前端取锁状态；解锁 = 停用插件删除 backend.lock 后重启
+- **`/导出聊天记录` 迁移指令（`core/sqlite_migrator.py`，管理员，仅 SQLite 模式）**：
+  自建独立 MySQL 只读连接（与运行时后端解耦），按 id 分页批 2000 导入
+  chat_history/image_records；幂等可重跑（唯一索引 + 按群预查计「跳过重复」）；
+  可选 `hours` 参数仅补导最近 N 小时；全量完成写 meta 标记拦截重复全量；
+  每批进度日志、失败保留已导入数据
+- **Web 面板 SQLite 适配**：`/history_status` 显示存储后端类型；清空弹窗与
+  危险区文案按后端区分；「数据分析」tab 在 SQLite 模式点击即提示不可用（不发请求）
+
+### Changed
+
+- 数据分析服务（StatsService）在 SQLite 模式下不再构造：Web stats 端点走既有
+  503 路径，`/群统计` 指令回复「SQLite 模式下不可用（需 MySQL 聚合性能）」明确文案
+- `core/profile/fetcher.py` 的群清单查询下沉为存储管理器方法
+  `get_all_groups_summary`（MySQL/SQLite 双实现），消除 SQLite 模式下对
+  MySQL 连接池的直连依赖，「发起分析」群下拉在 SQLite 模式正常工作
+
+### Fixed（随本版调试轮一并修复）
+
+- 启动锁标记落位方案：初版写配置实体 `active_backend_lock` 的设想经复现证伪
+  ——AstrBot 配置完整性检查会剥离 schema 外的键，锁从未生效；改为插件自有
+  `backend.lock` 文件（详见 开发/v0.9.0/debug/debug_0.md）
+- 迁移器消息侧预查恒不命中（`get_existing_message_ids("")` 恒空集契约误用），
+  改为按群分组预查，「跳过重复」计数恢复准确
+
 ## [0.8.1] - 2026-08-20
 
 main.py 职责下沉重构（版本号保持不变 0.8.0，注册性内容零改动）：
