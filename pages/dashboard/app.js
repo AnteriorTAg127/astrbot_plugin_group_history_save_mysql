@@ -37,10 +37,11 @@ async function loadStorageInfo() {
     applySqlitePurgeHints(storageInfo);
 }
 
-// 三分支渲染（PRD F2 三重提醒③）：
-// ① backend=sqlite → 红色常驻横幅（无关闭按钮），history_db_path 非空时小字第二行显示路径；
-// ② backend=mysql 且 lock_mismatch → 黄色可关闭横幅；
-// ③ 其余（mysql 正常）→ 不渲染（容器保持隐藏）。
+// 三分支渲染（PRD F2 三重提醒③，v0.9.0 语义修正版）：
+// 锁只属于 sqlite 危险选项；mysql 是安全默认态、无锁无横幅。
+// ① backend=sqlite 且 lock_mismatch（配置被改回 mysql 被挡回）→ 黄色可关闭横幅；
+// ② backend=sqlite（正常）→ 红色常驻横幅（无关闭按钮），history_db_path 非空时小字第二行显示路径；
+// ③ backend=mysql（安全态，永不锁定）→ 不渲染。
 // 全部文本走 textContent / el()，零 HTML 注入面。
 function renderStorageBanner(info) {
     const banner = document.getElementById("storageBanner");
@@ -50,39 +51,42 @@ function renderStorageBanner(info) {
     if (!info) return;
 
     if (info.backend === "sqlite") {
+        if (info.lock_mismatch) {
+            // 锁 sqlite、配置被改回 mysql：仍运行 sqlite，提示改动未生效
+            const cfg = info.config_backend == null ? "?" : String(info.config_backend);
+            banner.appendChild(
+                el(
+                    "div",
+                    "storage-banner-text",
+                    `⚠️ 检测到 storage_backend=${cfg} 配置被更改但未生效——本插件已锁定为 SQLite 并继续运行；` +
+                        "如确需切回 MySQL：停用插件、删除 backend.lock 后重启（SQLite 期间新增的历史不会自动迁回，且暂无反向迁移工具）。",
+                ),
+            );
+            const closeBtn = el("button", "storage-banner-close", "✕");
+            closeBtn.type = "button";
+            closeBtn.title = "关闭提示";
+            closeBtn.addEventListener("click", () => banner.classList.add("hidden"));
+            banner.appendChild(closeBtn);
+            banner.classList.add("warn");
+            banner.classList.remove("hidden");
+            return;
+        }
         banner.appendChild(
             el(
                 "div",
                 "storage-banner-text",
-                "⚠️ 当前为 SQLite 备用存储（危险选项已锁定）。数据分析与 /群统计 不可用；" +
-                    "请勿随意切换存储后端，MySQL / SQLite 两侧数据完全独立、互不迁移。",
+                "⚠️ 当前为 SQLite 备用存储（危险选项" +
+                    (info.locked ? "已锁定" : "启用中") +
+                    "）。数据分析与 /群统计 不可用；" +
+                    "MySQL / SQLite 两侧数据完全独立，切换需按插件配置页警告说明操作。",
             ),
         );
         const path = typeof info.history_db_path === "string" ? info.history_db_path : "";
         if (path) banner.appendChild(el("div", "storage-banner-sub", `数据文件：${path}`));
         banner.classList.add("danger");
         banner.classList.remove("hidden");
-        return;
     }
-
-    if (info.backend === "mysql" && info.lock_mismatch) {
-        const cfg = info.config_backend == null ? "?" : String(info.config_backend);
-        banner.appendChild(
-            el(
-                "div",
-                "storage-banner-text",
-                `⚠️ 检测到 storage_backend=${cfg} 配置被更改但未生效，已锁定为 MySQL 继续运行；` +
-                    "切换存储后端请按插件配置页警告说明操作。",
-            ),
-        );
-        const closeBtn = el("button", "storage-banner-close", "✕");
-        closeBtn.type = "button";
-        closeBtn.title = "关闭提示";
-        closeBtn.addEventListener("click", () => banner.classList.add("hidden"));
-        banner.appendChild(closeBtn);
-        banner.classList.add("warn");
-        banner.classList.remove("hidden");
-    }
+    // backend === "mysql"：安全默认态（无锁），不渲染任何横幅
 }
 
 // SQLite 模式下的清空类文案补充（数据表同名，但目标库是本地 history.db）

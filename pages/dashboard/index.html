@@ -20,9 +20,9 @@
         </header>
 
         <!-- 存储后端危险横幅（v0.9.0）：由 app.js renderStorageBanner 按
-             storage/info 端点结果渲染，初始隐藏。sqlite=红色常驻（无关闭钮）、
-             mysql 且配置与锁不一致=黄色可关闭、正常 mysql 不渲染。
-             全部文案走 textContent，零 HTML 注入面 -->
+             storage/info 端点结果渲染，初始隐藏。sqlite 且配置与锁不一致
+             （改回 mysql 被挡回）=黄色可关闭、sqlite 正常=红色常驻（无关闭钮）、
+             mysql（安全默认态，永不锁定）不渲染。全部文案走 textContent，零 HTML 注入面 -->
         <div class="storage-banner hidden" id="storageBanner" role="alert"></div>
 
         <!-- 顶层功能分区：存储库 / 消息总结 / 人物分析（滑动高光分段控件） -->

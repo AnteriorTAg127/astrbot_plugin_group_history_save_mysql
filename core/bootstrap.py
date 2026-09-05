@@ -59,8 +59,13 @@ BACKEND_LOCK_HINT = (
 def _read_backend_lock() -> str:
     """读启动锁文件内容（同步、幂等、绝不抛出）。
 
+    v0.9.0 语义修正（debug_0.md PROD-BUG-03）：**只有 "sqlite" 是有效锁值**。
+    mysql 是安全默认态、不加锁——全新安装插件自动以 mysql 首次启动时若也落锁，
+    等于插件替用户做了选择，之后永远切不到 sqlite。历史实验版可能留下的
+    "mysql" 锁文件内容在本函数归一为「未锁定」。
+
     Returns:
-        str: "mysql" / "sqlite"；无锁文件或内容非法一律返回 ""（未锁定）
+        str: "sqlite"（已锁定）或 ""（未锁定；无文件 / 内容非法 / 旧版 mysql 值）
     """
     try:
         path = (
@@ -70,7 +75,7 @@ def _read_backend_lock() -> str:
         if not path.is_file():
             return ""
         value = path.read_text(encoding="utf-8").strip().lower()
-        return value if value in ("mysql", "sqlite") else ""
+        return value if value == "sqlite" else ""
     except Exception as e:
         logger.warning(f"[HistorySave] 读取存储后端锁文件失败（按未锁定处理）: {e}")
         return ""
@@ -80,7 +85,8 @@ def _write_backend_lock_file(backend: str) -> bool:
     """写启动锁文件（同步、全兜底）。
 
     Args:
-        backend: "mysql" / "sqlite"
+        backend: 固定为 "sqlite"（语义修正版：mysql 安全态不加锁，
+            调用方仅在生效后端为 sqlite 时调用本函数）
 
     Returns:
         bool: 是否写入成功
@@ -100,17 +106,19 @@ def _write_backend_lock_file(backend: str) -> bool:
 def _resolve_backend(cfg: dict, locked_raw: str) -> tuple[str, bool, bool, str]:
     """存储后端启动锁判定（v0.9.0，纯函数便于测试）。
 
-    锁定语义：后端初始化成功后，插件把生效后端写入自有锁文件
-    （backend.lock，**不放配置实体**——schema 外键会被框架剥离，见
-    _read_backend_lock 注释与 debug_0.md PROD-BUG-02），此后配置页的
-    storage_backend 改动一律不生效——危险选项防护，防止误切换导致
-    「看不到另一侧历史」。解锁方式：停用插件、删除 backend.lock、重启。
+    锁定语义（**语义修正版**，debug_0.md PROD-BUG-03）：锁只属于 sqlite
+    危险选项本身——只有生效后端为 sqlite 且初始化成功时，插件才把
+    "sqlite" 写入自有锁文件（backend.lock，**不放配置实体**——schema 外键
+    会被框架剥离，见 _read_backend_lock 注释与 debug_0.md PROD-BUG-02）。
+    mysql 是安全默认态，永不加锁：全新安装自动跑 mysql 后用户仍可自由
+    切换一次到 sqlite；sqlite 锁定后改配置被挡回（这才是"一旦选择就不要
+    随便更改"要防的事故），解锁方式：停用插件、删除 backend.lock、重启。
 
     三重提醒②的日志由调用方（PluginBootstrap.__init__）打印，本函数只判定。
 
     Args:
         cfg: 插件配置 dict（读 storage_backend）
-        locked_raw: 锁文件原始内容（合法值 mysql/sqlite，其余视为未锁定）
+        locked_raw: 锁文件原始内容（仅 "sqlite" 为有效锁，其余视为未锁定）
 
     Returns:
         tuple: (生效后端, lock_mismatch 是否配置与锁不一致被挡回,
@@ -119,15 +127,14 @@ def _resolve_backend(cfg: dict, locked_raw: str) -> tuple[str, bool, bool, str]:
     raw = str(cfg.get("storage_backend", "mysql") or "").strip().lower()
     config_backend = raw if raw in ("mysql", "sqlite") else "mysql"
     locked = str(locked_raw or "").strip().lower()
-    if locked not in ("mysql", "sqlite"):
-        locked = ""
-    if not locked:
-        # 未锁定：按配置选择，初始化成功后由调用方写锁
+    if locked != "sqlite":
+        # 无锁文件 / 内容非法 / 历史实验版遗留的 "mysql" 值 → 一律未锁定
         return config_backend, False, False, config_backend
-    if locked == config_backend:
-        return locked, False, True, config_backend
-    # 已锁定且配置被改动：仍按锁定后端启动，仅记录不一致供警告与横幅使用
-    return locked, True, True, config_backend
+    if config_backend == "sqlite":
+        return "sqlite", False, True, "sqlite"
+    # 锁 sqlite 但配置被改为 mysql：仍按锁定的 sqlite 启动，记录不一致
+    # 供警告与横幅使用——「切离 sqlite」正是危险动作，必须显式删锁文件
+    return "sqlite", True, True, config_backend
 
 
 def _parse_bool_cfg(value, default: bool = True) -> bool:
@@ -174,23 +181,28 @@ class PluginBootstrap:
         self.is_sqlite_backend = backend == "sqlite"
         if self.lock_mismatch:
             # 连发三条 ERROR：醒目且各自给出「现状 / 如何解锁 / 数据后果」
+            # （语义修正版下 mismatch 仅有一种：锁 sqlite、配置被改为 mysql）
             logger.error(
                 f"[HistorySave] ⚠ 检测到存储后端配置（storage_backend="
-                f"{self.config_backend}）与已锁定后端（{backend}）不一致："
-                f"本插件按启动锁继续使用 {backend}，运行中修改配置不生效。"
+                f"{self.config_backend}）与已锁定后端（sqlite）不一致："
+                f"本插件按启动锁继续使用 sqlite，运行中修改配置不生效。"
             )
             logger.error(
                 "[HistorySave] ⚠ 这是一个危险选项。如确需切换：停用本插件，"
                 f"删除 {BACKEND_LOCK_HINT} 文件，再重启插件。"
             )
             logger.error(
-                "[HistorySave] ⚠ mysql / sqlite 两侧数据完全独立：切换后将"
-                "看不到另一侧的历史记录，请先用 /导出聊天记录 完成迁移。"
-                "请谨慎操作！"
+                "[HistorySave] ⚠ 两侧数据完全独立：切回 MySQL 后将看不到 "
+                "SQLite（history.db）期间新增的历史记录，且本版暂无 "
+                "SQLite→MySQL 反向迁移工具，请先自行导出备份。请谨慎操作！"
             )
-        # 未锁定时记下待写锁值（后端初始化成功后才落盘，避免锁到一个
-        # 根本没连上的后端上）
-        self._pending_lock_write = None if self.locked else backend
+        # 记下待写锁值：仅 sqlite 需要落锁（危险选项锁定），且要等后端
+        # 初始化成功后才写，避免锁到一个根本没连上的后端上；
+        # mysql 安全默认态永不加锁——否则全新安装自动首跑即被插件"替用户
+        # 做主"锁死 mysql，再想开 sqlite 就永远被挡（PROD-BUG-03）
+        self._pending_lock_write = (
+            "sqlite" if (backend == "sqlite" and not self.locked) else None
+        )
 
         if self.is_sqlite_backend:
             # SQLite 备用后端（history.db，无需安装 MySQL）：属性名保留
@@ -427,9 +439,10 @@ class PluginBootstrap:
                 return
 
     def _write_backend_lock(self) -> None:
-        """把生效后端写入启动锁文件 backend.lock（v0.9.0 启动锁落盘）。
+        """把 sqlite 写入启动锁文件 backend.lock（v0.9.0 危险选项锁定落盘）。
 
-        仅在「未锁定 → 首次锁定」时写一次；已锁定的实例不重写。
+        语义修正版（PROD-BUG-03）：仅「首次启用 sqlite 且初始化成功」时写锁；
+        mysql 安全默认态永不调用（_pending_lock_write 仅在 sqlite 未锁定时置值）。
         **落本地文件而非配置实体**：AstrBot 配置完整性检查会剥离
         schema 外的键（debug_0.md PROD-BUG-02），写进配置等于没写。
         写失败仅记日志不阻断本次运行（下次启动按配置重新判定）。
@@ -439,9 +452,9 @@ class PluginBootstrap:
         backend = self._pending_lock_write
         if _write_backend_lock_file(backend):
             logger.info(
-                f"[HistorySave] 存储后端已锁定为 {backend}"
-                f"（{BACKEND_LOCK_HINT}，危险选项，勿随意更改；"
-                f"解锁 = 停用插件并删除该文件）"
+                f"[HistorySave] 危险选项已确认：存储后端锁定为 {backend}"
+                f"（{BACKEND_LOCK_HINT}；勿随意更改，如需切回 MySQL 请停用插件"
+                f"并删除该锁文件后重启）"
             )
             self._pending_lock_write = None
             self.locked = True

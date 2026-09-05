@@ -3,8 +3,8 @@
 ## [0.9.0] - 2026-08-20
 
 SQLite 备用存储后端（Windows 部署友好，**危险选项**）：聊天记录可选存入本地
-`history.db`，无需安装 MySQL；配置页手动开启，一经启用即由启动锁文件锁定并
-三重提醒；数据分析与 `/群统计` 在 SQLite 模式下明确不可用；新增
+`history.db`，无需安装 MySQL；配置页手动开启，首次成功启用 sqlite 即由启动锁文件
+锁定并三重提醒；数据分析与 `/群统计` 在 SQLite 模式下明确不可用；新增
 `/导出聊天记录` 一次性迁移指令（MySQL → SQLite，幂等可重跑）。
 MySQL 默认路径行为与 v0.8.1 完全一致。
 
@@ -18,11 +18,13 @@ MySQL 默认路径行为与 v0.8.1 完全一致。
 - **配置项 3 个（插件配置页）**：`storage_backend`（mysql/sqlite，默认 mysql，
   多行醒目危险警告 hint）、`sqlite_wal_mode`（默认开）、`sqlite_busy_timeout_ms`
   （默认 5000，0–60000）
-- **启动锁与三重提醒**：后端首次初始化成功后把生效后端写入锁文件
-  `backend.lock`；此后配置页改动不热切换、重启也被挡回——①配置页警告 hint、
-  ②检测到「配置≠锁」时连续 3 条 ERROR 日志（含解锁步骤与数据独立警告）、
-  ③Web 面板顶部横幅（sqlite 红色常驻 / 误改配置黄色可关闭）；新端点
-  `GET /{plugin}/storage/info` 供前端取锁状态；解锁 = 停用插件删除 backend.lock 后重启
+- **启动锁与三重提醒（锁只属于 sqlite）**：仅「首次成功启用 sqlite」时把 `"sqlite"`
+  写入锁文件 `backend.lock`；mysql 为安全默认态**永不加锁**（全新安装自动以 mysql
+  首跑不留锁，用户仍可自由切换到 sqlite）。锁定后配置页改回 mysql 一律被挡回：
+  运行中不热切换、重启仍按 sqlite，①配置页警告 hint、②启动连发 3 条 ERROR 日志、
+  ③Web 面板横幅（sqlite 正常=红色常驻、sqlite 锁定下误改配置=黄色可关闭、
+  mysql=无横幅）；新端点 `GET /{plugin}/storage/info` 供前端取锁状态；
+  解锁 = 停用插件删除 backend.lock 后重启（SQLite 期间新增数据不反向迁移，需自行备份）
 - **`/导出聊天记录` 迁移指令（`core/sqlite_migrator.py`，管理员，仅 SQLite 模式）**：
   自建独立 MySQL 只读连接（与运行时后端解耦），按 id 分页批 2000 导入
   chat_history/image_records；幂等可重跑（唯一索引 + 按群预查计「跳过重复」）；

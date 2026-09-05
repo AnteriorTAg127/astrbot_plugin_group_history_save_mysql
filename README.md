@@ -1,6 +1,6 @@
 # astrbot_plugin_group_history_save_mysql
 
-将 QQ 群聊天记录自动保存到 MySQL 数据库（v0.9 起可选 **SQLite 备用存储后端**，Windows 等无 MySQL 环境开箱即用——危险选项，一经启用即锁定），支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构；v0.7 新增对外查询接口（其他插件可导入调用本插件查询聊天记录）与查询日志（Web 后台可审计所有对外查询）；v0.8 重做补库窗口规则并新增 `/补库` 强制补库指令；v0.8 结构进一步下沉（`main.py` 只保留注册与薄 handler，实例装配/生命周期迁至 `core/bootstrap.py`、指令体迁至 `core/commands.py`）。
+将 QQ 群聊天记录自动保存到 MySQL 数据库（v0.9 起可选 **SQLite 备用存储后端**，Windows 等无 MySQL 环境开箱即用——危险选项，sqlite 启用后即锁定），支持按时间、群号、QQ 号索引过滤，提供 Web 管理后台；v0.3 新增群聊历史自动总结功能（MySQL 优先 + 协议端补齐）；v0.4 新增人物分析功能（发言习惯/活动时间/性格/爱好/人物关系）；v0.5 新增数据分析功能（Web 实时统计面板 / `/群统计` 指令报告卡 / 定时日报周报推送 / 分段快照统计，纯 SQL 聚合、不依赖 LLM）；v0.6 新增插件重载后自动从 OneBot 拉取历史消息补库，并将全部代码重构为 `core/` 模块化结构；v0.7 新增对外查询接口（其他插件可导入调用本插件查询聊天记录）与查询日志（Web 后台可审计所有对外查询）；v0.8 重做补库窗口规则并新增 `/补库` 强制补库指令；v0.8 结构进一步下沉（`main.py` 只保留注册与薄 handler，实例装配/生命周期迁至 `core/bootstrap.py`、指令体迁至 `core/commands.py`）。
 
 ## 功能
 
@@ -33,7 +33,7 @@
 - 🧱 分段快照统计（v0.5.5 新增）：图片小时级快照泛化为「消息 + 图片 × 小时/日/月」三段式预计算快照体系，数据分析群级统计（总消息数/每日趋势/群排行）直接读快照，快照不可服务或异常自动整体回退实时 SQL；启动自动回填历史快照（兼顾宕机缺档补偿），强制刷新 60 秒限流
 - 🔄 重载自动补库（v0.6.0 新增）：插件加载/重载、MySQL 初始化成功后，后台自动从 OneBot 协议端拉取白名单启用群近 `backfill_hours` 小时的历史消息（文本 + 图片 URL）补库，按 `message_id` 与图片 URL 双重去重，弥补重载窗口期间的消息缺口
 - 🧩 模块化重构（v0.6.0）：全部代码迁入 `core/` 子包——`core/db_mysql`（连接池 + 数据库访问拆分）、`core/db_config`（本地配置管理拆分）、`core/webapi`（Web API 按子功能拆分）、`core/{summary,profile,stats}`（三大功能包）、`core/{parsing,saver,cleaner}`（保存逻辑）；`main.py` 仅保留框架交互（指令注册与事件委托）
-- 💽 SQLite 备用存储后端（v0.9.0 新增，**危险选项**）：插件配置页 `storage_backend` 手动切换为 `sqlite` 后，聊天记录（文本+图片）改存本地 `history.db`，无需安装 MySQL（Windows 部署友好）；消息保存/补库/查询/白名单/对外 API/消息总结/人物分析全量可用；**数据分析 tab 与 `/群统计` 在 SQLite 模式下不可用**（需 MySQL 聚合性能，明确提示）。一经启用即由启动锁文件锁定，运行中改配置不热切换；mysql/sqlite 两侧数据完全独立互不迁移
+- 💽 SQLite 备用存储后端（v0.9.0 新增，**危险选项**）：插件配置页 `storage_backend` 手动切换为 `sqlite` 后，聊天记录（文本+图片）改存本地 `history.db`，无需安装 MySQL（Windows 部署友好）；消息保存/补库/查询/白名单/对外 API/消息总结/人物分析全量可用；**数据分析 tab 与 `/群统计` 在 SQLite 模式下不可用**（需 MySQL 聚合性能，明确提示）。锁只属于 sqlite：全新安装自动以 mysql 运行不加锁、可放心切换一次；首次成功启用 sqlite 即被锁定，改回 mysql 被挡回（删 backend.lock 才能解锁）；mysql/sqlite 两侧数据完全独立互不迁移
 - 🚚 一次性迁移指令 `/导出聊天记录`（v0.9.0 新增，管理员，仅 SQLite 模式）：把 MySQL 既有历史一次性导入本地 `history.db`；按 id 分页批 2000、幂等可重跑（重复自动跳过）、`hours` 参数支持只补导最近 N 小时、全量完成后标记拦截重复全量
 
 ## 安装
@@ -50,29 +50,39 @@
 
 | 配置项 | 类型 | 默认 | 说明 |
 |--------|------|------|------|
-| storage_backend | string(mysql/sqlite) | mysql | ⚠️ 存储后端，危险选项，一经启用即锁定 |
+| storage_backend | string(mysql/sqlite) | mysql | ⚠️ 存储后端，危险选项，sqlite 启用后即锁定 |
 | sqlite_wal_mode | bool | true | WAL 模式，仅 sqlite 生效，提升并发读写 |
 | sqlite_busy_timeout_ms | int | 5000 | busy_timeout 毫秒（0–60000），仅 sqlite 生效 |
 
-### ⚠️ 危险选项：为什么「一经启用就锁定」
+### ⚠️ 危险选项：锁的语义（重要）
 
-- **两侧数据完全独立、互不迁移**：sqlite 与 mysql 各存各的，切换后看不到另一侧历史记录。
-- **启动锁**：插件首次成功初始化后，会把生效后端写入锁文件
-  `data/plugin_data/astrbot_plugin_group_history_save_mysql/backend.lock`。此后配置页的
-  `storage_backend` 改动**不再生效**——运行中不热切换，重启也仍按锁定的后端启动，
-  并在日志连续告警、Web 面板顶部弹黄色横幅提示「配置被更改但未生效」。
-- **三重提醒**：① 配置页该项的醒目警告说明；② 启动时检测到「配置≠锁」的连续 ERROR 日志；
-  ③ Web 面板顶部常驻横幅（sqlite 模式红色常驻 + mysql 模式检测到误改则黄色可关闭）。
+- **锁只属于 sqlite**：mysql 是安全默认态，**永不加锁**。全新安装插件会自动以
+  mysql 运行一次——这不会留下任何锁，你随时可以放心地切换到 sqlite（这是
+  唯一一次"自由"切换）。
+- **sqlite 启用即锁定**：首次成功以 sqlite 初始化后，插件写入锁文件
+  `data/plugin_data/astrbot_plugin_group_history_save_mysql/backend.lock`（内容 `sqlite`）。
+  此后在配置页把它改回 mysql **不会生效**——运行中不热切换，重启也仍按
+  sqlite 启动，并在日志连续告警、Web 面板顶部弹黄色横幅提示「配置被更改但未生效」。
+- **为什么这么设计**：sqlite 与 mysql 两侧数据完全独立、互不迁移，误切换会导致
+  「历史突然看不到了」；而 mysql 侧随时可切换、无数据风险，不需要锁。
+- **三重提醒**：① 配置页该项的醒目警告说明；② 启动时检测到「锁 sqlite、配置被改回
+  mysql」的连续 ERROR 日志；③ Web 面板顶部横幅（sqlite 正常=红色常驻，
+  sqlite 锁定下误改配置=黄色可关闭；mysql 安全态无横幅）。
 
-### 如何切换 / 解锁
+### 如何切换
 
-如确需更换存储后端：
+**mysql → sqlite（启用危险选项）**：全新安装后处于未锁定状态，直接在配置页把
+`storage_backend` 改为 `sqlite` 并重启插件即可；首次以 sqlite 初始化成功后该选项即被锁定。
+若要在启用后保留旧数据，重启进入 SQLite 模式后用 `/导出聊天记录` 把 MySQL 历史一次性导入本地（见下）。
+
+**sqlite → mysql（解锁，谨慎）**：
 
 1. 停用（禁用）本插件；
 2. 删除锁文件 `data/plugin_data/astrbot_plugin_group_history_save_mysql/backend.lock`；
-3. 在配置页改好 `storage_backend`；
+3. 在配置页把 `storage_backend` 改回 `mysql`；
 4. 重启插件 / AstrBot。
-5. 若要在切换后保留旧数据，请在**新 SQLite 模式**下用 `/导出聊天记录` 把 MySQL 历史一次性导入本地（见下）。
+   ⚠️ SQLite 期间新增的历史记录**不会**自动迁回 MySQL（本版无 SQLite→MySQL 反向
+   迁移工具），如需保留请先自行备份导出 history.db。
 
 ### 功能可用性矩阵
 
