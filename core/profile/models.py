@@ -13,7 +13,7 @@
 - ``mysql_row_to_profile_message``：MySQL 查询返回的行 → ProfileMessage
 
 设计对齐 ``summary/models.py``：时间戳三级回退、NULL 兜底、异常不中断整体流程。
-契约见 ``开发/v0.4.0/分工.md``「共享接口契约 → 数据模型」，改动需同步下游。
+契约见模块接口约定（docs/contracts/profile.md），改动需同步下游。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from datetime import datetime
 from astrbot.api import logger
 
 # ---------------------------------------------------------------------------
-# 数据结构（契约见 开发/v0.4.0/分工.md「共享接口契约 → 数据模型」，改动需同步下游）
+# 数据结构（契约见模块接口约定，改动需同步下游）
 # ---------------------------------------------------------------------------
 
 

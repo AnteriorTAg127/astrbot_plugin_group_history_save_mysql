@@ -1,7 +1,7 @@
 """混合数据获取层（模块 D）。
 
 以 MySQL 为主、OneBot 协议端缓存为辅获取群聊历史素材，供总结引擎消费。
-契约见 开发/v0.3/分工.md「接口约定 → HistoryFetcher」，对外仅两个公开方法：
+契约见模块接口约定（docs/contracts/summary.md），对外仅两个公开方法：
 
 - :meth:`HistoryFetcher.fetch_by_count`：数量模式（最近 N 条）
 - :meth:`HistoryFetcher.fetch_by_window`：时间模式（时间窗口内）
@@ -67,7 +67,7 @@ class HistoryFetcher:
         self._bot_id_warned = False
 
     # ------------------------------------------------------------------
-    # 公开接口（契约见 开发/v0.3/分工.md，不得私改签名）
+    # 公开接口（契约见模块接口约定，不得私改签名）
     # ------------------------------------------------------------------
 
     async def fetch_by_count(

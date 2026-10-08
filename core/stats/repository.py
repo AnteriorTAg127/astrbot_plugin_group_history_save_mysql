@@ -1,7 +1,7 @@
 """MySQL 聚合仓储（v0.5.0 数据分析模块 B）。
 
 对 chat_history / image_records 做纯 SQL 实时聚合，供编排服务 StatsService
-（模块 G）组装统计卡片/图表/排行数据。设计约束（接口契约见 开发/v0.5.0/分工.md）：
+（模块 G）组装统计卡片/图表/排行数据。设计约束（接口契约见模块接口约定 docs/contracts/stats.md）：
 
 - 连接获取模式与 db_mysql 保持一致：一律 ``async with self._mgr.pool.acquire()``，
   超时/取消后由 acquire 上下文自动销毁脏连接，本层**不得**自行 close；

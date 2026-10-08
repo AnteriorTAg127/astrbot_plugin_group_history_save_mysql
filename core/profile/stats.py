@@ -8,7 +8,7 @@
 - **无 AI、无 I/O、无副作用**：纯 CPU 计算，同输入恒同输出，最易测；
 - 口头禅/高频词**不做本地分词**（不引 jieba），交由 LLM 从样本归纳；
 - 统计基于**全量**目标消息（长度预算截断只影响喂 LLM 的素材，不影响统计）；
-- 契约见 ``开发/v0.4.0/分工.md``「共享接口契约 → 数据模型」ProfileStats 字段。
+- 契约见模块接口约定（docs/contracts/profile.md）ProfileStats 字段。
 """
 
 from __future__ import annotations

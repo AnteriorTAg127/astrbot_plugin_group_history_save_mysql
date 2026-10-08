@@ -35,7 +35,7 @@
    同名板块去重保留首个，按规范顺序输出；切分失败（无 ## 标题或解析异常）
    回退单段 ``[("人物画像", raw)]``。
 
-契约见 开发/v0.4.0/分工.md「共享接口契约 → Module F」，不得私改。
+契约见模块接口约定（docs/contracts/profile.md），不得私改。
 """
 
 from __future__ import annotations

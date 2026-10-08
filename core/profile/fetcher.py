@@ -2,7 +2,7 @@
 
 以 MySQL 为主、OneBot 协议端缓存为辅获取目标用户的发言素材；关系上下文开关
 开启时进一步双向识别互动对象（partners）并拉取其消息，供统计引擎与 LLM 消费。
-契约见 ``开发/v0.4.0/分工.md``「共享接口契约 / Module D」，对外仅一个公开方法：
+契约见模块接口约定（docs/contracts/profile.md），对外仅一个公开方法：
 
 - :meth:`ProfileFetcher.fetch`：按 :class:`ProfileTarget` 拉取目标消息 +
   关系上下文消息，产出 :class:`ProfileFetchOutcome`
@@ -331,7 +331,7 @@ class ProfileFetcher:
         self._config_mgr = config_mgr
 
     # ------------------------------------------------------------------
-    # 公开接口（契约见 开发/v0.4.0/分工.md「Module D」，不得私改签名）
+    # 公开接口（契约见模块接口约定，不得私改签名）
     # ------------------------------------------------------------------
 
     async def fetch(

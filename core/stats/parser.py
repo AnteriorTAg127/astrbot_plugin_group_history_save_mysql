@@ -3,7 +3,7 @@
 将指令名之后的自由参数文本解析为 ``(member_id, StatsTimeRange)`` 二元组，供
 ``main.py`` 指令 handler 与 ``stats.service.StatsService`` 使用。
 
-解析规则（契约见 ``开发/v0.5.0/分工.md``「接口契约 → StatsQuery 时间范围解析」，
+解析规则（契约见模块接口约定 docs/contracts/stats.md「时间范围解析」，
 与 PRD 2.1 F2 / 2.2 一致）：
 
 - **时间关键词**（大小写不敏感、容忍全角/半角空白）：

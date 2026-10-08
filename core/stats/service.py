@@ -38,9 +38,8 @@
 方法（``await service.check_cooldown(gid)``），与 profile/summary 侧异步
 冷却检查范式一致；模块 M 接线时按实际签名 await 调用。
 
-日志统一 ``[Stats]`` 前缀。契约见 ``开发/v0.5.0/分工.md``「接口契约 →
-编排服务（模块 G）」；v0.5.5 迁移点与回退矩阵见 ``开发/v0.5.5/分工.md``
-「E. stats/service.py 迁移点与回退矩阵」，字段与注释与其保持一致。
+日志统一 ``[Stats]`` 前缀。契约见模块接口约定（docs/contracts/stats.md）；
+v0.5.5 迁移点与回退矩阵同见该文档「编排层」，字段与注释与其保持一致。
 """
 
 from __future__ import annotations
@@ -114,7 +113,7 @@ class StatsService:
     """数据分析编排服务：build_stats 单一组装出口 + 冷却 + umo 缓存 + 推送。
 
     v0.5.5 起群级查询（总消息数 / 每日趋势 / 群排行 count）迁分段快照读数，
-    快照不可用时精确回退实时 SQL（回退矩阵见 开发/v0.5.5/分工.md）；Web
+    快照不可用时精确回退实时 SQL（回退矩阵见 docs/contracts/stats.md）；Web
     概览趋势经 :meth:`overview_daily_stats` 走快照口径。
 
     Attributes:
@@ -289,7 +288,7 @@ class StatsService:
         流程：强制刷新当前小时快照 → 群级维度快照取数判定（total_messages /
         daily_trend / 群排行 count 走消息快照三层归并（月+日+时）；快照返回
         None（范围不可服务/快照异常）精确回退对应 repo 实时 SQL，回退矩阵见
-        ``开发/v0.5.5/分工.md``）→ ``asyncio.gather`` 并发聚合查询（按 query
+        docs/contracts/stats.md）→ ``asyncio.gather`` 并发聚合查询（按 query
         维度裁剪：群维度查发言人排行、全部群视图查群排行、个人维度附加
         member_overview 与 sender 维度分布/完整排行；快照路径的 overview 仅查
         活跃数与首末条时间 meta、群排行仅查每群活跃数）→ daily_trend 连续补零

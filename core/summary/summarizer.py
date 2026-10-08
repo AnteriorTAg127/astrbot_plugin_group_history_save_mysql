@@ -24,7 +24,7 @@
 7. **板块解析**（best-effort）：按 4 个板块标题行宽松切分 LLM 输出，
    切出少于 2 个板块则回退单段 ``[("全部", raw)]``。
 
-契约见 开发/v0.3/分工.md「接口约定 → Summarizer」，不得私改。
+契约见模块接口约定（docs/contracts/summary.md），不得私改。
 """
 
 from __future__ import annotations

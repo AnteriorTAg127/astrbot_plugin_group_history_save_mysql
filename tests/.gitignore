@@ -1,0 +1,23 @@
+# 测试运行时产物（临时库 / 基线输出 / 沙箱重定向目录），不入库
+__pycache__/
+*.py[cod]
+
+# v0.9.0 基线运行器与沙箱插件产物
+.baseline_out/
+.baseline_tmp/
+.smoke_tmp/
+_sandbox_tmp_root/
+_basetemp/
+_baseline_log.txt
+repro_prod_bug_02/
+
+# 各套件自建临时目录
+tmp_v090/
+tmp_data/
+tmp_export/
+_bt*/
+_btmp*/
+_tmp/
+_tmpwork/
+ptmp*/
+tmpti7rmxhn/

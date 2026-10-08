@@ -4,7 +4,7 @@
 action ``get_group_msg_history``，拉取指定群的近期历史消息，并逐条交给
 ``models.parse_onebot_message`` 归一化为统一数据模型 :class:`ChatMessage`。
 
-设计要点（见 开发/v0.3/分工.md「OneBot 封装」契约与 prd.md 第 4/7 节）：
+设计要点（见模块接口约定 docs/contracts/summary.md「OneBot 封装」与 PRD 第 4/7 节）：
 
 - **仅提取文本段**：消息段数组中只取 ``type == "text"`` 的 ``data.text`` 拼接，
   图片/语音/视频/表情等非文本段完全忽略（段解析与过滤由

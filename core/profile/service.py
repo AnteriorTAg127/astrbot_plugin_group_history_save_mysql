@@ -39,7 +39,7 @@
   **绝不 yield**（保证可脱离事件钩子调用）
 - ``StarTools.get_data_dir(plugin_name) -> Path``，导入路径与 summary 一致
 
-契约见 开发/v0.4.0/分工.md「共享接口契约 / Module J」，不得私改。
+契约见模块接口约定（docs/contracts/profile.md），不得私改。
 """
 
 from __future__ import annotations
