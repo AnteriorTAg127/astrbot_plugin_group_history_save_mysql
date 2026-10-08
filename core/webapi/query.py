@@ -5,6 +5,8 @@ QueryMixin：聊天记录多条件查询 + 回复目标消息补充。
 
 from astrbot.api.web import json_response, request
 
+from ..query_enrich import enrich_query_reply
+
 
 class QueryMixin:
     """查询端点 Mixin（v0.6.0 拆分自 web_api.py）。"""
@@ -60,25 +62,11 @@ class QueryMixin:
         return json_response(result)
 
     async def _enrich_query_reply(self, result: dict) -> None:
-        """为查询结果批量补充回复目标消息内容。
+        """为查询结果批量补充回复目标消息（v0.8.2 R2：委托 core/query_enrich 共享实现）。
 
-        仅按 reply_id（消息 ID）反查——reply_id 是唯一可靠的反查锚点；
-        任一关联缺失或异常仅跳过该条，不阻断整体结果。
+        与 core/public_api.py 的 _enrich_query_reply 共用同一份逻辑，杜绝
+        Web 与对外 API 口径分叉；本方法名保留做兼容。反查经
+        self.mysql_mgr.get_messages_by_ids 回调注入，共享模块不依赖 db 层。
         """
         records = result.get("records") or []
-        if not records:
-            return
-
-        reply_ids = [(rec.get("reply_id") or "").strip() for rec in records]
-        reply_ids = [rid for rid in reply_ids if rid]
-
-        reply_map: dict[str, dict] = {}
-        if reply_ids:
-            for row in await self.mysql_mgr.get_messages_by_ids(reply_ids):
-                mid = str(row.get("message_id") or "")
-                if mid and mid not in reply_map:
-                    reply_map[mid] = row
-
-        for rec in records:
-            rid = (rec.get("reply_id") or "").strip()
-            rec["reply_message"] = reply_map.get(rid)
+        await enrich_query_reply(records, self.mysql_mgr.get_messages_by_ids)

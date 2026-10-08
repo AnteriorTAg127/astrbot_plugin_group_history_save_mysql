@@ -20,8 +20,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 from .core.bootstrap import PluginBootstrap
-from .core.parsing import stats_fallback_text
-from .core.profile.capture import extract_at_targets
+from .core.parsing import extract_at_targets, stats_fallback_text
 from .core.stats import StatsBuildError
 from .core.stats.models import StatsQuery
 from .core.stats.parser import USAGE_TEXT, StatsParseError, parse_stats_args

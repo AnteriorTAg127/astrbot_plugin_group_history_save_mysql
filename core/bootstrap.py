@@ -27,7 +27,7 @@ from .public_api import register_config_manager, register_mysql_manager
 from .saver import MessageSaver
 from .stats import StatsService
 from .summary import SummaryService
-from .webapi import WebAPI
+from .webapi import ProfileFacade, StatsFacade, SummaryFacade, WebAPI
 
 # 后台 MySQL 初始化的最大连续失败次数：超过后放弃重试并停用存储功能，
 # 避免数据库长期不可用时无限刷日志。恢复方式：修正配置后在插件管理重启插件。
@@ -92,18 +92,22 @@ class PluginBootstrap:
         # 构造仅组装上游模块引用无 I/O，调度器在 MySQL 初始化成功后才 start）
         self.stats_service = StatsService(context, self.mysql_mgr, self.config_mgr, plugin)
 
-        # Web API（注入总结/人物存储与渲染实例 + 统计服务）
+        # Web API（v0.8.2 R4 依赖收敛：域依赖按 Facade 打包注入）
         self.web_api = WebAPI(
             context,
             self.mysql_mgr,
             self.config_mgr,
             self.cleaner,
-            summary_storage=self.summary_service.storage,
-            summary_renderer=self.summary_service.renderer,
-            profile_service=self.profile_service,
-            profile_storage=self.profile_service.storage,
-            profile_renderer=self.profile_service.renderer,
-            stats_service=self.stats_service,
+            summary=SummaryFacade(
+                storage=self.summary_service.storage,
+                renderer=self.summary_service.renderer,
+            ),
+            profile=ProfileFacade(
+                service=self.profile_service,
+                storage=self.profile_service.storage,
+                renderer=self.profile_service.renderer,
+            ),
+            stats=StatsFacade(service=self.stats_service),
         )
 
         # 消息保存器（解析/缓冲/落库/补录全部在 core.saver）

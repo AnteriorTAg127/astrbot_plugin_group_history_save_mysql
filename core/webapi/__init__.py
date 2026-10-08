@@ -3,8 +3,17 @@
 主文件（base.py）负责路由注册与公共 helper；子功能文件按功能拆分
 storage/query/summary/profile/stats。组装范式：Mixin 多继承出单一
 公开类名 WebAPI，对外调用零改动。
+
+v0.8.2 R4：域依赖 Facade（SummaryFacade/ProfileFacade/StatsFacade）由
+base.py 定义，此处以冗余别名形式再导出，供装配层（core/bootstrap.py）
+从包表面导入；公开符号面 __all__ 保持不变。
 """
 
+from .base import (
+    ProfileFacade as ProfileFacade,
+    StatsFacade as StatsFacade,
+    SummaryFacade as SummaryFacade,
+)
 from .base import WebAPIBase, _to_jsonable, make_challenge
 from .profile import ProfileMixin
 from .query import QueryMixin

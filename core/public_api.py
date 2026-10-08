@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+from .query_enrich import enrich_query_reply
+
 if TYPE_CHECKING:
     from .db_config import ConfigManager
     from .db_mysql import MySQLManager
@@ -78,30 +80,13 @@ def _infer_caller() -> str:
 
 
 async def _enrich_query_reply(mgr: "MySQLManager", records: list[dict]) -> None:
-    """为查询结果批量补充回复目标消息（等价 core/webapi/query.py 的实现）。
+    """为查询结果批量补充回复目标消息（v0.8.2 R2：委托 core/query_enrich 共享实现）。
 
-    仅按 reply_id（消息 ID）反查——reply_id 是唯一可靠的反查锚点；
-    经 mgr.get_messages_by_ids 批量反查后回填 reply_message（取不到为 None）；
-    任一关联缺失或反查异常仅跳过该条，不阻断整体结果。
+    与 core/webapi/query.py 的 _enrich_query_reply 共用同一份逻辑，杜绝口径
+    分叉；本函数名保留做兼容。反查经 mgr.get_messages_by_ids 回调注入，
+    共享模块本身不依赖 db 层。
     """
-    if not records:
-        return
-
-    reply_ids = [(rec.get("reply_id") or "").strip() for rec in records]
-    reply_ids = [rid for rid in reply_ids if rid]
-
-    reply_map: dict[str, dict] = {}
-    if reply_ids:
-        for row in await mgr.get_messages_by_ids(reply_ids):
-            mid = str(row.get("message_id") or "")
-            # 去重策略：message_id 在 chat_history 中应唯一，若底层异常返回
-            # 重复行，保留第一条（与「取不到为 None」的降级口径一致）
-            if mid and mid not in reply_map:
-                reply_map[mid] = row
-
-    for rec in records:
-        rid = (rec.get("reply_id") or "").strip()
-        rec["reply_message"] = reply_map.get(rid)
+    await enrich_query_reply(records, mgr.get_messages_by_ids)
 
 
 async def query_records(
@@ -113,6 +98,8 @@ async def query_records(
     keyword: str | None = None,
     page: int = 1,
     page_size: int = 50,
+    mgr: "MySQLManager | None" = None,
+    log_mgr: "ConfigManager | None" = None,
 ) -> dict:
     """对外查询聊天记录（多条件分页），返回纯数据 {"total", "records"}。
 
@@ -136,6 +123,11 @@ async def query_records(
         keyword: 关键词，模糊匹配 content 与 sender_name
         page: 页码（<1 归 1）
         page_size: 每页条数（夹取 [1, 200]）
+        mgr: MySQL 管理器显式注入（v0.8.2 R5，可选）；缺省 None 时回读模块
+            全局 _mysql_mgr（register_mysql_manager 注册值），显式传入非 None
+            则使用传入值——测试/高级调用方无需改动全局即可调用，老调用零变化
+        log_mgr: 查询日志存储（ConfigManager）显式注入（可选）；缺省 None 时
+            回读模块全局 _config_mgr，显式传入非 None 则使用传入值，语义同 mgr
 
     Returns:
         dict: {"total": int, "records": list[dict]}；查询失败时额外含
@@ -146,13 +138,15 @@ async def query_records(
     Raises:
         PublicAPIError: 本插件 MySQL 尚未初始化完成，或时间参数格式非法
     """
-    mgr = _mysql_mgr
+    # v0.8.2 R5：显式注入优先，缺省回读模块全局（register_* 注册值）——
+    # 只读全局一次（无写入），老调用与测试直接赋值全局的用法行为不变
+    mgr = mgr if mgr is not None else _mysql_mgr
     if mgr is None:
         raise PublicAPIError("本插件 MySQL 尚未初始化完成，请稍后重试")
 
     # 查询日志存储（内置 SQLite config.db）：未注册时写入仅 warning 降级，
     # 不阻断查询（与日志写失败同一降级口径）
-    log_mgr = _config_mgr
+    log_mgr = log_mgr if log_mgr is not None else _config_mgr
 
     caller = (caller or _infer_caller())[:128]
     # 参数夹取：page < 1 归 1；page_size 夹取 [1, 200]；空串视同未提供
@@ -253,6 +247,8 @@ async def count_messages(
     sender_ids: str | list[str] | None = None,
     time_start: str | None = None,
     time_end: str | None = None,
+    mgr: "MySQLManager | None" = None,
+    log_mgr: "ConfigManager | None" = None,
 ) -> dict:
     """对外统计文本消息数（群总计 + 批量人统计），返回纯数据 dict。
 
@@ -271,6 +267,11 @@ async def count_messages(
         time_start: 开始时间（格式 YYYY-MM-DD HH:MM:SS，非法抛
             PublicAPIError）
         time_end: 结束时间（同上）
+        mgr: MySQL 管理器显式注入（v0.8.2 R5，可选）；缺省 None 时回读模块
+            全局 _mysql_mgr，显式传入非 None 则使用传入值，语义同
+            query_records.mgr
+        log_mgr: 查询日志存储（ConfigManager）显式注入（可选）；缺省 None 时
+            回读模块全局 _config_mgr，语义同 query_records.log_mgr
 
     Returns:
         dict: {
@@ -286,12 +287,13 @@ async def count_messages(
         PublicAPIError: 未初始化 / 时间格式非法 / 参数缺失（group_id 与
             sender_ids 都未提供）/ sender_ids 超 500
     """
-    mgr = _mysql_mgr
+    # v0.8.2 R5：显式注入优先，缺省回读模块全局（同 query_records）
+    mgr = mgr if mgr is not None else _mysql_mgr
     if mgr is None:
         raise PublicAPIError("本插件 MySQL 尚未初始化完成，请稍后重试")
 
     # 查询日志存储（内置 SQLite config.db）：未注册时写入仅 warning 降级
-    log_mgr = _config_mgr
+    log_mgr = log_mgr if log_mgr is not None else _config_mgr
     caller = (caller or _infer_caller())[:128]
 
     # 时间参数格式预检（同 query_records，非法抛 PublicAPIError 不写日志）

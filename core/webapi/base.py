@@ -1,13 +1,20 @@
 """Web API 后端核心（v0.6.0 包化拆分）。
 
-base：路由注册基类 WebAPIBase + 公共 helper 纯函数 + 模块常量。
+base：路由注册基类 WebAPIBase + 域依赖 Facade + 公共 helper 纯函数 + 模块常量。
 子功能 Mixin（storage/query/summary/profile/stats）经 __init__.py
 多继承组装出单一公开类名 WebAPI，对外调用零改动。
+
+v0.8.2 R4 依赖收敛与路由分组（纯重构零行为变化）：
+- 构造依赖 10 → 7：4 个核心依赖（context/mysql_mgr/config_mgr/cleaner，位置不变）
+  + 3 个按域打包的 Facade（summary/profile/stats），老平铺属性名保留为
+  只读兼容 property，各 Mixin 与外部读取路径零改动。
+- _register_routes 拆为 5 个分组表方法，路由路径/方法/回调/描述逐条不变，
+  注册顺序与 v0.6.0 单表一致。
 """
 
 import random
 import uuid
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -145,8 +152,47 @@ def _stats_data_to_dict(data) -> dict:
     return result if isinstance(result, dict) else {"value": result}
 
 
+# ---------------------------------------------------------------------------
+# v0.8.2 R4：域依赖 Facade（按域打包的小 dataclass，替代 6 个平铺注入参数）。
+# 字段缺省 None，「未注入 → 相关端点 503」的原语义逐字段保持（WebAPIBase 总
+# 会构造出非 None 的 Facade 实例，端点判空仍看各字段）。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SummaryFacade:
+    """总结域依赖（v0.3 历史存储 + v0.4.2 导出渲染器）。"""
+
+    storage: "SummaryStorage | None" = None
+    renderer: "T2IRenderer | None" = None
+
+
+@dataclass
+class ProfileFacade:
+    """人物分析域依赖（v0.4.0 编排服务与存储 + v0.4.2 导出渲染器）。"""
+
+    service: "ProfileService | None" = None
+    storage: "ProfileStorage | None" = None
+    renderer: "ProfileT2IRenderer | None" = None
+
+
+@dataclass
+class StatsFacade:
+    """数据分析域依赖（v0.5.0 编排服务；设置类端点不依赖，正常可用）。"""
+
+    service: "StatsService | None" = None
+
+
 class WebAPIBase:
-    """Web 管理后台 API 处理器。"""
+    """Web 管理后台 API 处理器。
+
+    构造依赖（v0.8.2 R4 收敛后 7 个）：context / mysql_mgr / config_mgr /
+    cleaner 四个核心依赖保持老位置参数顺序（兼容既有调用），域依赖经
+    summary / profile / stats 三个 Facade 注入；老平铺属性名
+    （summary_storage / summary_renderer / profile_service / profile_storage /
+    profile_renderer / stats_service）保留为只读兼容 property，各 Mixin
+    端点与外部读取零改动。
+    """
 
     def __init__(
         self,
@@ -154,39 +200,81 @@ class WebAPIBase:
         mysql_mgr: MySQLManager,
         config_mgr: ConfigManager,
         cleaner: ImageCleaner,
-        summary_storage: "SummaryStorage | None" = None,
-        summary_renderer: "T2IRenderer | None" = None,
-        profile_service: "ProfileService | None" = None,
-        profile_storage: "ProfileStorage | None" = None,
-        profile_renderer: "ProfileT2IRenderer | None" = None,
-        stats_service: "StatsService | None" = None,
+        summary: SummaryFacade | None = None,
+        profile: ProfileFacade | None = None,
+        stats: StatsFacade | None = None,
     ):
         self.context = context
         self.mysql_mgr = mysql_mgr
         self.config_mgr = config_mgr
         self.cleaner = cleaner
-        # v0.3 总结功能存储层，由 main.py 注入（模块 K）；
-        # 未注入时总结历史相关端点返回 503
-        self.summary_storage = summary_storage
-        # v0.4.2 总结导出图片用 T2I 渲染器，由 main.py 注入（复用
-        # SummaryService.renderer）；未注入时导出端点返回 503
-        self.summary_renderer = summary_renderer
-        # v0.4.0 人物分析编排层与存储层，由 main.py 注入（模块 K）；
-        # 未注入时 analyze / history 相关端点返回 503
-        self.profile_service = profile_service
-        self.profile_storage = profile_storage
-        # v0.4.2 人物分析导出图片用 T2I 渲染器，由 main.py 注入（复用
-        # ProfileService.renderer）；未注入时导出端点返回 503
-        self.profile_renderer = profile_renderer
-        # v0.5.0 数据分析编排服务，由 main.py 注入（模块 M）；
+        # v0.3 总结域（存储层 + v0.4.2 导出渲染器），由 bootstrap 注入（模块 K）；
+        # 未注入时总结历史/导出相关端点返回 503
+        self.summary = summary or SummaryFacade()
+        # v0.4.0 人物分析域（编排服务 + 存储层 + v0.4.2 导出渲染器），
+        # 由 bootstrap 注入（模块 K）；未注入时 analyze / history 端点返回 503
+        self.profile = profile or ProfileFacade()
+        # v0.5.0 数据分析域（编排服务），由 bootstrap 注入（模块 M）；
         # 未注入时 stats/data 端点返回 503（设置类端点不依赖，正常可用）
-        self.stats_service = stats_service
+        self.stats = stats or StatsFacade()
         self._purge_challenges: dict[str, tuple[int, float]] = {}
         self._register_routes()
 
+    # ---- v0.8.2 R4 兼容只读属性：老平铺依赖名 → 新 Facade 字段 ----
+
+    @property
+    def summary_storage(self) -> "SummaryStorage | None":
+        """总结存储层（兼容：原 self.summary_storage → self.summary.storage）。"""
+        return self.summary.storage
+
+    @property
+    def summary_renderer(self) -> "T2IRenderer | None":
+        """总结导出渲染器（兼容：原 self.summary_renderer → self.summary.renderer）。"""
+        return self.summary.renderer
+
+    @property
+    def profile_service(self) -> "ProfileService | None":
+        """人物分析编排服务（兼容：原 self.profile_service → self.profile.service）。"""
+        return self.profile.service
+
+    @property
+    def profile_storage(self) -> "ProfileStorage | None":
+        """人物分析存储层（兼容：原 self.profile_storage → self.profile.storage）。"""
+        return self.profile.storage
+
+    @property
+    def profile_renderer(self) -> "ProfileT2IRenderer | None":
+        """人物分析导出渲染器（兼容：原 self.profile_renderer → self.profile.renderer）。"""
+        return self.profile.renderer
+
+    @property
+    def stats_service(self) -> "StatsService | None":
+        """数据分析编排服务（兼容：原 self.stats_service → self.stats.service）。"""
+        return self.stats.service
+
+    # ---- 路由注册（v0.8.2 R4：按域分组；条目内容/注册顺序与 v0.6.0 单表一致） ----
+
     def _register_routes(self):
-        """注册所有 Web API 路由。"""
+        """注册所有 Web API 路由（分组表拼接后统一注册）。
+
+        分组拼接顺序即 v0.6.0 单表的历史顺序（清空维护两条在查询域之后，
+        保持注册次序逐条不变）。
+        """
         routes = [
+            *self._register_storage_routes(),
+            *self._register_query_routes(),
+            *self._register_maintenance_routes(),
+            *self._register_summary_routes(),
+            *self._register_profile_routes(),
+            *self._register_stats_routes(),
+        ]
+        for route, handler, methods, desc in routes:
+            self.context.register_web_api(route, handler, methods, desc)
+        logger.info(f"[HistorySave] 已注册 {len(routes)} 个 Web API 路由")
+
+    def _register_storage_routes(self) -> list:
+        """存储库域路由表：状态 / 群白名单 / 设置 / 每日统计 / 手动清理。"""
+        return [
             (f"/{PLUGIN_NAME}/status", self.api_status, ["GET"], "数据库状态"),
             (f"/{PLUGIN_NAME}/groups", self.api_get_groups, ["GET"], "获取群列表"),
             (
@@ -211,6 +299,11 @@ class WebAPIBase:
             ),
             (f"/{PLUGIN_NAME}/stats/daily", self.api_daily_stats, ["GET"], "每日统计"),
             (f"/{PLUGIN_NAME}/clean", self.api_clean, ["POST"], "手动清理"),
+        ]
+
+    def _register_query_routes(self) -> list:
+        """查询域路由表：聊天记录查询 + 查询日志（v0.7.0）列表与设置。"""
+        return [
             (f"/{PLUGIN_NAME}/query", self.api_query, ["GET"], "查询聊天记录"),
             (
                 f"/{PLUGIN_NAME}/query_log/list",
@@ -230,6 +323,14 @@ class WebAPIBase:
                 ["POST"],
                 "保存查询日志设置",
             ),
+        ]
+
+    def _register_maintenance_routes(self) -> list:
+        """清空维护域路由表：二次验证题目 + 清空所有数据。
+
+        （历史上紧随查询日志之后注册，为保持注册次序逐条不变单列一组。）
+        """
+        return [
             (
                 f"/{PLUGIN_NAME}/purge/challenge",
                 self.api_purge_challenge,
@@ -237,6 +338,11 @@ class WebAPIBase:
                 "获取清空验证题目",
             ),
             (f"/{PLUGIN_NAME}/purge", self.api_purge, ["POST"], "清空所有数据"),
+        ]
+
+    def _register_summary_routes(self) -> list:
+        """总结域路由表（v0.3）：设置 / 提供商 / 忽略名单 / 历史总结。"""
+        return [
             # ---- 总结功能（v0.3） ----
             (
                 f"/{PLUGIN_NAME}/summary/settings",
@@ -304,6 +410,11 @@ class WebAPIBase:
                 ["GET"],
                 "历史总结导出图片",
             ),
+        ]
+
+    def _register_profile_routes(self) -> list:
+        """人物分析域路由表（v0.4.0）：设置 / 提供商 / 群 / 分析 / 历史。"""
+        return [
             # ---- 人物分析功能（v0.4.0） ----
             (
                 f"/{PLUGIN_NAME}/profile/settings",
@@ -365,6 +476,11 @@ class WebAPIBase:
                 ["DELETE", "POST"],
                 "删除历史人物分析",
             ),
+        ]
+
+    def _register_stats_routes(self) -> list:
+        """数据分析域路由表（v0.5.0）：数据 / 群列表 / 设置 / 推送开关。"""
+        return [
             # ---- 数据分析功能（v0.5.0） ----
             (
                 f"/{PLUGIN_NAME}/stats/data",
@@ -403,6 +519,3 @@ class WebAPIBase:
                 "切换群推送开关",
             ),
         ]
-        for route, handler, methods, desc in routes:
-            self.context.register_web_api(route, handler, methods, desc)
-        logger.info(f"[HistorySave] 已注册 {len(routes)} 个 Web API 路由")
